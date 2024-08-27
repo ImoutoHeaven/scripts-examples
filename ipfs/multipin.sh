@@ -92,14 +92,3 @@ for ((i=1; i<=loops; i++)); do
 done
 
 echo "所有任务完成"
-
-
-
-
-
-
-执行： /path/to/multipin.sh
-
-回车输入多行 ipfs pin remote add --service=crust --background <cid> 指令。其中 cid 可以是文件 cid 也可以是文件夹 cid.
-
-输入完成后，按 Ctrl+D 开始执行指令。你可以开一个 screen 会话挂后台执行。脚本在 12 小时后会自行结束。

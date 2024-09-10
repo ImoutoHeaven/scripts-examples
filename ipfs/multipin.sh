@@ -1,15 +1,15 @@
 #!/bin/bash
 
-# 提示用户输入最大运行时间和 sleep 时间
-read -p "请输入最大运行时间（默认 12 小时，单位为小时）:" max_runtime
+# 提示用户输入最大运行时间和sleep时间
+read -p "请输入最大运行时间（默认12小时，单位为小时）: " max_runtime
 max_runtime=${max_runtime:-12}
 
-read -p "请输入 sleep 时间（默认 4 小时，单位为小时）:" sleep_time
+read -p "请输入sleep时间（默认4小时，单位为小时）: " sleep_time
 sleep_time=${sleep_time:-4}
 
-# 检查最大运行时间是否为 sleep 时间的整数倍数
-if ((max_runtime % sleep_time != 0)); then
-    echo "最大运行时间必须为 sleep 时间的整数倍数。请重新输入。"
+# 检查最大运行时间是否为sleep时间的整数倍数
+if (( max_runtime % sleep_time != 0 )); then
+    echo "最大运行时间必须为sleep时间的整数倍数。请重新输入。"
     exit 1
 fi
 
@@ -32,7 +32,7 @@ execute_command() {
         output=$(eval "$cmd" 2>&1)
         echo "$output"
 
-        if [[$output != *"Error"*]]; then
+        if [[ $output != *"Error"* ]]; then
             return 0
         else
             echo "命令执行失败，检测到错误。"
@@ -45,7 +45,7 @@ execute_command() {
 
 # 定义信号处理函数
 handle_sigint() {
-    echo -e "\n 检测到 Ctrl+C，强制退出脚本。"
+    echo -e "\n检测到 Ctrl+C，强制退出脚本。"
     exit 1
 }
 
@@ -53,7 +53,7 @@ handle_sigint() {
 trap 'handle_sigint' SIGINT
 
 # 计算循环次数
-loops=$((max_runtime / sleep_time))
+loops=$(( max_runtime / sleep_time ))
 
 # 执行循环
 for ((i=1; i<=loops; i++)); do
@@ -64,25 +64,25 @@ for ((i=1; i<=loops; i++)); do
     # 执行所有命令
     for cmd in "${commands[@]}"; do
         execute_command "$cmd"
-        if [[$? -ne 0]]; then
+        if [[ $? -ne 0 ]]; then
             failed_commands+=("$cmd")
         fi
     done
 
     # 处理失败的命令
-    if [[${#failed_commands[@]} -ne 0 ]]; then
+    if [[ ${#failed_commands[@]} -ne 0 ]]; then
         echo "尝试重试失败的命令..."
 
         for failed_cmd in "${failed_commands[@]}"; do
             execute_command "$failed_cmd"
-            if [[$? -ne 0]]; then
+            if [[ $? -ne 0 ]]; then
                 echo "跳过命令: $failed_cmd"
             fi
         done
     fi
 
     # 如果还有下一轮循环，sleep
-    if ((i < loops)); then
+    if (( i < loops )); then
         echo "等待 $sleep_time 小时..."
         sleep $((sleep_time * 3600)) &
         sleep_pid=$!

@@ -15,6 +15,10 @@ def generate_bearer_token(addr, hex_value):
     auth_header = base64.b64encode(auth_string.encode()).decode()
     return auth_header
 
+def is_valid_cid(cid):
+    # Check if CID starts with "Qm", "bafy", or "bafk"
+    return cid.startswith("Qm") or cid.startswith("bafy") or cid.startswith("bafk")
+
 def upload_file(file_path, relative_path, gateway_url, headers, retries, file_index, total_files, verify_ssl, debug_mode):
     url = f"{gateway_url}/api/v0/add?pin=true&cid-version=1"
     file_size = os.path.getsize(file_path)  # Calculate file size locally
@@ -30,14 +34,18 @@ def upload_file(file_path, relative_path, gateway_url, headers, retries, file_in
                 if response.status_code == 200:
                     res_json = response.json()
                     file_hash = res_json.get('Hash', 'N/A')
-                    progress_bar.update(100)
-                    progress_bar.close()
-                    print(f"file {file_index}/{total_files} upload successfully")
-                    return "success", os.path.basename(file_path), relative_path, file_hash, file_size
+                    
+                    # Check if the CID hash is valid
+                    if is_valid_cid(file_hash):
+                        progress_bar.update(100)
+                        progress_bar.close()
+                        print(f"file {file_index}/{total_files} upload successfully")
+                        return "success", os.path.basename(file_path), relative_path, file_hash, file_size
+                    else:
+                        print(f"Invalid CID received for {os.path.basename(file_path)}: {file_hash}")
                 else:
                     # For any non-200 response, treat the upload as failed and retry
-                    attempt += 1
-                    print(f"Attempt {attempt}/{retries} failed for {os.path.basename(file_path)}.")
+                    print(f"Attempt {attempt + 1}/{retries} failed for {os.path.basename(file_path)}.")
                     if debug_mode:
                         print(f"Response status code: {response.status_code}")
                         print(f"Response content: {response.content.decode('utf-8')}")
@@ -45,8 +53,11 @@ def upload_file(file_path, relative_path, gateway_url, headers, retries, file_in
                         # Handle specific large file issue and exit retry
                         print(f"File {os.path.basename(file_path)} is too large to upload.")
                         break
-                    progress_bar.update(20)
-                    sleep(1)  # Delay between retries
+                
+                attempt += 1
+                progress_bar.update(20)
+                sleep(1)  # Delay between retries
+
             except Exception as e:
                 attempt += 1
                 print(f"Error on attempt {attempt}/{retries} for {os.path.basename(file_path)}.")
@@ -55,8 +66,9 @@ def upload_file(file_path, relative_path, gateway_url, headers, retries, file_in
                     traceback.print_exc()  # Print full traceback when in debug mode
                 progress_bar.update(20)
                 sleep(1)
+
         progress_bar.close()
-    print(f"file {file_index}/{total_files} failed to upload")
+    print(f"file {file_index}/{total_files} failed to upload after {retries} attempts.")
     return "failed", os.path.basename(file_path), relative_path, None, file_size
 
 def recursive_upload(folder_path, gateway_url, headers, retries, verify_ssl, debug_mode):

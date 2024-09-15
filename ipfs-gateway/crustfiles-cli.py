@@ -68,6 +68,9 @@ def recursive_upload(folder_path, gateway_url, headers, retries, verify_ssl, deb
             relative_path = os.path.relpath(full_path, folder_path)  # Calculate relative path
             files_list.append((full_path, relative_path))
 
+    # Sort the files list based on the file name
+    files_list.sort(key=lambda x: x[1])
+
     total_files = len(files_list)
     print(f"total files to upload: {total_files}")
 

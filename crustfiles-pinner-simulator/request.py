@@ -47,8 +47,7 @@ def read_user_input():
 
 def process_entries(entries, auth_token, max_retries):
     total = len(entries)
-    success_entries = []
-    failed_entries = []
+    status_entries = []
 
     headers_options = {
         'Accept': '*/*',
@@ -83,30 +82,36 @@ def process_entries(entries, auth_token, max_retries):
         size = entry['size']
         logging.info(f'start processing {idx}/{total}.')
         success = False
+        response_status_code = None
 
         # OPTIONS request
         for attempt in range(1, max_retries + 1):
             try:
                 logging.debug(f'Attempting OPTIONS request {attempt}/{max_retries}')
                 response = requests.options(url, headers=headers_options)
+                response_status_code = response.status_code
                 logging.debug(f'OPTIONS request headers: {headers_options}')
                 logging.debug(f'OPTIONS response status code: {response.status_code}')
                 logging.debug(f'OPTIONS response headers: {response.headers}')
-                if response.status_code == 200:
+                if 200 <= response.status_code < 300:
+                    # Success on OPTIONS request
                     break
-                elif response.status_code == 522:
-                    logging.warning(f'failed {idx}/{total}, response is 522, retry in {attempt}/{max_retries}...')
+                elif 400 <= response.status_code < 600:
+                    # Fail and retry
+                    logging.warning(f'failed {idx}/{total}, response is {response.status_code}, retry in {attempt}/{max_retries}...')
                 else:
                     logging.error(f'Unexpected response code {response.status_code} during OPTIONS request.')
-                    break
             except requests.exceptions.RequestException as e:
                 logging.error(f'Exception during OPTIONS request: {e}')
             if attempt == max_retries:
-                logging.error(f'failed {idx}/{total}, response is 522, retry count exceeded, skipped by now.')
-                failed_entries.append(entry)
+                logging.error(f'failed {idx}/{total}, response is {response_status_code}, retry count exceeded, skipped by now.')
+                status_entries.append({'status_code': response_status_code, 'status': 'failed', 'file_name': file_name, 'entry': entry})
                 break
         else:
             continue  # Skip to next entry if OPTIONS request fails
+
+        if attempt == max_retries and response_status_code != 200:
+            continue  # Skip to next entry if OPTIONS request fails after retries
 
         # POST request
         payload = {'cid': cid, 'name': file_name}
@@ -114,44 +119,49 @@ def process_entries(entries, auth_token, max_retries):
             try:
                 logging.debug(f'Attempting POST request {attempt}/{max_retries}')
                 response = requests.post(url, headers=headers_post, json=payload)
+                response_status_code = response.status_code
                 logging.debug(f'POST request headers: {headers_post}')
                 logging.debug(f'POST request payload: {payload}')
                 logging.debug(f'POST response status code: {response.status_code}')
                 logging.debug(f'POST response headers: {response.headers}')
                 logging.debug(f'POST response content: {response.text}')
-                if response.status_code == 200:
-                    logging.info(f'success {idx}/{total}, response is 200.')
+                if 200 <= response.status_code < 300:
+                    logging.info(f'{response.status_code} success {idx}/{total}.')
                     success = True
-                    success_entries.append(entry)
+                    status_entries.append({'status_code': response_status_code, 'status': 'success', 'file_name': file_name})
                     break
-                elif response.status_code == 522:
-                    logging.warning(f'failed {idx}/{total}, response is 522, retry in {attempt}/{max_retries}...')
+                elif 400 <= response.status_code < 600:
+                    logging.warning(f'failed {idx}/{total}, response is {response.status_code}, retry in {attempt}/{max_retries}...')
                 else:
                     logging.error(f'Unexpected response code {response.status_code} during POST request.')
-                    break
             except requests.exceptions.RequestException as e:
                 logging.error(f'Exception during POST request: {e}')
             if attempt == max_retries:
-                logging.error(f'failed {idx}/{total}, response is 522, retry count exceeded, skipped by now.')
-                failed_entries.append(entry)
-        if not success and entry not in failed_entries:
-            failed_entries.append(entry)
-    return success_entries, failed_entries
+                logging.error(f'failed {idx}/{total}, response is {response_status_code}, retry count exceeded, skipped by now.')
+                status_entries.append({'status_code': response_status_code, 'status': 'failed', 'file_name': file_name, 'entry': entry})
+        if not success and not any(d['file_name'] == file_name for d in status_entries):
+            status_entries.append({'status_code': response_status_code, 'status': 'failed', 'file_name': file_name, 'entry': entry})
+    return status_entries
 
-def print_summary(success_entries, failed_entries):
+def print_summary(status_entries):
     print('---')
     print('process completed. status:')
     print()
-    for entry in success_entries:
-        print(f'success {entry["file_name"]}')
-    for entry in failed_entries:
-        print(f'failed {entry["file_name"]}')
+    failed_entries = []
+    for entry in status_entries:
+        status_code = entry['status_code']
+        status = entry['status']
+        file_name = entry['file_name']
+        print(f'{status_code} {status}\t{file_name}')
+        if status == 'failed':
+            failed_entries.append(entry)
     print('---')
     if failed_entries:
         print('---')
         print('files that need to be retried (in table):')
         for entry in failed_entries:
-            print(f'{entry["file_name"]}\t{entry["cid"]}\t{entry["size"]}')
+            file_entry = entry['entry']
+            print(f'{file_entry["file_name"]}\t{file_entry["cid"]}\t{file_entry["size"]}')
         print('---')
 
 def main():
@@ -167,8 +177,8 @@ def main():
     if not entries:
         logging.info('No entries to process.')
         sys.exit(0)
-    success_entries, failed_entries = process_entries(entries, args.auth, args.retries)
-    print_summary(success_entries, failed_entries)
+    status_entries = process_entries(entries, args.auth, args.retries)
+    print_summary(status_entries)
 
 if __name__ == '__main__':
     main()

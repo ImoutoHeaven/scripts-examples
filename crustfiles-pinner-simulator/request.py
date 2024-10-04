@@ -14,8 +14,8 @@ def parse_arguments():
     parser.add_argument('--auth', required=True, help='Authorization token')
     parser.add_argument('--low-level-retries', dest='low_level_retries', type=int, default=10,
                         help='Number of retries for each failed request (POST or OPTIONS)')
-    parser.add_argument('--retries', type=int, default=3,
-                        help='Number of times to retry processing failed files')
+    parser.add_argument('--retries', type=str, default='3',
+                        help='Number of times to retry processing failed files. Use "unless-stopped" for infinite retries.')
     parser.add_argument('--cooldown', type=str, default='1h',
                         help='Cooldown period between retries (e.g., 30s, 10m, 1h, 2d, 1w)')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
@@ -199,6 +199,18 @@ def main():
         logging.getLogger('urllib3').setLevel(logging.DEBUG)
         logging.debug('Debug logging enabled')
 
+    # Process args.retries
+    if args.retries == 'unless-stopped':
+        max_retries = None  # Infinite retries
+    else:
+        try:
+            max_retries = int(args.retries)
+            if max_retries < 0:
+                raise ValueError
+        except ValueError:
+            logging.error('Invalid value for --retries. Must be a non-negative integer or "unless-stopped".')
+            sys.exit(1)
+
     entries = read_user_input()
     if not entries:
         logging.info('No entries to process.')
@@ -213,9 +225,12 @@ def main():
     retry_count = 0
     status_dict = {}  # key: (file_name, cid), value: status_entry
 
-    while retry_count <= args.retries:
+    while True:
         if retry_count > 0:
-            logging.info(f'Retry attempt {retry_count}/{args.retries}')
+            if max_retries is not None:
+                logging.info(f'Retry attempt {retry_count}/{max_retries}')
+            else:
+                logging.info(f'Retry attempt {retry_count}')
         status_entries = process_entries(entries, args.auth, args.low_level_retries)
         # Update status_dict with the latest status
         for entry in status_entries:
@@ -224,9 +239,10 @@ def main():
         # Collect failed entries
         failed_entries = [entry['entry'] for entry in status_entries if entry['status'] == 'failed']
         if failed_entries:
-            if retry_count < args.retries:
-                logging.info(f'Failed entries detected. Waiting for {cooldown_seconds} seconds before retrying.')
-                time.sleep(cooldown_seconds)
+            if max_retries is None or retry_count < max_retries:
+                if retry_count > 0:
+                    logging.info(f'Failed entries detected. Waiting for {cooldown_seconds} seconds before retrying.')
+                    time.sleep(cooldown_seconds)
                 entries = failed_entries
                 retry_count += 1
             else:

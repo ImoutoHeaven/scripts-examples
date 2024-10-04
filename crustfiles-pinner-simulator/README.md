@@ -1,11 +1,11 @@
-## CrustFiles crust pinner call-simulator.
+# CrustFiles crust pinner call-simulator.
 
-# Usage:
+## Usage:
 ```
-python3 request.py --auth <your bearer token(without Bearer :)> --retries=10
+python3 request.py --auth <your bearer token(without Bearer :)> --retries=10 [--debug]
 ```
 
-# User Input:
+## User Input:
 ```
 my file name with spaces    bafy123cidvalue    12345
 another file.txt    bafy456cidvalue    67890

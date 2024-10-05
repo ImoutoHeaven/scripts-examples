@@ -101,4 +101,4 @@ example-image.jpg  QmAnotherCid0987654321  54321
 
 ## License
 
-This project is licensed under the MIT License.
+No License. Use at your own risk. 

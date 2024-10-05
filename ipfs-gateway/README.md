@@ -57,4 +57,4 @@ python ipfs_uploader.py -gw http://localhost:5001 --addr your_address --hex your
 - By default, SSL verification is disabled, but this can be adjusted with `--allow-insecure`.
 
 ## License
-This project is licensed under GPL-3.0-only.
+No License. Use at your own risk.

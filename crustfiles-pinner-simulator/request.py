@@ -5,6 +5,7 @@ import requests
 import logging
 import time
 import re
+import os
 
 # Configure the basic logging format
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -19,6 +20,7 @@ def parse_arguments():
     parser.add_argument('--cooldown', type=str, default='1h',
                         help='Cooldown period between retries (e.g., 30s, 10m, 1h, 2d, 1w)')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
+    parser.add_argument('--input', type=str, help='Path to input file containing file table')
     return parser.parse_args()
 
 def parse_cooldown(cooldown_str):
@@ -40,40 +42,51 @@ def parse_cooldown(cooldown_str):
     else:
         raise ValueError('Invalid time unit in cooldown')
 
-def read_user_input():
-    print('---')
-    print('CrustFiles Pinner CallCommand ver1.0')
-    print('Input file name and cid tables:')
-    print('<user input...>')
-    print('[example:')
-    print('<file name 1> <space/tab> <file cid 1> <space/tab> <file size 1>')
-    print('<file name 2> <space/tab> <file cid 2> <space/tab> <file size 2>')
-    print('...')
-    print('<file name i> <space/tab> <file cid i> <space/tab> <file size i>')
-    print(']')
-    print('(attention: Press Ctrl+D to start execution)')
-    print('---')
-
+def read_user_input(input_file=None):
     entries = []
-    try:
-        for line in sys.stdin:
-            line = line.strip()
-            if not line:
-                continue
-            tokens = line.rsplit(None, 2)
-            if len(tokens) != 3:
-                print(f'Invalid input line: "{line}"')
-                continue
-            file_name, cid, size = tokens
-            entries.append({'file_name': file_name, 'cid': cid, 'size': size})
-    except EOFError:
-        pass
-    print('---')
+    
+    if input_file:
+        if not os.path.exists(input_file):
+            logging.error(f'File {input_file} does not exist.')
+            sys.exit(1)
+        with open(input_file, 'r') as file:
+            lines = file.readlines()
+    else:
+        lines = []
+        try:
+            for line in sys.stdin:
+                lines.append(line.strip())
+        except EOFError:
+            pass
+    
+    for line in lines:
+        line = line.strip()  # 去除空白字符
+        if not line:
+            continue  # 跳过空行
+        tokens = line.rsplit(None, 2)  # 逆向分割，最后两个部分是CID和文件大小
+        if len(tokens) != 3:
+            logging.warning(f'Invalid input line: "{line}". Expected format: <file_name> <cid> <size>. Skipping...')
+            continue
+        file_name, cid, size = tokens
+        
+        # 使用正则表达式仅检查CID是否由合法字符组成
+        if not re.match(r'^[a-zA-Z0-9]+$', cid):  # CID格式校验，CID必须由大小写英文和数字组成
+            logging.warning(f'Invalid CID format: "{cid}" in line "{line}". Skipping...')
+            continue
+        if not size.isdigit():  # 确保size是数字
+            logging.warning(f'Invalid size: "{size}" in line "{line}". Skipping...')
+            continue
+        entries.append({'file_name': file_name, 'cid': cid, 'size': size})
+    
     return entries
 
 def process_entries(entries, auth_token, max_retries):
+    if not entries:
+        logging.info("No entries to process.")
+        return []
+
     total = len(entries)
-    status_entries = []
+    status_entries = []  # 确保status_entries为列表
 
     headers_options = {
         'Accept': '*/*',
@@ -106,7 +119,7 @@ def process_entries(entries, auth_token, max_retries):
         file_name = entry['file_name']
         cid = entry['cid']
         size = entry['size']
-        logging.info(f'start processing {idx}/{total}.')
+        logging.info(f'Start processing {idx}/{total}.')
         success = False
         response_status_code = None
 
@@ -116,25 +129,18 @@ def process_entries(entries, auth_token, max_retries):
                 logging.debug(f'Attempting OPTIONS request {attempt}/{max_retries}')
                 response = requests.options(url, headers=headers_options)
                 response_status_code = response.status_code
-                logging.debug(f'OPTIONS request headers: {headers_options}')
-                logging.debug(f'OPTIONS response status code: {response.status_code}')
-                logging.debug(f'OPTIONS response headers: {response.headers}')
                 if 200 <= response.status_code < 300:
-                    # Success on OPTIONS request
                     break
                 elif 400 <= response.status_code < 600:
-                    # Fail and retry
-                    logging.warning(f'failed {idx}/{total}, response is {response.status_code}, retry in {attempt}/{max_retries}...')
+                    logging.warning(f'Failed OPTIONS request {attempt}/{max_retries}, response is {response.status_code}, retrying (low level retry {attempt}/{max_retries})...')
                 else:
                     logging.error(f'Unexpected response code {response.status_code} during OPTIONS request.')
             except requests.exceptions.RequestException as e:
                 logging.error(f'Exception during OPTIONS request: {e}')
             if attempt == max_retries:
-                logging.error(f'failed {idx}/{total}, response is {response_status_code}, retry count exceeded, skipped by now.')
+                logging.error(f'Failed OPTIONS request {attempt}/{max_retries}, retry count exceeded.')
                 status_entries.append({'status_code': response_status_code, 'status': 'failed', 'file_name': file_name, 'cid': cid, 'entry': entry})
                 break
-        else:
-            continue  # Skip to next entry if OPTIONS request fails
 
         if attempt == max_retries and response_status_code not in range(200, 300):
             continue  # Skip to next entry if OPTIONS request fails after retries
@@ -146,32 +152,27 @@ def process_entries(entries, auth_token, max_retries):
                 logging.debug(f'Attempting POST request {attempt}/{max_retries}')
                 response = requests.post(url, headers=headers_post, json=payload)
                 response_status_code = response.status_code
-                logging.debug(f'POST request headers: {headers_post}')
-                logging.debug(f'POST request payload: {payload}')
-                logging.debug(f'POST response status code: {response.status_code}')
-                logging.debug(f'POST response headers: {response.headers}')
-                logging.debug(f'POST response content: {response.text}')
                 if 200 <= response.status_code < 300:
-                    logging.info(f'{response_status_code} success {idx}/{total}.')
+                    logging.info(f'Successful POST request for {file_name}.')
                     success = True
                     status_entries.append({'status_code': response_status_code, 'status': 'success', 'file_name': file_name, 'cid': cid, 'entry': entry})
                     break
                 elif 400 <= response.status_code < 600:
-                    logging.warning(f'failed {idx}/{total}, response is {response_status_code}, retry in {attempt}/{max_retries}...')
+                    logging.warning(f'Failed POST request {attempt}/{max_retries}, response is {response_status_code}, retrying (low level retry {attempt}/{max_retries})...')
                 else:
                     logging.error(f'Unexpected response code {response_status_code} during POST request.')
             except requests.exceptions.RequestException as e:
                 logging.error(f'Exception during POST request: {e}')
             if attempt == max_retries:
-                logging.error(f'failed {idx}/{total}, response is {response_status_code}, retry count exceeded, skipped by now.')
+                logging.error(f'Failed POST request {attempt}/{max_retries}, retry count exceeded.')
                 status_entries.append({'status_code': response_status_code, 'status': 'failed', 'file_name': file_name, 'cid': cid, 'entry': entry})
-        if not success and not any(d['file_name'] == file_name and d['cid'] == cid for d in status_entries):
-            status_entries.append({'status_code': response_status_code, 'status': 'failed', 'file_name': file_name, 'cid': cid, 'entry': entry})
-    return status_entries
+
+    return status_entries  # 确保返回status_entries列表
+
 
 def print_summary(status_entries):
     print('---')
-    print('process completed. status:')
+    print('Process completed. Status:')
     print()
     failed_entries = []
     for entry in status_entries:
@@ -183,8 +184,7 @@ def print_summary(status_entries):
             failed_entries.append(entry)
     print('---')
     if failed_entries:
-        print('---')
-        print('files that need to be retried (in table):')
+        print('Files that need to be retried (in table):')
         for entry in failed_entries:
             file_entry = entry['entry']
             print(f'{file_entry["file_name"]}\t{file_entry["cid"]}\t{file_entry["size"]}')
@@ -193,13 +193,10 @@ def print_summary(status_entries):
 def main():
     args = parse_arguments()
     if args.debug:
-        # Set logging level to DEBUG
         logging.getLogger().setLevel(logging.DEBUG)
-        # Enable debugging for requests library
         logging.getLogger('urllib3').setLevel(logging.DEBUG)
         logging.debug('Debug logging enabled')
 
-    # Process args.retries
     if args.retries == 'unless-stopped':
         max_retries = None  # Infinite retries
     else:
@@ -211,7 +208,7 @@ def main():
             logging.error('Invalid value for --retries. Must be a non-negative integer or "unless-stopped".')
             sys.exit(1)
 
-    entries = read_user_input()
+    entries = read_user_input(args.input)
     if not entries:
         logging.info('No entries to process.')
         sys.exit(0)
@@ -223,7 +220,7 @@ def main():
         sys.exit(1)
 
     retry_count = 0
-    status_dict = {}  # key: (file_name, cid), value: status_entry
+    status_dict = {}
 
     while True:
         if retry_count > 0:
@@ -231,29 +228,31 @@ def main():
                 logging.info(f'Retry attempt {retry_count}/{max_retries}')
             else:
                 logging.info(f'Retry attempt {retry_count}')
+        
         status_entries = process_entries(entries, args.auth, args.low_level_retries)
-        # Update status_dict with the latest status
+        if not status_entries:
+            logging.info('No status entries returned.')
+            break
+        
         for entry in status_entries:
             key = (entry['file_name'], entry['cid'])
             status_dict[key] = entry
-        # Collect failed entries
+        
         failed_entries = [entry['entry'] for entry in status_entries if entry['status'] == 'failed']
         if failed_entries:
             if max_retries is None or retry_count < max_retries:
-                if retry_count > 0:
-                    logging.info(f'Failed entries detected. Waiting for {cooldown_seconds} seconds before retrying.')
-                    time.sleep(cooldown_seconds)
+                logging.info(f'Waiting for {cooldown_seconds} seconds before retrying failed entries.')
+                time.sleep(cooldown_seconds)
                 entries = failed_entries
                 retry_count += 1
             else:
                 logging.info('Maximum number of retries reached. Exiting.')
                 break
         else:
-            # All entries processed successfully
             break
 
-    # After all retries, print summary
     print_summary(list(status_dict.values()))
 
 if __name__ == '__main__':
     main()
+

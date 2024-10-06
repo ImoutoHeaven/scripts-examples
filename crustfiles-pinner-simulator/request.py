@@ -52,6 +52,20 @@ def read_user_input(input_file=None):
         with open(input_file, 'r') as file:
             lines = file.readlines()
     else:
+        # 提示用户交互输入
+        print('---')
+        print('CrustFiles Pinner CallCommand ver1.0')
+        print('Input file name and cid tables:')
+        print('<user input...>')
+        print('[example:')
+        print('<file name 1> <space/tab> <file cid 1> <space/tab> <file size 1>')
+        print('<file name 2> <space/tab> <file cid 2> <space/tab> <file size 2>')
+        print('...]')
+        print('<file name i> <space/tab> <file cid i> <space/tab> <file size i>')
+        print(']')
+        print('(attention: Press Ctrl+D to start execution)')
+        print('---')
+        
         lines = []
         try:
             for line in sys.stdin:
@@ -79,6 +93,7 @@ def read_user_input(input_file=None):
         entries.append({'file_name': file_name, 'cid': cid, 'size': size})
     
     return entries
+
 
 def process_entries(entries, auth_token, max_retries):
     if not entries:

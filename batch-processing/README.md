@@ -1,155 +1,83 @@
 
-# 文件名重命名脚本 renamev9.py
+# Filename Processor Script
 
-## 描述
-此 Python 脚本用于批量重命名指定文件夹中的文件和文件夹名，主要目标是标准化命名格式，移除多余字符，替换括号类型，以及规范化空格使用。它特别适用于需要处理大量含有特定格式字符或关键词的文件名的场景。
+This script processes filenames (and folder names) in a specified directory. It standardizes naming conventions, rearranges tags, and performs checks for compliance. The script provides warnings for non-compliant names and offers a `--dry-run` option to preview changes.
 
-## 功能
-- 处理文件名中的各种中、英文括号，并将其替换为统一格式。
-- 移除 `(同人誌)` 的内容。
-- 将某些关键词（如 `汉化`、`翻译` 等）包裹在方括号中。
-- 处理特定情况下需要移动方括号的位置。
-- 将版本号如 `v2/v3/v4` 等包裹在方括号中（如果它们不在已有的方括号内）。
-- 替换文件名中的下划线为空格，并规范空格的使用。
+## Features
+- **Bracket Replacement**: Converts special brackets (e.g., `【】`, `（）`) into standard ones (`[]`, `()`).
+- **Keyword Handling**: Replaces keywords inside `()` with `[]` for better readability.
+- **Version Tag Normalization**: Converts `v2`, `v3`, etc., into `[v2]`, `[v3]` unless they are already inside square brackets.
+- **Whitespace Handling**: Replaces underscores with spaces and normalizes whitespace.
+- **Tag Rearrangement**: Sorts and places specific tags in the correct order at the end of filenames.
+- **Compliance Check**: Ensures filenames start correctly with `[]` or `()` and follow other specific conventions.
 
-## 使用方法
-1. 将脚本保存为 `script.py`。
-2. 在终端中运行以下命令：
-
-   ```bash
-   python script.py /path/to/folder [--dry-run]
-   ```
-
-   - `/path/to/folder` 是需要处理的文件夹路径。
-   - `--dry-run` 参数是可选的，用于进行模拟重命名操作，不会对文件进行实际修改，只会打印重命名预览。
-
-## 参数
-- `folder_path`：需要处理的文件夹路径。
-- `--dry-run`：可选参数。如果指定此参数，脚本只会显示重命名的变化，而不会实际更改文件名。
-
-## 注意事项
-- 如果文件或文件夹名包含不匹配的括号（例如多余的关闭括号或缺少的打开括号），脚本会抛出错误，并要求用户手动处理。
-- 如果文件名以 `.` 开头（即隐藏文件），脚本不会对其进行处理。
-- 当进行实际重命名时，脚本会在终端中显示重命名的旧路径和新路径。
-
-## 示例
-假设我们有一个包含以下文件的文件夹：
-
-```
-/path/to/folder/
-  ├── [Pixiv]作品1_v2 (汉化).zip
-  └── (个人)作品2_(同人誌).zip
-```
-
-运行以下命令：
-
+## Usage
 ```bash
-python script.py /path/to/folder
+python script.py /path/to/folder [--dry-run]
+```
+- `/path/to/folder`: The path to the directory to process.
+- `--dry-run`: Optional. Use this flag to preview changes without applying them.
+
+## Example Input and Output
+
+### Example 1: Standard Case
+**Input Filename:**
+```
+【Pixiv】_v2_测试文件_(汉化).zip
+```
+**Output Filename:**
+```
+测试文件 [Pixiv] [v2] [汉化].zip
 ```
 
-将会对文件进行如下重命名：
-
+### Example 2: Folder Renaming
+**Input Folder:**
 ```
-/path/to/folder/
-  ├── 作品1 [v2] [Pixiv] (汉化).zip
-  └── 作品2.zip
+【Patreon】_项目_v3_(中文)
 ```
-
-## 错误处理
-- 如果文件或文件夹名中存在未匹配的括号，脚本会抛出 `ValueError` 并终止执行，提示用户手动解决问题。
-
-## 环境要求
-- Python 3.8 及以上版本
-- 依赖标准库模块 `os`、`sys` 和 `re`
-
-## 作者
-本脚本由 OpenAI 的 GPT-3.5 生成并修改。无版权信息, 你可以随意使用。
-
-
-
-
-
-
-# 目录优化脚本 dir_flatten.py
-
-## 描述
-此 Python 脚本用于优化指定目录的结构，通过删除冗余的嵌套文件夹并将文件移至上级目录，使得目录结构更为简洁、易于管理。它非常适用于处理包含大量嵌套子目录且目录层次结构需要简化的情况。
-
-## 功能
-- 移动嵌套文件夹中的文件和子目录到其父目录中，以减少嵌套层级。
-- 删除空的目录。
-- 提供 `--dry-run` 模式预览更改内容，而不对实际文件进行修改。
-
-## 使用方法
-1. 将脚本保存为 `optimize_directory.py`。
-2. 在终端中运行以下命令：
-
-   ```bash
-   python optimize_directory.py /path/to/directory [--dry-run]
-   ```
-
-   - `/path/to/directory` 是需要优化的目录路径。
-   - `--dry-run` 参数是可选的，用于进行模拟优化操作，不会对文件进行实际修改，只会打印优化预览。
-
-## 参数
-- `path`：需要优化的目录路径，可以是相对路径或绝对路径。
-- `--dry-run`：可选参数。如果指定此参数，脚本只会显示即将进行的更改，而不会实际更改目录结构。
-
-## 注意事项
-- 脚本会逐层遍历目录结构并对冗余的嵌套文件夹进行优化。
-- 在移动文件或文件夹时，如果目标目录中已经存在同名文件或文件夹，脚本会跳过这些项目并给出提示。
-- 如果目录不是有效的路径，脚本会抛出错误并终止执行。
-
-## 示例
-假设我们有以下目录结构：
-
+**Output Folder:**
 ```
-/path/to/directory/
-  ├── nested_folder1/
-  │   └── file1.txt
-  └── nested_folder2/
-      └── file2.txt
+项目 [Patreon] [v3] [中文]
 ```
 
-运行以下命令：
+## Warnings and Errors
 
+### Warnings
+If a filename does not conform to the naming conventions, it will be listed under warnings:
+```
+WARNING: The following files do not conform to the naming convention and require manual renaming:
+Test_file
+```
+
+### Errors
+The script checks for unmatched brackets. If detected, it will stop execution with an error message:
+```
+Error: Unmatched opening '(' in 'Test(漢化.zip'. Please handle the issue manually. No changes have been made.
+```
+
+## Dry Run Mode
+Using `--dry-run` allows you to preview the changes without applying them:
 ```bash
-python optimize_directory.py /path/to/directory
+python script.py /path/to/folder --dry-run
+```
+Example Output:
+```
+Rename: /path/to/folder/【Pixiv】_测试文件_(汉化).zip -> /path/to/folder/测试文件 [Pixiv] [汉化].zip
 ```
 
-将会优化目录结构为：
+## Requirements
+- Python 3.8 or above
 
-```
-/path/to/directory/
-  ├── file1.txt
-  ├── file2.txt
-```
+## Error Handling
+- **Unmatched Brackets**: The script will stop and raise a `ValueError` if there are unmatched brackets.
+- **OS Errors**: If the script cannot rename a file due to system restrictions, it will display an error message.
 
-并删除空的嵌套文件夹。
+## License
+This script is licensed under the MIT License.
 
-## 错误处理
-- 如果提供的路径不是有效目录，脚本会显示错误信息并终止执行。
-- 如果目录中存在未处理的冲突（如同名文件），脚本会跳过这些文件并输出提示。
+## Author
+This script was generated based on user-provided logic.
 
-## 环境要求
-- Python 3.8 及以上版本
-- 依赖标准库模块 `os`、`sys`、`shutil` 和 `argparse`
+---
 
-## 作者
-本脚本由 OpenAI 的 GPT-3.5 生成并修改。无版权信息, 你可以随意使用。
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+**Note:** Use this script with caution, especially if running without `--dry-run`. Ensure you have backups of your files.

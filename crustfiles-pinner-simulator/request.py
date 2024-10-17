@@ -6,6 +6,7 @@ import logging
 import time
 import re
 import os
+from urllib.parse import urlparse
 
 # Configure the basic logging format
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -21,6 +22,7 @@ def parse_arguments():
                         help='Cooldown period between retries (e.g., 30s, 10m, 1h, 2d, 1w)')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     parser.add_argument('--input', type=str, help='Path to input file containing file table')
+    parser.add_argument('--url', default='https://pin.crustcode.com:443', help='Server URL including protocol and port, e.g., https://xxx.com:443')
     return parser.parse_args()
 
 def parse_cooldown(cooldown_str):
@@ -52,7 +54,7 @@ def read_user_input(input_file=None):
         with open(input_file, 'r') as file:
             lines = file.readlines()
     else:
-        # 提示用户交互输入
+        # Prompt user for interactive input
         print('---')
         print('CrustFiles Pinner CallCommand ver1.0')
         print('Input file name and cid tables:')
@@ -74,34 +76,40 @@ def read_user_input(input_file=None):
             pass
     
     for line in lines:
-        line = line.strip()  # 去除空白字符
+        line = line.strip()  # Remove whitespace characters
         if not line:
-            continue  # 跳过空行
-        tokens = line.rsplit(None, 2)  # 逆向分割，最后两个部分是CID和文件大小
+            continue  # Skip empty lines
+        tokens = line.rsplit(None, 2)  # Reverse split, last two parts are CID and file size
         if len(tokens) != 3:
             logging.warning(f'Invalid input line: "{line}". Expected format: <file_name> <cid> <size>. Skipping...')
             continue
         file_name, cid, size = tokens
         
-        # 使用正则表达式仅检查CID是否由合法字符组成
-        if not re.match(r'^[a-zA-Z0-9]+$', cid):  # CID格式校验，CID必须由大小写英文和数字组成
+        # Use regular expression to check if CID consists of valid characters
+        if not re.match(r'^[a-zA-Z0-9]+$', cid):  # CID format validation, CID must consist of letters and numbers
             logging.warning(f'Invalid CID format: "{cid}" in line "{line}". Skipping...')
             continue
-        if not size.isdigit():  # 确保size是数字
+        if not size.isdigit():  # Ensure size is a number
             logging.warning(f'Invalid size: "{size}" in line "{line}". Skipping...')
             continue
         entries.append({'file_name': file_name, 'cid': cid, 'size': size})
     
     return entries
 
-
-def process_entries(entries, auth_token, max_retries):
+def process_entries(entries, auth_token, max_retries, url):
     if not entries:
         logging.info("No entries to process.")
         return []
 
     total = len(entries)
-    status_entries = []  # 确保status_entries为列表
+    status_entries = []
+
+    base_url = url.rstrip('/')
+    full_url = f'{base_url}/psa/pins'
+
+    parsed_url = urlparse(base_url)
+    origin = f'{parsed_url.scheme}://{parsed_url.netloc}'
+    referer = f'{origin}/'
 
     headers_options = {
         'Accept': '*/*',
@@ -109,8 +117,8 @@ def process_entries(entries, auth_token, max_retries):
         'Accept-Language': 'zh-CN,zh;q=0.9',
         'Access-Control-Request-Headers': 'authorization,content-type',
         'Access-Control-Request-Method': 'POST',
-        'Origin': 'https://crustfiles.io',
-        'Referer': 'https://crustfiles.io/',
+        'Origin': origin,
+        'Referer': referer,
         'Sec-Fetch-Dest': 'empty',
         'Sec-Fetch-Mode': 'cors',
         'Sec-Fetch-Site': 'cross-site',
@@ -121,14 +129,12 @@ def process_entries(entries, auth_token, max_retries):
         'Accept': 'application/json, text/plain, */*',
         'Authorization': f'Bearer {auth_token}',
         'Content-Type': 'application/json',
-        'Referer': 'https://crustfiles.io/',
+        'Referer': referer,
         'Sec-CH-UA': '"Chromium";v="127", "Not)A;Brand";v="99"',
         'Sec-CH-UA-Mobile': '?0',
         'Sec-CH-UA-Platform': '"Windows"',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
     }
-
-    url = 'https://pin.crustcode.com/psa/pins'
 
     for idx, entry in enumerate(entries, start=1):
         file_name = entry['file_name']
@@ -142,7 +148,7 @@ def process_entries(entries, auth_token, max_retries):
         for attempt in range(1, max_retries + 1):
             try:
                 logging.debug(f'Attempting OPTIONS request {attempt}/{max_retries}')
-                response = requests.options(url, headers=headers_options)
+                response = requests.options(full_url, headers=headers_options)
                 response_status_code = response.status_code
                 if 200 <= response.status_code < 300:
                     break
@@ -165,14 +171,14 @@ def process_entries(entries, auth_token, max_retries):
         for attempt in range(1, max_retries + 1):
             try:
                 logging.debug(f'Attempting POST request {attempt}/{max_retries}')
-                response = requests.post(url, headers=headers_post, json=payload)
+                response = requests.post(full_url, headers=headers_post, json=payload)
                 response_status_code = response.status_code
                 if 200 <= response.status_code < 300:
                     logging.info(f'Successful POST request for {file_name}.')
                     success = True
                     status_entries.append({'status_code': response_status_code, 'status': 'success', 'file_name': file_name, 'cid': cid, 'entry': entry})
                     break
-                elif 400 <= response.status_code < 600:
+                elif 400 <= response_status_code < 600:
                     logging.warning(f'Failed POST request {attempt}/{max_retries}, response is {response_status_code}, retrying (low level retry {attempt}/{max_retries})...')
                 else:
                     logging.error(f'Unexpected response code {response_status_code} during POST request.')
@@ -182,8 +188,7 @@ def process_entries(entries, auth_token, max_retries):
                 logging.error(f'Failed POST request {attempt}/{max_retries}, retry count exceeded.')
                 status_entries.append({'status_code': response_status_code, 'status': 'failed', 'file_name': file_name, 'cid': cid, 'entry': entry})
 
-    return status_entries  # 确保返回status_entries列表
-
+    return status_entries
 
 def print_summary(status_entries):
     print('---')
@@ -244,7 +249,7 @@ def main():
             else:
                 logging.info(f'Retry attempt {retry_count}')
         
-        status_entries = process_entries(entries, args.auth, args.low_level_retries)
+        status_entries = process_entries(entries, args.auth, args.low_level_retries, args.url)
         if not status_entries:
             logging.info('No status entries returned.')
             break
@@ -270,4 +275,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

@@ -23,14 +23,16 @@ def parse_arguments():
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     parser.add_argument('--input', type=str, help='Path to input file containing file table')
     parser.add_argument('--url', default='https://pin.crustcode.com:443', help='Server URL including protocol and port, e.g., https://xxx.com:443')
-    parser.add_argument('--sleep-retries', type=str, default='auto',
-                        help='Time to sleep when a 403 error occurs (e.g., 30s, 10m, "auto")')
+    parser.add_argument('--timeout-sleep-time', default='2s',
+                        help='Sleep time after 5xx errors (e.g., 2s, 1m). Default is 2s.')
+    parser.add_argument('--ban-max-sleep-time', default='5m',
+                        help='Maximum sleep time after 4xx errors (e.g., 5m, 10s). Default is 5m.')
     return parser.parse_args()
 
-def parse_cooldown(cooldown_str):
-    match = re.match(r'^(\d+)([smhdw])$', cooldown_str)
+def parse_time(time_str):
+    match = re.match(r'^(\d+)([smhdw])$', time_str)
     if not match:
-        raise ValueError('Invalid cooldown format. Use formats like 30s, 10m, 1h, 2d, 1w')
+        raise ValueError('Invalid time format. Use formats like 30s, 10m, 1h, 2d, 1w')
     value = int(match.group(1))
     unit = match.group(2)
     if unit == 's':
@@ -44,7 +46,10 @@ def parse_cooldown(cooldown_str):
     elif unit == 'w':
         return value * 604800
     else:
-        raise ValueError('Invalid time unit in cooldown')
+        raise ValueError('Invalid time unit')
+
+def parse_cooldown(cooldown_str):
+    return parse_time(cooldown_str)
 
 def read_user_input(input_file=None):
     entries = []
@@ -98,7 +103,7 @@ def read_user_input(input_file=None):
     
     return entries
 
-def process_entries(entries, auth_token, max_retries, url, sleep_retries):
+def process_entries(entries, auth_token, max_retries, url, timeout_sleep_time, ban_max_sleep_time):
     if not entries:
         logging.info("No entries to process.")
         return []
@@ -110,12 +115,8 @@ def process_entries(entries, auth_token, max_retries, url, sleep_retries):
     full_url = f'{base_url}/psa/pins'
 
     parsed_url = urlparse(base_url)
-    if parsed_url.netloc == 'pin.crustcode.com:443':
-        origin = 'https://crustfiles.io'
-        referer = 'https://crustfiles.io/'
-    else:
-        origin = f'{parsed_url.scheme}://{parsed_url.netloc}'
-        referer = f'{origin}/'
+    origin = f'{parsed_url.scheme}://{parsed_url.netloc}'
+    referer = f'{origin}/'
 
     headers_options = {
         'Accept': '*/*',
@@ -142,15 +143,18 @@ def process_entries(entries, auth_token, max_retries, url, sleep_retries):
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
     }
 
+    INITIAL_BACKOFF_TIME = 2  # seconds
+
     for idx, entry in enumerate(entries, start=1):
         file_name = entry['file_name']
         cid = entry['cid']
         size = entry['size']
         logging.info(f'Start processing {idx}/{total}.')
+        success = False
         response_status_code = None
 
-        last_5xx_time_options = None
-        last_403_time_options = None
+        backoff_time_options = INITIAL_BACKOFF_TIME
+        backoff_time_post = INITIAL_BACKOFF_TIME
 
         # OPTIONS request
         for attempt in range(1, max_retries + 1):
@@ -159,33 +163,22 @@ def process_entries(entries, auth_token, max_retries, url, sleep_retries):
                 response = requests.options(full_url, headers=headers_options)
                 response_status_code = response.status_code
                 if 200 <= response_status_code < 300:
-                    break  # Success, exit the retry loop
-                elif 500 <= response_status_code < 600:
-                    logging.warning(f'Failed OPTIONS request {attempt}/{max_retries}, response is {response_status_code}, retrying after 1 second...')
-                    last_5xx_time_options = time.time()
-                    time.sleep(1)
-                elif response_status_code == 403:
-                    logging.warning(f'Failed OPTIONS request {attempt}/{max_retries}, response is {response_status_code}, need to sleep before retrying...')
-                    if sleep_retries == 'auto':
-                        current_time = time.time()
-                        if last_5xx_time_options is not None:
-                            sleep_time = min(current_time - last_5xx_time_options + 1, 300)  # Cap at 300 seconds
-                        else:
-                            sleep_time = 1  # If no previous 5xx error, sleep 1 second
-                        logging.info(f'Sleeping for {sleep_time} seconds before retrying due to 403 error...')
-                        time.sleep(sleep_time)
-                        last_403_time_options = current_time
-                    elif sleep_retries is not None:
-                        logging.info(f'Sleeping for {sleep_retries} seconds before retrying due to 403 error...')
-                        time.sleep(sleep_retries)
-                    else:
-                        # No sleep_retries specified, proceed without sleeping
-                        pass
+                    break
                 else:
-                    # Other 4xx errors or unexpected status codes
-                    logging.error(f'Unexpected response code {response_status_code} during OPTIONS request.')
+                    if 500 <= response_status_code < 600:
+                        logging.warning(f'Failed OPTIONS request {attempt}/{max_retries}, response is {response_status_code}, server error. Retrying after {timeout_sleep_time} seconds...')
+                        time.sleep(timeout_sleep_time)
+                    elif 400 <= response_status_code < 500:
+                        logging.warning(f'Failed OPTIONS request {attempt}/{max_retries}, response is {response_status_code}, client error. Retrying after {backoff_time_options} seconds...')
+                        time.sleep(backoff_time_options)
+                        backoff_time_options = min(backoff_time_options * 2, ban_max_sleep_time)
+                    else:
+                        logging.error(f'Unexpected response code {response_status_code} during OPTIONS request.')
+                        time.sleep(timeout_sleep_time)
             except requests.exceptions.RequestException as e:
                 logging.error(f'Exception during OPTIONS request: {e}')
+                logging.warning(f'Exception during OPTIONS request, treating as server error. Retrying after {timeout_sleep_time} seconds...')
+                time.sleep(timeout_sleep_time)
             if attempt == max_retries:
                 logging.error(f'Failed OPTIONS request {attempt}/{max_retries}, retry count exceeded.')
                 status_entries.append({'status_code': response_status_code, 'status': 'failed', 'file_name': file_name, 'cid': cid, 'entry': entry})
@@ -193,9 +186,6 @@ def process_entries(entries, auth_token, max_retries, url, sleep_retries):
 
         if attempt == max_retries and response_status_code not in range(200, 300):
             continue  # Skip to next entry if OPTIONS request fails after retries
-
-        last_5xx_time_post = None
-        last_403_time_post = None
 
         # POST request
         payload = {'cid': cid, 'name': file_name}
@@ -206,34 +196,24 @@ def process_entries(entries, auth_token, max_retries, url, sleep_retries):
                 response_status_code = response.status_code
                 if 200 <= response_status_code < 300:
                     logging.info(f'Successful POST request for {file_name}.')
+                    success = True
                     status_entries.append({'status_code': response_status_code, 'status': 'success', 'file_name': file_name, 'cid': cid, 'entry': entry})
                     break
-                elif 500 <= response_status_code < 600:
-                    logging.warning(f'Failed POST request {attempt}/{max_retries}, response is {response_status_code}, retrying after 1 second...')
-                    last_5xx_time_post = time.time()
-                    time.sleep(1)
-                elif response_status_code == 403:
-                    logging.warning(f'Failed POST request {attempt}/{max_retries}, response is {response_status_code}, need to sleep before retrying...')
-                    if sleep_retries == 'auto':
-                        current_time = time.time()
-                        if last_5xx_time_post is not None:
-                            sleep_time = min(current_time - last_5xx_time_post + 1, 300)  # Cap at 300 seconds
-                        else:
-                            sleep_time = 1  # If no previous 5xx error, sleep 1 second
-                        logging.info(f'Sleeping for {sleep_time} seconds before retrying due to 403 error...')
-                        time.sleep(sleep_time)
-                        last_403_time_post = current_time
-                    elif sleep_retries is not None:
-                        logging.info(f'Sleeping for {sleep_retries} seconds before retrying due to 403 error...')
-                        time.sleep(sleep_retries)
-                    else:
-                        # No sleep_retries specified, proceed without sleeping
-                        pass
                 else:
-                    # Other 4xx errors or unexpected status codes
-                    logging.error(f'Unexpected response code {response_status_code} during POST request.')
+                    if 500 <= response_status_code < 600:
+                        logging.warning(f'Failed POST request {attempt}/{max_retries}, response is {response_status_code}, server error. Retrying after {timeout_sleep_time} seconds...')
+                        time.sleep(timeout_sleep_time)
+                    elif 400 <= response_status_code < 500:
+                        logging.warning(f'Failed POST request {attempt}/{max_retries}, response is {response_status_code}, client error. Retrying after {backoff_time_post} seconds...')
+                        time.sleep(backoff_time_post)
+                        backoff_time_post = min(backoff_time_post * 2, ban_max_sleep_time)
+                    else:
+                        logging.error(f'Unexpected response code {response_status_code} during POST request.')
+                        time.sleep(timeout_sleep_time)
             except requests.exceptions.RequestException as e:
                 logging.error(f'Exception during POST request: {e}')
+                logging.warning(f'Exception during POST request, treating as server error. Retrying after {timeout_sleep_time} seconds...')
+                time.sleep(timeout_sleep_time)
             if attempt == max_retries:
                 logging.error(f'Failed POST request {attempt}/{max_retries}, retry count exceeded.')
                 status_entries.append({'status_code': response_status_code, 'status': 'failed', 'file_name': file_name, 'cid': cid, 'entry': entry})
@@ -268,26 +248,15 @@ def main():
         logging.debug('Debug logging enabled')
 
     if args.retries == 'unless-stopped':
-        max_retries_main = None  # Infinite retries
+        max_retries = None  # Infinite retries
     else:
         try:
-            max_retries_main = int(args.retries)
-            if max_retries_main < 0:
+            max_retries = int(args.retries)
+            if max_retries < 0:
                 raise ValueError
         except ValueError:
             logging.error('Invalid value for --retries. Must be a non-negative integer or "unless-stopped".')
             sys.exit(1)
-
-    if args.sleep_retries == 'auto':
-        sleep_retries = 'auto'
-    elif args.sleep_retries:
-        try:
-            sleep_retries = parse_cooldown(args.sleep_retries)
-        except ValueError as e:
-            logging.error(f'Invalid value for --sleep-retries: {e}')
-            sys.exit(1)
-    else:
-        sleep_retries = 'auto'  # Set default to 'auto' as per your requirement
 
     entries = read_user_input(args.input)
     if not entries:
@@ -300,17 +269,29 @@ def main():
         logging.error(str(e))
         sys.exit(1)
 
+    try:
+        timeout_sleep_time = parse_time(args.timeout_sleep_time)
+    except ValueError as e:
+        logging.error(f'Invalid timeout-sleep-time: {e}')
+        sys.exit(1)
+
+    try:
+        ban_max_sleep_time = parse_time(args.ban_max_sleep_time)
+    except ValueError as e:
+        logging.error(f'Invalid ban-max-sleep-time: {e}')
+        sys.exit(1)
+
     retry_count = 0
     status_dict = {}
 
     while True:
         if retry_count > 0:
-            if max_retries_main is not None:
-                logging.info(f'Retry attempt {retry_count}/{max_retries_main}')
+            if max_retries is not None:
+                logging.info(f'Retry attempt {retry_count}/{max_retries}')
             else:
                 logging.info(f'Retry attempt {retry_count}')
         
-        status_entries = process_entries(entries, args.auth, args.max_retries, args.url, sleep_retries)
+        status_entries = process_entries(entries, args.auth, args.max_retries, args.url, timeout_sleep_time, ban_max_sleep_time)
         if not status_entries:
             logging.info('No status entries returned.')
             break
@@ -321,7 +302,7 @@ def main():
         
         failed_entries = [entry['entry'] for entry in status_entries if entry['status'] == 'failed']
         if failed_entries:
-            if max_retries_main is None or retry_count < max_retries_main:
+            if max_retries is None or retry_count < max_retries:
                 logging.info(f'Waiting for {cooldown_seconds} seconds before retrying failed entries.')
                 time.sleep(cooldown_seconds)
                 entries = failed_entries

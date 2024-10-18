@@ -22,7 +22,8 @@ def parse_arguments():
                         help='Cooldown period between retries (e.g., 30s, 10m, 1h, 2d, 1w)')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     parser.add_argument('--input', type=str, help='Path to input file containing file table')
-    parser.add_argument('--url', default='https://pin.crustcode.com:443', help='Server URL including protocol and port, e.g., https://xxx.com:443')
+    parser.add_argument('--url', default='https://pin.crustcode.com:443',
+                        help='Server URL including protocol and port, e.g., https://xxx.com:443')
     parser.add_argument('--timeout-sleep-time', default='2s',
                         help='Sleep time after 5xx errors (e.g., 2s, 1m). Default is 2s.')
     parser.add_argument('--ban-max-sleep-time', default='5m',
@@ -115,8 +116,14 @@ def process_entries(entries, auth_token, max_retries, url, timeout_sleep_time, b
     full_url = f'{base_url}/psa/pins'
 
     parsed_url = urlparse(base_url)
-    origin = f'{parsed_url.scheme}://{parsed_url.netloc}'
-    referer = f'{origin}/'
+    
+    # Adjust origin and referer based on the parsed URL
+    if parsed_url.netloc == 'pin.crustcode.com:443':
+        origin = 'https://crustfiles.io'
+        referer = 'https://crustfiles.io/'
+    else:
+        origin = f'{parsed_url.scheme}://{parsed_url.netloc}'
+        referer = f'{origin}/'
 
     headers_options = {
         'Accept': '*/*',
@@ -248,11 +255,11 @@ def main():
         logging.debug('Debug logging enabled')
 
     if args.retries == 'unless-stopped':
-        max_retries = None  # Infinite retries
+        total_retries = None  # Infinite retries
     else:
         try:
-            max_retries = int(args.retries)
-            if max_retries < 0:
+            total_retries = int(args.retries)
+            if total_retries < 0:
                 raise ValueError
         except ValueError:
             logging.error('Invalid value for --retries. Must be a non-negative integer or "unless-stopped".')
@@ -286,8 +293,8 @@ def main():
 
     while True:
         if retry_count > 0:
-            if max_retries is not None:
-                logging.info(f'Retry attempt {retry_count}/{max_retries}')
+            if total_retries is not None:
+                logging.info(f'Retry attempt {retry_count}/{total_retries}')
             else:
                 logging.info(f'Retry attempt {retry_count}')
         
@@ -302,7 +309,7 @@ def main():
         
         failed_entries = [entry['entry'] for entry in status_entries if entry['status'] == 'failed']
         if failed_entries:
-            if max_retries is None or retry_count < max_retries:
+            if total_retries is None or retry_count < total_retries:
                 logging.info(f'Waiting for {cooldown_seconds} seconds before retrying failed entries.')
                 time.sleep(cooldown_seconds)
                 entries = failed_entries

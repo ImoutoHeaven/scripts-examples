@@ -163,6 +163,9 @@ def process_entries(entries, auth_token, max_retries, url, timeout_sleep_time, b
         backoff_time_options = INITIAL_BACKOFF_TIME
         backoff_time_post = INITIAL_BACKOFF_TIME
 
+        consecutive_4xx_options = 0  # Counter for consecutive 4xx errors in OPTIONS
+        consecutive_4xx_post = 0     # Counter for consecutive 4xx errors in POST
+
         # OPTIONS request
         for attempt in range(1, max_retries + 1):
             try:
@@ -170,22 +173,35 @@ def process_entries(entries, auth_token, max_retries, url, timeout_sleep_time, b
                 response = requests.options(full_url, headers=headers_options)
                 response_status_code = response.status_code
                 if 200 <= response_status_code < 300:
+                    # Reset backoff on success
+                    backoff_time_options = INITIAL_BACKOFF_TIME
+                    consecutive_4xx_options = 0
                     break
                 else:
                     if 500 <= response_status_code < 600:
                         logging.warning(f'Failed OPTIONS request {attempt}/{max_retries}, response is {response_status_code}, server error. Retrying after {timeout_sleep_time} seconds...')
                         time.sleep(timeout_sleep_time)
+                        # Reset 4xx backoff after 5xx error
+                        backoff_time_options = INITIAL_BACKOFF_TIME
+                        consecutive_4xx_options = 0
                     elif 400 <= response_status_code < 500:
                         logging.warning(f'Failed OPTIONS request {attempt}/{max_retries}, response is {response_status_code}, client error. Retrying after {backoff_time_options} seconds...')
                         time.sleep(backoff_time_options)
+                        consecutive_4xx_options += 1
                         backoff_time_options = min(backoff_time_options * 2, ban_max_sleep_time)
                     else:
                         logging.error(f'Unexpected response code {response_status_code} during OPTIONS request.')
                         time.sleep(timeout_sleep_time)
+                        # Reset 4xx backoff on unexpected error
+                        backoff_time_options = INITIAL_BACKOFF_TIME
+                        consecutive_4xx_options = 0
             except requests.exceptions.RequestException as e:
                 logging.error(f'Exception during OPTIONS request: {e}')
                 logging.warning(f'Exception during OPTIONS request, treating as server error. Retrying after {timeout_sleep_time} seconds...')
                 time.sleep(timeout_sleep_time)
+                # Reset 4xx backoff after exception (5xx equivalent)
+                backoff_time_options = INITIAL_BACKOFF_TIME
+                consecutive_4xx_options = 0
             if attempt == max_retries:
                 logging.error(f'Failed OPTIONS request {attempt}/{max_retries}, retry count exceeded.')
                 status_entries.append({'status_code': response_status_code, 'status': 'failed', 'file_name': file_name, 'cid': cid, 'entry': entry})
@@ -205,22 +221,35 @@ def process_entries(entries, auth_token, max_retries, url, timeout_sleep_time, b
                     logging.info(f'Successful POST request for {file_name}.')
                     success = True
                     status_entries.append({'status_code': response_status_code, 'status': 'success', 'file_name': file_name, 'cid': cid, 'entry': entry})
+                    # Reset backoff on success
+                    backoff_time_post = INITIAL_BACKOFF_TIME
+                    consecutive_4xx_post = 0
                     break
                 else:
                     if 500 <= response_status_code < 600:
                         logging.warning(f'Failed POST request {attempt}/{max_retries}, response is {response_status_code}, server error. Retrying after {timeout_sleep_time} seconds...')
                         time.sleep(timeout_sleep_time)
+                        # Reset 4xx backoff after 5xx error
+                        backoff_time_post = INITIAL_BACKOFF_TIME
+                        consecutive_4xx_post = 0
                     elif 400 <= response_status_code < 500:
                         logging.warning(f'Failed POST request {attempt}/{max_retries}, response is {response_status_code}, client error. Retrying after {backoff_time_post} seconds...')
                         time.sleep(backoff_time_post)
+                        consecutive_4xx_post += 1
                         backoff_time_post = min(backoff_time_post * 2, ban_max_sleep_time)
                     else:
                         logging.error(f'Unexpected response code {response_status_code} during POST request.')
                         time.sleep(timeout_sleep_time)
+                        # Reset 4xx backoff on unexpected error
+                        backoff_time_post = INITIAL_BACKOFF_TIME
+                        consecutive_4xx_post = 0
             except requests.exceptions.RequestException as e:
                 logging.error(f'Exception during POST request: {e}')
                 logging.warning(f'Exception during POST request, treating as server error. Retrying after {timeout_sleep_time} seconds...')
                 time.sleep(timeout_sleep_time)
+                # Reset 4xx backoff after exception (5xx equivalent)
+                backoff_time_post = INITIAL_BACKOFF_TIME
+                consecutive_4xx_post = 0
             if attempt == max_retries:
                 logging.error(f'Failed POST request {attempt}/{max_retries}, retry count exceeded.')
                 status_entries.append({'status_code': response_status_code, 'status': 'failed', 'file_name': file_name, 'cid': cid, 'entry': entry})

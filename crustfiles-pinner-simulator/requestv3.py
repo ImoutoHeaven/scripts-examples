@@ -84,22 +84,35 @@ def read_user_input(input_file=None):
             pass
     
     for line in lines:
-        line = line.strip()  # Remove whitespace characters
+        line = line.strip()  # Remove leading and trailing whitespace
         if not line:
             continue  # Skip empty lines
-        tokens = line.rsplit(None, 2)  # Reverse split, last two parts are CID and file size
-        if len(tokens) != 3:
+
+        # From right to left, extract the file size
+        tokens = re.split(r'\s+', line.strip())
+        if len(tokens) < 3:
             logging.warning(f'Invalid input line: "{line}". Expected format: <file_name> <cid> <size>. Skipping...')
             continue
-        file_name, cid, size = tokens
-        
-        # Use regular expression to check if CID consists of valid characters
-        if not re.match(r'^[a-zA-Z0-9]+$', cid):  # CID format validation, CID must consist of letters and numbers
-            logging.warning(f'Invalid CID format: "{cid}" in line "{line}". Skipping...')
+
+        # Extract the size
+        size_candidate = tokens[-1]
+        if not size_candidate.isdigit():
+            logging.warning(f'Invalid size: "{size_candidate}" in line "{line}". Skipping...')
             continue
-        if not size.isdigit():  # Ensure size is a number
-            logging.warning(f'Invalid size: "{size}" in line "{line}". Skipping...')
+        size = size_candidate
+
+        # Extract the CID
+        cid_candidate = tokens[-2]
+        if not re.match(r'^[a-zA-Z0-9]+$', cid_candidate):
+            logging.warning(f'Invalid CID format: "{cid_candidate}" in line "{line}". Skipping...')
             continue
+        cid = cid_candidate
+
+        # Extract the file name (rest of the line)
+        file_name_part = ' '.join(tokens[:-2])
+        # Remove any trailing '/' and surrounding whitespace from the file name
+        file_name = re.sub(r'\s*/\s*$', '', file_name_part).strip()
+
         entries.append({'file_name': file_name, 'cid': cid, 'size': size})
     
     return entries

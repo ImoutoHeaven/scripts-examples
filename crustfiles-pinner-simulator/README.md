@@ -39,6 +39,10 @@ It sends `OPTIONS` and `POST` requests to pin files to Crust Network via CrustFi
 - `--timeout-sleep-time`: Sleep time after server (5xx) errors (default: 2s).
 - `--ban-max-sleep-time`: Maximum sleep time after client (4xx) errors (default: 5m).
 
+### Additional Arguments for Proxy Support
+- `--proxy`: Specify a proxy URL if routing requests through a proxy server is required (e.g., `http://proxyserver:port`).
+- `--proxy-auth`: Provide proxy authentication in the format `username:password` if the proxy requires credentials.
+
 ### Example Usage
 
 ```bash

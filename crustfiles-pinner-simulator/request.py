@@ -6,7 +6,7 @@ import logging
 import time
 import re
 import os
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 # Configure the basic logging format
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -28,6 +28,9 @@ def parse_arguments():
                         help='Sleep time after 5xx errors (e.g., 2s, 1m). Default is 2s.')
     parser.add_argument('--ban-max-sleep-time', default='5m',
                         help='Maximum sleep time after 4xx errors (e.g., 5m, 10s). Default is 5m.')
+    # Add new arguments
+    parser.add_argument('--proxy', type=str, help='Proxy server URL, e.g., socks5://127.0.0.1:1080')
+    parser.add_argument('--proxy-auth', type=str, help='Proxy authentication in the form user:pass')
     return parser.parse_args()
 
 def parse_time(time_str):
@@ -88,7 +91,6 @@ def read_user_input(input_file=None):
         if not line:
             continue  # Skip empty lines
 
-        # From right to left, extract the file size
         tokens = re.split(r'\s+', line.strip())
         if len(tokens) < 3:
             logging.warning(f'Invalid input line: "{line}". Expected format: <file_name> <cid> <size>. Skipping...')
@@ -117,7 +119,7 @@ def read_user_input(input_file=None):
     
     return entries
 
-def process_entries(entries, auth_token, max_retries, url, timeout_sleep_time, ban_max_sleep_time):
+def process_entries(entries, auth_token, max_retries, url, timeout_sleep_time, ban_max_sleep_time, proxies=None):
     if not entries:
         logging.info("No entries to process.")
         return []
@@ -183,7 +185,7 @@ def process_entries(entries, auth_token, max_retries, url, timeout_sleep_time, b
         for attempt in range(1, max_retries + 1):
             try:
                 logging.debug(f'Attempting OPTIONS request {attempt}/{max_retries}')
-                response = requests.options(full_url, headers=headers_options)
+                response = requests.options(full_url, headers=headers_options, proxies=proxies)
                 response_status_code = response.status_code
                 if 200 <= response_status_code < 300:
                     # Reset backoff on success
@@ -228,7 +230,7 @@ def process_entries(entries, auth_token, max_retries, url, timeout_sleep_time, b
         for attempt in range(1, max_retries + 1):
             try:
                 logging.debug(f'Attempting POST request {attempt}/{max_retries}')
-                response = requests.post(full_url, headers=headers_post, json=payload)
+                response = requests.post(full_url, headers=headers_post, json=payload, proxies=proxies)
                 response_status_code = response.status_code
                 if 200 <= response_status_code < 300:
                     logging.info(f'Successful POST request for {file_name}.')
@@ -330,6 +332,42 @@ def main():
         logging.error(f'Invalid ban-max-sleep-time: {e}')
         sys.exit(1)
 
+    # Process proxy settings
+    proxies = None
+    if args.proxy:
+        proxy_url = args.proxy
+        if args.proxy_auth:
+            # Add authentication to proxy URL
+            parsed_proxy_url = urlparse(proxy_url)
+            if parsed_proxy_url.username or parsed_proxy_url.password:
+                logging.error('Proxy URL already contains authentication information.')
+                sys.exit(1)
+            user_pass = args.proxy_auth
+            if ':' not in user_pass:
+                logging.error('Invalid proxy authentication format. Expected format: user:pass')
+                sys.exit(1)
+            username, password = user_pass.split(':', 1)
+            hostname = parsed_proxy_url.hostname
+            port = parsed_proxy_url.port
+            netloc = f'{username}:{password}@{hostname}'
+            if port:
+                netloc += f':{port}'
+            proxy_url = urlunparse((parsed_proxy_url.scheme, netloc, parsed_proxy_url.path or '', parsed_proxy_url.params or '', parsed_proxy_url.query or '', parsed_proxy_url.fragment or ''))
+
+        else:
+            # No '--proxy-auth', check if proxy_url contains authentication
+            parsed_proxy_url = urlparse(proxy_url)
+            if parsed_proxy_url.username or parsed_proxy_url.password:
+                # Proxy URL already contains authentication, do nothing
+                pass
+
+        # Set up proxies dictionary for both http and https
+        proxies = {
+            'http': proxy_url,
+            'https': proxy_url
+        }
+        logging.debug(f'Using proxy: {proxies}')
+
     retry_count = 0
     status_dict = {}
 
@@ -340,7 +378,7 @@ def main():
             else:
                 logging.info(f'Retry attempt {retry_count}')
         
-        status_entries = process_entries(entries, args.auth, args.max_retries, args.url, timeout_sleep_time, ban_max_sleep_time)
+        status_entries = process_entries(entries, args.auth, args.max_retries, args.url, timeout_sleep_time, ban_max_sleep_time, proxies=proxies)
         if not status_entries:
             logging.info('No status entries returned.')
             break

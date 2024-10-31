@@ -1,104 +1,86 @@
+
 # CrustFiles Pinner CallCommand
 
-This script is designed to interact with the CrustFiles service, which helps in pinning files to the Crust Network. It provides a command-line interface to input file details and initiate pinning operations via HTTP requests to Crust's API endpoint.
+This Python script is a command-line tool for interacting with the CrustFiles pinner service. 
+It sends `OPTIONS` and `POST` requests to pin files to Crust Network via CrustFiles API and handles retries and error handling based on server responses.
 
-## Requirements
+## Script Logic
 
-- Python 3.8 or higher
-- The following Python packages:
-  - `argparse` (standard library)
-  - `sys` (standard library)
-  - `requests`
-  - `logging`
-  - `re`
+1. **Argument Parsing**: The script uses `argparse` to parse command-line arguments for various configurations such as authorization token, retries, cooldown periods, and input file paths.
 
-## Installation
+2. **Cooldown and Retry Logic**: 
+   - If a request fails, the script implements cooldown and exponential backoff between retries.
+   - The user can specify the maximum number of retries and cooldown duration after failures.
 
-Before running the script, make sure you have installed the required dependencies. You can install the `requests` library using the following command:
+3. **Input Handling**: 
+   - The script reads file details (name, CID, size) from a specified file or through interactive input.
+   - Validates each entry to ensure it contains the correct format and skips any invalid entries.
 
-```sh
-pip install requests
-```
+4. **Request Processing**:
+   - For each file entry, the script first makes an `OPTIONS` request to the server, followed by a `POST` request to pin the file.
+   - It includes exponential backoff logic to handle server-side errors.
+   - In the case of multiple consecutive 4xx responses, the script increases the retry delay to prevent server overload.
+
+5. **Output**:
+   - The script logs the status of each processed file and displays a summary of successful and failed entries.
 
 ## Usage
 
-```sh
-./crustfiles_pinner.py --auth <Authorization Token> [OPTIONS]
+### Required Arguments
+- `--auth`: Authorization token for accessing the CrustFiles API.
+
+### Optional Arguments
+- `--low-level-retries` or `--max-retries`: Number of retries for each failed request (default: 10).
+- `--retries`: Number of times to retry processing failed files. Use "unless-stopped" for infinite retries (default: 3).
+- `--cooldown`: Cooldown period between retries (e.g., 30s, 10m, 1h).
+- `--debug`: Enable debug logging for detailed logs.
+- `--input`: Path to input file containing the file table.
+- `--url`: Server URL (default: `https://pin.crustcode.com:443`).
+- `--timeout-sleep-time`: Sleep time after server (5xx) errors (default: 2s).
+- `--ban-max-sleep-time`: Maximum sleep time after client (4xx) errors (default: 5m).
+
+### Example Usage
+
+```bash
+python3 crustfiles_pinner.py --auth YOUR_AUTH_TOKEN --input file_table.txt --retries 5 --cooldown 1h
 ```
 
-### Arguments
+## Input
 
-- `--auth`: **Required**. Authorization token for the Crust service.
-
-### Options
-
-- `--low-level-retries`: Number of retries for each failed HTTP request (POST or OPTIONS). Default is `10`.
-
-- `--retries`: Number of times to retry processing failed files. Use `"unless-stopped"` for infinite retries. Default is `3`.
-
-- `--cooldown`: Cooldown period between retries (e.g., `30s`, `10m`, `1h`, `2d`, `1w`). Default is `1h`.
-
-- `--debug`: Enable debug logging for more verbose output.
-
-### Example
-
-```sh
-./crustfiles_pinner.py --auth myAuthToken123 --retries 5 --cooldown 30s --debug
+The input file or interactive input should follow this format:
 ```
-
-## Input Format
-
-The script will prompt the user for input with the following format:
-
+<file_name> <CID> <size>
 ```
-<file name> <space/tab> <file cid> <space/tab> <file size>
+- `file_name`: Name of the file.
+- `CID`: Content ID of the file.
+- `size`: File size.
+
+### Example Input
 ```
-
-Example:
-
+file1.jpg QmYwAPJzv5CZsnAzt8auVZRn6cYvZ7rZjp7kWsVdpJcwY1 51200
+file2.png QmXxPzK8L2K9yV4tz5RmJ6cqkTfW5qM9C4XjV1qB6D 1048576
 ```
-example-file.txt  QmExampleCid1234567890  12345
-example-image.jpg QmAnotherCid0987654321  54321
-```
-
-Press `Ctrl+D` to complete the input and start processing the files.
-
-## Logging
-
-The script uses Python's `logging` module to print logs to the console. If `--debug` is provided, debug logs are printed to provide more information about the process.
-
-### Log Levels
-- `INFO`: General information about the progress.
-- `WARNING`: Warnings related to failed retries.
-- `ERROR`: Errors that occurred during requests.
-- `DEBUG`: Detailed logs, enabled with the `--debug` flag.
-
-## Processing Flow
-
-1. **OPTIONS Request**: The script first sends an OPTIONS request to the Crust API endpoint to check permissions.
-2. **POST Request**: If the OPTIONS request is successful, it proceeds with a POST request to pin the file to Crust.
-3. **Retries**: The script will retry failed requests based on the values provided with the `--low-level-retries` and `--retries` options.
-4. **Cooldown**: The script will pause for the defined `--cooldown` period before retrying failed requests.
 
 ## Output
 
-The script prints a summary of the processed entries, including their status and any entries that failed to be processed.
+The script logs the status of each processed file, summarizing the following:
+- Status code and success/failure for each file.
+- A table of failed entries for possible retry.
 
 ### Example Output
-
 ```
 ---
-process completed. status:
-
-200 success  example-file.txt
-500 failed   example-image.jpg
+Process completed. Status:
+200 success file1.jpg
+404 failed  file2.png
 ---
----
-files that need to be retried (in table):
-example-image.jpg  QmAnotherCid0987654321  54321
+Files that need to be retried:
+file2.png QmXxPzK8L2K9yV4tz5RmJ6cqkTfW5qM9C4XjV1qB6D 1048576
 ---
 ```
 
 ## License
 
-No License. Use at your own risk. 
+This script is licensed under the GPL-3.0-only License.
+
+---

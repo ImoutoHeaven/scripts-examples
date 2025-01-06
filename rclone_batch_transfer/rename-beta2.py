@@ -326,6 +326,9 @@ def process_name(name: str) -> str:
         
         # 重排序标签
         name = rearrange_tags(name)
+        
+        # 添加新的处理：将 ") ]" 替换为 ")]"
+        name = re.sub(r'\)\s*\]', ')]', name)
             
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f"最终处理后的文件名: {name}")

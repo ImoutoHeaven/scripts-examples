@@ -11,7 +11,7 @@ class OperationType(Enum):
     RENAME = auto()
     MOVE = auto()
     DELETE = auto()
-    MOVE_CONTENT = auto()  # 新增：整体移动内容目录
+    MOVE_CONTENT = auto()
 
 @dataclass
 class Operation:
@@ -31,7 +31,8 @@ class Operation:
             return f"DELETE: {self.source}"
 
 class DirectoryFlattener:
-    def __init__(self, dry_run: bool = False):
+    def __init__(self, root_path: Path, dry_run: bool = False):
+        self.root_path = root_path
         self.dry_run = dry_run
         self.operations: List[Operation] = []
         self.existing_paths: Set[Path] = set()
@@ -140,7 +141,7 @@ class DirectoryFlattener:
         return all_success
 
     def cleanup_empty_dirs(self, path: Path, is_content: bool = False):
-        """递归删除空目录，但跳过内容目录中的空目录"""
+        """递归删除空目录，但跳过内容目录"""
         if is_content:
             return
 
@@ -174,8 +175,8 @@ class DirectoryFlattener:
             # 检查当前目录是否为内容目录
             is_content = self.is_content_directory(path)
             if is_content and not is_root:
-                # 如果是内容目录（且不是根目录），将整个目录移动到父目录
-                self.move_content_directory(path, path.parent.parent)
+                # 如果是内容目录（且不是根目录），将整个目录移动到根目录
+                self.move_content_directory(path, self.root_path)
                 return
             
             # 获取当前目录下所有内容
@@ -236,7 +237,7 @@ def main():
     
     print(f"Processing directory: {root_path}")
     
-    flattener = DirectoryFlattener(dry_run=args.dry_run)
+    flattener = DirectoryFlattener(root_path, dry_run=args.dry_run)
     flattener.flatten_directory(root_path)
     
     if args.dry_run or flattener.operations:

@@ -367,12 +367,45 @@ def is_filename_compliant(name: str) -> bool:
                 return False
     return True
 
+def preview_names(filenames: List[str]) -> None:
+    """
+    预览多个文件名的处理结果。
+    """
+    logger.info("\n预览重命名结果:")
+    logger.info("-" * 80)
+    logger.info(f"{'原文件名':<40} → {'新文件名':<40}")
+    logger.info("-" * 80)
+    
+    non_compliant_files = []
+    
+    for filename in filenames:
+        try:
+            new_name = process_file(filename.strip(), dry_run=True)
+            if new_name:
+                # 检查新文件名是否符合规范
+                if not is_filename_compliant(new_name):
+                    non_compliant_files.append(new_name)
+                logger.info(f"{filename:<40} → {new_name:<40}")
+            else:
+                logger.info(f"{filename:<40} → {'(保持不变)':<40}")
+        except Exception as e:
+            logger.error(f"{filename:<40} → 处理出错: {str(e)}")
+    
+    logger.info("-" * 80)
+    
+    # 输出不符合命名规范的文件列表
+    if non_compliant_files:
+        logger.warning("\n警告：以下文件不遵循标准命名规范，需要手动命名:")
+        for file in non_compliant_files:
+            logger.warning(f"  - {file}")
+
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description="文件重命名工具")
     parser.add_argument("folder", help="要处理的文件夹路径")
     parser.add_argument("--dry-run", action="store_true", help="模拟运行，不实际重命名文件")
     parser.add_argument("--debug", action="store_true", help="启用调试模式")
+    parser.add_argument("-i", "--interactive", action="store_true", help="交互式预览模式")
     args = parser.parse_args()
     
     if args.debug:
@@ -380,6 +413,29 @@ def main():
     
     folder_path = args.folder
     dry_run = args.dry_run
+    
+    # 交互式预览模式
+    if args.interactive:
+        logger.info("进入交互式预览模式")
+        logger.info("请输入要预览的文件名(每行一个)")
+        logger.info("输入两个空行结束输入\n")
+        
+        filenames = []
+        empty_line_count = 0
+        
+        while empty_line_count < 2:
+            line = input().strip()
+            if not line:
+                empty_line_count += 1
+            else:
+                empty_line_count = 0
+                filenames.append(line)
+        
+        if filenames:
+            preview_names(filenames)
+        else:
+            logger.warning("未输入任何文件名")
+        return 0
     
     if not os.path.isdir(folder_path):
         logger.error(f"文件夹不存在: {folder_path}")

@@ -271,6 +271,102 @@ def ensure_unique_path(path: str) -> str:
             return new_path
         counter += 1
 
+def is_filename_compliant(name: str) -> bool:
+    """
+    检查文件名是否符合命名规范。
+    
+    规则:
+    1. 开头必须是 [] 或 ()
+    2. 如果以 () 开头，在第一个 [] 之前不能有超过一个 ()
+    3. 如果以 [] 开头，在其后不能立即跟 ()
+    4. 开头不能有多个连续的 []
+    """
+    def parse_starting_tokens(text: str) -> List[Tuple[str, str]]:
+        """解析文件名开头的括号标记。"""
+        tokens = []
+        pos = 0
+        length = len(text)
+        
+        while pos < length:
+            # 跳过前导空格
+            while pos < length and text[pos].isspace():
+                pos += 1
+            if pos >= length:
+                break
+                
+            if text[pos] == '[':
+                # 解析 [] 中的内容
+                start = pos
+                pos += 1
+                depth = 1
+                while pos < length and depth > 0:
+                    if text[pos] == '[':
+                        depth += 1
+                    elif text[pos] == ']':
+                        depth -= 1
+                    pos += 1
+                if depth == 0:
+                    tokens.append(('[]', text[start:pos]))
+                else:
+                    break
+            elif text[pos] == '(':
+                # 解析 () 中的内容
+                start = pos
+                pos += 1
+                depth = 1
+                while pos < length and depth > 0:
+                    if text[pos] == '(':
+                        depth += 1
+                    elif text[pos] == ')':
+                        depth -= 1
+                    pos += 1
+                if depth == 0:
+                    tokens.append(('()', text[start:pos]))
+                else:
+                    break
+            else:
+                break
+        return tokens
+
+    # 移除扩展名进行检查
+    name = os.path.splitext(name)[0]
+    
+    tokens = parse_starting_tokens(name)
+    
+    # 如果没有解析到标记，检查第一个非空格字符是否为 [ 或 (
+    if not tokens:
+        first_char = name.lstrip()[0] if name.lstrip() else ''
+        if first_char not in ['[', '(']:
+            return False
+    else:
+        token_types = [t[0] for t in tokens]
+        if '[]' not in token_types:
+            # 没有 [] 标记
+            return False
+            
+        first_bracket_type = token_types[0]
+        if first_bracket_type == '()':
+            # 以 () 开头
+            # 检查在第一个 [] 之前是否有超过一个 ()
+            index_of_first_square = token_types.index('[]')
+            num_paren_before_square = index_of_first_square
+            if num_paren_before_square > 1:
+                return False
+        elif first_bracket_type == '[]':
+            # 以 [] 开头
+            # 检查是否有多个连续的 []
+            num_initial_square = 1
+            i = 1
+            while i < len(token_types) and token_types[i] == '[]':
+                num_initial_square += 1
+                i += 1
+            if num_initial_square > 1:
+                return False
+            # 检查下一个是否为 ()
+            if i < len(token_types) and token_types[i] == '()':
+                return False
+    return True
+
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description="文件重命名工具")
@@ -298,6 +394,7 @@ def main():
         processed_count = 0
         skipped_count = 0
         error_count = 0
+        non_compliant_files = []  # 存储不符合命名规范的文件
         
         for item in os.listdir(folder_path):
             if item == 'temp':
@@ -341,6 +438,12 @@ def main():
         logger.info(f"处理文件数: {processed_count}")
         logger.info(f"跳过文件数: {skipped_count}")
         logger.info(f"错误文件数: {error_count}")
+        
+        # 输出不符合命名规范的文件列表
+        if non_compliant_files:
+            logger.warning("\n警告：以下文件不遵循标准命名规范，请手动命名:")
+            for file in non_compliant_files:
+                logger.warning(f"  - {file}")
         
     except Exception as e:
         logger.error(f"执行过程中出错: {str(e)}")

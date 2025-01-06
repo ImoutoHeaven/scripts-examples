@@ -11,6 +11,7 @@ class OperationType(Enum):
     RENAME = auto()
     MOVE = auto()
     DELETE = auto()
+    MOVE_CONTENT = auto()  # 新增：整体移动内容目录
 
 @dataclass
 class Operation:
@@ -24,6 +25,8 @@ class Operation:
             return f"RENAME: {self.source} -> {self.destination}"
         elif self.op_type == OperationType.MOVE:
             return f"MOVE: {self.source} -> {self.destination}"
+        elif self.op_type == OperationType.MOVE_CONTENT:
+            return f"MOVE_CONTENT: {self.source} -> {self.destination} (Content directory preserved)"
         else:  # DELETE
             return f"DELETE: {self.source}"
 
@@ -31,7 +34,6 @@ class DirectoryFlattener:
     def __init__(self, dry_run: bool = False):
         self.dry_run = dry_run
         self.operations: List[Operation] = []
-        # 用于追踪已经存在的路径，避免名称冲突
         self.existing_paths: Set[Path] = set()
 
     def generate_unique_name(self, original_path: Path) -> Path:
@@ -44,33 +46,58 @@ class DirectoryFlattener:
             if new_path not in self.existing_paths:
                 return new_path
 
-    def is_empty_dir(self, path: Path) -> bool:
-        """检查目录是否为空"""
+    def is_content_directory(self, path: Path) -> bool:
+        """判断是否为内容目录(包含2个或以上文件/文件夹)"""
         try:
-            return not any(path.iterdir())
-        except Exception:
+            items = list(path.iterdir())
+            return len(items) >= 2
+        except Exception as e:
+            print(f"Error checking directory {path}: {e}")
             return False
 
-    def handle_name_conflict(self, current_dir: Path, subdir: Path) -> Path:
-        """处理内层文件夹与外层文件夹同名的情况"""
-        if current_dir.name == subdir.name:
-            new_subdir = self.generate_unique_name(subdir)
+    def handle_name_conflict(self, current_dir: Path, target_dir: Path) -> Path:
+        """处理目录重名情况"""
+        if current_dir.name == target_dir.name or target_dir in self.existing_paths:
+            new_dir = self.generate_unique_name(target_dir)
             self.operations.append(Operation(
                 OperationType.RENAME,
-                subdir,
-                new_subdir,
-                f"Rename directory due to name conflict with parent"
+                target_dir,
+                new_dir,
+                f"Rename directory due to name conflict"
             ))
             if not self.dry_run:
                 try:
-                    subdir.rename(new_subdir)
-                    print(f"Renamed directory '{subdir}' to '{new_subdir}'")
-                    return new_subdir
+                    if target_dir.exists():  # 确保目标存在再重命名
+                        target_dir.rename(new_dir)
+                        print(f"Renamed directory '{target_dir}' to '{new_dir}'")
+                    return new_dir
                 except Exception as e:
-                    print(f"Error renaming directory {subdir}: {e}")
-                    return subdir
-            return new_subdir
-        return subdir
+                    print(f"Error renaming directory {target_dir}: {e}")
+                    return target_dir
+            return new_dir
+        return target_dir
+
+    def move_content_directory(self, src: Path, dest_parent: Path) -> bool:
+        """整体移动内容目录到目标位置"""
+        try:
+            dest = dest_parent / src.name
+            dest = self.handle_name_conflict(dest_parent, dest)
+            
+            self.operations.append(Operation(
+                OperationType.MOVE_CONTENT,
+                src,
+                dest,
+                f"Move content directory from {src.parent.name} to {dest_parent.name}"
+            ))
+            
+            if not self.dry_run:
+                shutil.move(str(src), str(dest))
+                print(f"Moved content directory '{src}' to '{dest}'")
+                self.existing_paths.add(dest)
+            return True
+        except Exception as e:
+            print(f"Error moving content directory {src}: {e}")
+            return False
 
     def simulate_move_contents(self, src: Path, dest: Path) -> Dict[Path, Path]:
         """模拟移动操作并返回源目标路径映射"""
@@ -112,14 +139,18 @@ class DirectoryFlattener:
                 
         return all_success
 
-    def cleanup_empty_dirs(self, path: Path):
-        """递归删除空目录"""
+    def cleanup_empty_dirs(self, path: Path, is_content: bool = False):
+        """递归删除空目录，但跳过内容目录中的空目录"""
+        if is_content:
+            return
+
         try:
             for item in path.iterdir():
-                if item.is_dir():
+                if item.is_dir() and not self.is_content_directory(item):
                     self.cleanup_empty_dirs(item)
             
-            if self.is_empty_dir(path):
+            # 只有非内容目录的空目录才会被删除
+            if not self.is_content_directory(path) and not any(path.iterdir()):
                 self.operations.append(Operation(
                     OperationType.DELETE,
                     path,
@@ -135,43 +166,29 @@ class DirectoryFlattener:
             print(f"Error cleaning up directory {path}: {e}")
 
     def flatten_directory(self, path: Path, is_root: bool = True):
-        """递归扁平化目录结构"""
+        """递归扁平化目录结构，但保护内容目录"""
         try:
             # 初始化当前目录下所有已存在的路径
             self.existing_paths.update(path.iterdir())
             
+            # 检查当前目录是否为内容目录
+            is_content = self.is_content_directory(path)
+            if is_content and not is_root:
+                # 如果是内容目录（且不是根目录），将整个目录移动到父目录
+                self.move_content_directory(path, path.parent.parent)
+                return
+            
             # 获取当前目录下所有内容
             items = list(path.iterdir())
             dirs = [item for item in items if item.is_dir()]
-            files = [item for item in items if item.is_file()]
-            
-            # 如果只有一个子目录且没有文件，且不是根目录
-            if len(dirs) == 1 and len(files) == 0 and not is_root:
-                subdir = dirs[0]
-                # 处理可能的文件夹同名情况
-                subdir = self.handle_name_conflict(path, subdir)
-                # 移动子目录中的所有内容到当前目录
-                if self.move_contents(subdir, path):
-                    if self.is_empty_dir(subdir):
-                        self.operations.append(Operation(
-                            OperationType.DELETE,
-                            subdir,
-                            description="Remove empty directory after content move"
-                        ))
-                        if not self.dry_run:
-                            try:
-                                subdir.rmdir()
-                                print(f"Removed empty directory '{subdir}'")
-                            except Exception as e:
-                                print(f"Error removing directory {subdir}: {e}")
             
             # 递归处理所有子目录
-            for dir_path in path.iterdir():
+            for dir_path in dirs:
                 if dir_path.is_dir():
                     self.flatten_directory(dir_path, is_root=False)
             
-            # 清理空目录
-            self.cleanup_empty_dirs(path)
+            # 清理空目录，但跳过内容目录
+            self.cleanup_empty_dirs(path, is_content)
                     
         except Exception as e:
             print(f"Error processing directory {path}: {e}")
@@ -179,7 +196,7 @@ class DirectoryFlattener:
     def print_operations_summary(self):
         """打印操作摘要"""
         if not self.operations:
-            print("No operations needed - directory structure is already flat.")
+            print("No operations needed.")
             return
 
         print("\nOperation Summary:")
@@ -201,10 +218,11 @@ class DirectoryFlattener:
         for i, op in enumerate(self.operations, 1):
             print(f"{i}. {op}")
         
-        print("\nNote: This is a dry run - no actual changes were made.")
+        if self.dry_run:
+            print("\nNote: This is a dry run - no actual changes were made.")
 
 def main():
-    parser = argparse.ArgumentParser(description='Intelligently flatten directory structure.')
+    parser = argparse.ArgumentParser(description='Intelligently flatten directory structure while preserving content directories.')
     parser.add_argument('path', help='Path to the root folder')
     parser.add_argument('--dry-run', action='store_true', 
                       help='Show what would be done without actually doing it')
@@ -221,10 +239,10 @@ def main():
     flattener = DirectoryFlattener(dry_run=args.dry_run)
     flattener.flatten_directory(root_path)
     
-    if args.dry_run:
+    if args.dry_run or flattener.operations:
         flattener.print_operations_summary()
     else:
-        print("Directory flattening completed.")
+        print("Directory flattening completed - no changes needed.")
 
 if __name__ == '__main__':
     main()

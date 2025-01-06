@@ -1,249 +1,115 @@
-import argparse
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import os
+import sys
 import shutil
-from pathlib import Path
-import uuid
-from typing import List, Dict, Set
-from dataclasses import dataclass
-from enum import Enum, auto
 
-class OperationType(Enum):
-    RENAME = auto()
-    MOVE = auto()
-    DELETE = auto()
-    MOVE_CONTENT = auto()
+def flatten_shell(folder, depth=0):
+    """
+    扁平化移除“无意义的外壳”目录。
+    :param folder: 要处理的目录
+    :param depth: 当前目录相对于“游戏顶层目录”的深度。
+                  depth=0 => folder是root_dir下的直接子目录（一个游戏/文件集的顶层）。
+                  depth>0 => folder是更深一层的嵌套目录（潜在的无意义壳）。
+    """
+    items = os.listdir(folder)
 
-@dataclass
-class Operation:
-    op_type: OperationType
-    source: Path
-    destination: Path = None
-    description: str = ""
+    # 如果此目录包含 >=2 个条目 => 视为“内容目录”，停止扁平化
+    if len(items) >= 2:
+        return
 
-    def __str__(self) -> str:
-        if self.op_type == OperationType.RENAME:
-            return f"RENAME: {self.source} -> {self.destination}"
-        elif self.op_type == OperationType.MOVE:
-            return f"MOVE: {self.source} -> {self.destination}"
-        elif self.op_type == OperationType.MOVE_CONTENT:
-            return f"MOVE_CONTENT: {self.source} -> {self.destination} (Content directory preserved)"
-        else:  # DELETE
-            return f"DELETE: {self.source}"
-
-class DirectoryFlattener:
-    def __init__(self, root_path: Path, dry_run: bool = False):
-        self.root_path = root_path
-        self.dry_run = dry_run
-        self.operations: List[Operation] = []
-        self.existing_paths: Set[Path] = set()
-
-    def generate_unique_name(self, original_path: Path) -> Path:
-        """为发生冲突的文件/文件夹生成唯一名称"""
-        while True:
-            stem = original_path.stem
-            suffix = original_path.suffix
-            unique_stem = f"{stem}_{str(uuid.uuid4())[:8]}"
-            new_path = original_path.with_name(unique_stem + suffix)
-            if new_path not in self.existing_paths:
-                return new_path
-
-    def is_content_directory(self, path: Path) -> bool:
-        """判断是否为内容目录(包含2个或以上文件/文件夹)"""
-        try:
-            items = list(path.iterdir())
-            return len(items) >= 2
-        except Exception as e:
-            print(f"Error checking directory {path}: {e}")
-            return False
-
-    def handle_name_conflict(self, current_dir: Path, target_dir: Path) -> Path:
-        """处理目录重名情况"""
-        if current_dir.name == target_dir.name or target_dir in self.existing_paths:
-            new_dir = self.generate_unique_name(target_dir)
-            self.operations.append(Operation(
-                OperationType.RENAME,
-                target_dir,
-                new_dir,
-                f"Rename directory due to name conflict"
-            ))
-            if not self.dry_run:
-                try:
-                    if target_dir.exists():  # 确保目标存在再重命名
-                        target_dir.rename(new_dir)
-                        print(f"Renamed directory '{target_dir}' to '{new_dir}'")
-                    return new_dir
-                except Exception as e:
-                    print(f"Error renaming directory {target_dir}: {e}")
-                    return target_dir
-            return new_dir
-        return target_dir
-
-    def move_content_directory(self, src: Path, dest_parent: Path) -> bool:
-        """整体移动内容目录到目标位置"""
-        try:
-            dest = dest_parent / src.name
-            dest = self.handle_name_conflict(dest_parent, dest)
-            
-            self.operations.append(Operation(
-                OperationType.MOVE_CONTENT,
-                src,
-                dest,
-                f"Move content directory from {src.parent.name} to {dest_parent.name}"
-            ))
-            
-            if not self.dry_run:
-                shutil.move(str(src), str(dest))
-                print(f"Moved content directory '{src}' to '{dest}'")
-                self.existing_paths.add(dest)
-            return True
-        except Exception as e:
-            print(f"Error moving content directory {src}: {e}")
-            return False
-
-    def simulate_move_contents(self, src: Path, dest: Path) -> Dict[Path, Path]:
-        """模拟移动操作并返回源目标路径映射"""
-        path_mapping = {}
-        try:
-            for item in src.iterdir():
-                dest_path = dest / item.name
-                if dest_path in self.existing_paths:
-                    dest_path = self.generate_unique_name(dest_path)
-                path_mapping[item] = dest_path
-                self.existing_paths.add(dest_path)
-        except Exception as e:
-            print(f"Error simulating move from {src}: {e}")
-        return path_mapping
-
-    def move_contents(self, src: Path, dest: Path) -> bool:
-        """移动文件/文件夹的内容到目标位置"""
-        path_mapping = self.simulate_move_contents(src, dest)
-        
-        for source, destination in path_mapping.items():
-            self.operations.append(Operation(
-                OperationType.MOVE,
-                source,
-                destination,
-                f"Move from {source.parent.name} to {destination.parent.name}"
-            ))
-            
-        if self.dry_run:
-            return True
-            
-        all_success = True
-        for source, destination in path_mapping.items():
+    # 如果此目录为空
+    if len(items) == 0:
+        # 对于“深层壳”可直接删除
+        if depth > 0:
             try:
-                shutil.move(str(source), str(destination))
-                print(f"Moved '{source}' to '{destination}'")
+                os.rmdir(folder)
+                print(f"[删除空目录] {folder}")
+            except OSError as e:
+                print(f"[删除空目录失败] {folder}, 原因: {e}")
+        else:
+            # depth=0 => 顶层目录且为空，通常不动它，防止误删可能还要用的文件夹
+            pass
+        return
+
+    # 现在只剩下 len(items) == 1 的情况
+    only_item = items[0]
+    only_item_path = os.path.join(folder, only_item)
+
+    # 如果唯一条目是“文件”
+    if os.path.isfile(only_item_path):
+        if depth > 0:
+            # 将此唯一文件“上移”到父目录
+            parent_folder = os.path.dirname(folder)
+            try:
+                shutil.move(only_item_path, parent_folder)
+                print(f"[上移文件] {only_item_path} => {parent_folder}")
+                # 移动后若 folder 为空，可删
+                try:
+                    os.rmdir(folder)
+                    print(f"[删除外壳目录] {folder}")
+                except OSError as e:
+                    print(f"[删除外壳目录失败] {folder}, 原因: {e}")
             except Exception as e:
-                print(f"Error moving {source} to {destination}: {e}")
-                all_success = False
-                
-        return all_success
+                print(f"[移动文件时出现错误] {only_item_path} => {parent_folder}, 错误: {e}")
+        else:
+            # depth=0 => 顶层目录只有一个文件，不要把它扔到 root_dir
+            # 这个场景下就保持不动，防止把所有单文件都直接丢进root_dir。
+            pass
+        return
 
-    def cleanup_empty_dirs(self, path: Path, is_content: bool = False):
-        """递归删除空目录，但跳过内容目录"""
-        if is_content:
-            return
+    # 如果唯一条目是“目录”
+    if os.path.isdir(only_item_path):
+        # 这里不再判断它是否是“内容目录”，只要父目录只有它一个子目录，我们就把它的内容上移
+        # 这样就能把“subFolder2”中的多个文件 1.jpg,2.jpg,3.jpg 移到“subFolder1”。
+        for c in os.listdir(only_item_path):
+            src = os.path.join(only_item_path, c)
+            dst = os.path.join(folder, c)
+            try:
+                shutil.move(src, dst)
+                print(f"[上移内容] {src} => {dst}")
+            except Exception as e:
+                print(f"[移动内容时出现错误] {src} => {dst}, 错误: {e}")
 
+        # 搬空后，尝试删除 only_item_path
         try:
-            for item in path.iterdir():
-                if item.is_dir() and not self.is_content_directory(item):
-                    self.cleanup_empty_dirs(item)
-            
-            # 只有非内容目录的空目录才会被删除
-            if not self.is_content_directory(path) and not any(path.iterdir()):
-                self.operations.append(Operation(
-                    OperationType.DELETE,
-                    path,
-                    description="Remove empty directory"
-                ))
-                if not self.dry_run:
-                    try:
-                        path.rmdir()
-                        print(f"Removed empty directory '{path}'")
-                    except Exception as e:
-                        print(f"Error removing directory {path}: {e}")
-        except Exception as e:
-            print(f"Error cleaning up directory {path}: {e}")
+            os.rmdir(only_item_path)
+            print(f"[删除空目录] {only_item_path}")
+        except OSError:
+            pass
 
-    def flatten_directory(self, path: Path, is_root: bool = True):
-        """递归扁平化目录结构，但保护内容目录"""
-        try:
-            # 初始化当前目录下所有已存在的路径
-            self.existing_paths.update(path.iterdir())
-            
-            # 检查当前目录是否为内容目录
-            is_content = self.is_content_directory(path)
-            if is_content and not is_root:
-                # 如果是内容目录（且不是根目录），将整个目录移动到根目录
-                self.move_content_directory(path, self.root_path)
-                return
-            
-            # 获取当前目录下所有内容
-            items = list(path.iterdir())
-            dirs = [item for item in items if item.is_dir()]
-            
-            # 递归处理所有子目录
-            for dir_path in dirs:
-                if dir_path.is_dir():
-                    self.flatten_directory(dir_path, is_root=False)
-            
-            # 清理空目录，但跳过内容目录
-            self.cleanup_empty_dirs(path, is_content)
-                    
-        except Exception as e:
-            print(f"Error processing directory {path}: {e}")
+        # 现在 folder 里已经多了刚刚上移的内容 -> 重新判断一次
+        flatten_shell(folder, depth)
+        return
 
-    def print_operations_summary(self):
-        """打印操作摘要"""
-        if not self.operations:
-            print("No operations needed.")
-            return
 
-        print("\nOperation Summary:")
-        print("=" * 80)
-        
-        # 按操作类型分组统计
-        op_counts = {op_type: 0 for op_type in OperationType}
-        for op in self.operations:
-            op_counts[op.op_type] += 1
-        
-        print("\nOperation Counts:")
-        print("-" * 40)
-        for op_type, count in op_counts.items():
-            if count > 0:
-                print(f"{op_type.name}: {count}")
-        
-        print("\nDetailed Operations:")
-        print("-" * 80)
-        for i, op in enumerate(self.operations, 1):
-            print(f"{i}. {op}")
-        
-        if self.dry_run:
-            print("\nNote: This is a dry run - no actual changes were made.")
+def process_root_dir(root_dir):
+    """
+    对 root_dir 下的所有“游戏顶层目录”进行扁平化处理。
+    注：不会把“游戏内容”直接移到 root_dir，以防多个游戏/文件集混杂。
+    """
+    for entry in os.listdir(root_dir):
+        sub_path = os.path.join(root_dir, entry)
+        if os.path.isdir(sub_path):
+            flatten_shell(sub_path, depth=0)
+            # 若你担心一次 flatten_shell 不够彻底，可再重复调用一次或多次
+            # flatten_shell(sub_path, depth=0)
+
 
 def main():
-    parser = argparse.ArgumentParser(description='Intelligently flatten directory structure while preserving content directories.')
-    parser.add_argument('path', help='Path to the root folder')
-    parser.add_argument('--dry-run', action='store_true', 
-                      help='Show what would be done without actually doing it')
-    
-    args = parser.parse_args()
-    root_path = Path(args.path).resolve()
-    
-    if not root_path.is_dir():
-        print(f"Error: {root_path} is not a valid directory.")
-        return
-    
-    print(f"Processing directory: {root_path}")
-    
-    flattener = DirectoryFlattener(root_path, dry_run=args.dry_run)
-    flattener.flatten_directory(root_path)
-    
-    if args.dry_run or flattener.operations:
-        flattener.print_operations_summary()
-    else:
-        print("Directory flattening completed - no changes needed.")
+    if len(sys.argv) != 2:
+        print(f"用法：python {sys.argv[0]} /path/to/root_dir")
+        sys.exit(1)
 
-if __name__ == '__main__':
+    root_dir = sys.argv[1]
+    if not os.path.isdir(root_dir):
+        print(f"[错误] {root_dir} 不是一个有效目录")
+        sys.exit(1)
+
+    process_root_dir(root_dir)
+    print("处理完成。可以多次运行脚本查看是否还有可移除的外壳。")
+
+
+if __name__ == "__main__":
     main()

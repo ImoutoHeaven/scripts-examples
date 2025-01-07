@@ -273,17 +273,21 @@ def process_filename(filename):
 
 def is_filename_compliant(name):
     """
-    根据新的文件名开头要求判断合规性：
-    1) 可选的 (展会信息) 在最开头，内容不得包含翻译组/版本/来源/时间戳关键字
-       - 如果出现，只能出现一次，并且一定在 [] 之前。
-    2) 接下来必须出现且只能出现一个 [作者(可选)] 的方括号，也不能是系统关键字或时间戳。
-    3) 保留对版本[vX] 与时间戳[YYYYMMDD]的顺序检查 (如果两者同时存在，则 vX 必须在日期前)。
+    根据新需求：
+    1) 文件开头可选 ( )，内容不得是系统关键字或时间戳（并且只能出现一次）。
+    2) 接着必须出现 [ ]，内容不得是系统关键字或时间戳（只能出现一次）。
+    3) 后面如果紧跟 ()、[]、{}，则不合规。
+    4) 保留对 [vX] 与 [YYYYMMDD] 出现顺序的检查。
     """
-    # 如果压根没有方括号，直接判不合规
-    if '[' not in name:
+    name_stripped = name.strip()
+    if not name_stripped:
         return False
 
-    # 收集所有系统关键字（翻译组/版本/来源/translation_version 等）
+    # 如果文件名中根本没有方括号，直接判不合规
+    if '[' not in name_stripped:
+        return False
+
+    # 收集所有系统关键字（翻译组 / 版本 / 来源 / 翻译版本），转小写做对比
     system_keywords = set()
     for k, vals in category_keywords.items():
         if vals:
@@ -294,14 +298,13 @@ def is_filename_compliant(name):
     def is_timestamp_like(s):
         return re.match(r'^(?:\d{6}|\d{8}|\d{10})$', s)
 
-    name_stripped = name.strip()
     pos = 0
     length = len(name_stripped)
 
-    # 第一步：可能的 (展会信息)
+    # ------------------------
+    # 1) 可选的开头 ( ) 解析
+    # ------------------------
     has_paren = False
-    paren_content = ""
-
     if name_stripped.startswith('('):
         start = pos
         depth = 0
@@ -312,31 +315,33 @@ def is_filename_compliant(name):
             elif c == ')':
                 depth -= 1
                 if depth == 0:
-                    # 找到对应的闭合)
+                    # 找到对应闭合 ')'
+                    paren_content = name_stripped[start+1:pos].strip()
+                    pos += 1  # 跳到 ')' 后面
                     has_paren = True
-                    paren_content = name_stripped[start+1:pos].strip()  # 拿到(...)内的内容
-                    pos += 1
+                    # 检验 ( ) 内容不得是系统关键字 / 时间戳
+                    if not paren_content:
+                        return False
+                    if paren_content.lower() in system_keywords:
+                        return False
+                    if is_timestamp_like(paren_content):
+                        return False
                     break
             pos += 1
         
-        # 如果 depth != 0，表示括号不匹配
+        # 如果 depth != 0，说明 '('没被正确闭合
         if depth != 0:
             return False
-        
-        # 校验 (展会信息) 的内容是否是系统关键字或时间戳
-        if paren_content.lower() in system_keywords:
-            return False
-        if is_timestamp_like(paren_content):
-            return False
 
-    # 到这里，如果 has_paren == False，pos 还在开头(0)
-    # 如果 has_paren == True，pos 已经移动到 “(xxxx)” 之后
+    # 到此，如果 has_paren == True，pos 已移动到 `)` 后面，否则依然是0
 
-    # 跳过可能的空格
+    # 跳过可能出现的空格
     while pos < length and name_stripped[pos].isspace():
         pos += 1
 
-    # 第二步：必须出现一个 [方括号]
+    # ------------------------
+    # 2) 接下来必须出现 [ ]
+    # ------------------------
     if pos >= length or name_stripped[pos] != '[':
         return False
 
@@ -350,40 +355,41 @@ def is_filename_compliant(name):
             depth -= 1
         pos += 1
 
+    # depth != 0 => 方括号不匹配
     if depth != 0:
-        # 方括号不匹配
         return False
 
     bracket_end = pos
     bracket_content = name_stripped[bracket_start+1:bracket_end-1].strip()
     if not bracket_content:
-        # 空方括号不合规
+        # 空的方括号不合规
         return False
 
-    # 校验方括号内容是否是系统关键字或时间戳
+    # 检查是否是系统关键字/时间戳
     if bracket_content.lower() in system_keywords:
         return False
     if is_timestamp_like(bracket_content):
         return False
 
-    # 注意：目前只要求“开头必须有且只有一个 []”。
-    # 如果你想“紧跟着再出现第二个 []”也算不合规，这里可以再判断一下 bracket_end 后面是否又立刻出现 '['
-    # 但有些情况用户可能会加其他 [翻译组] [v2] 标签在后面几乎紧挨着，所以要不要严格禁止“紧挨着”这个要看你是否想要。
-    # 下面是一个更严格的写法：如果 bracket_end 后面紧跟 "["，就判不合规
-    # （可根据自己需求决定要不要加）
-    next_part = name_stripped[bracket_end:].lstrip()
-    if next_part.startswith('['):
-    #     # 又出现了一个方括号，且是紧随其后的 => 不合规
+    # ------------------------
+    # 3) 后面如果紧跟 ()、[]、{} => 不合规
+    # ------------------------
+    # 跳过空格
+    while pos < length and name_stripped[pos].isspace():
+        pos += 1
+
+    # 如果接下来立刻就是 '(' 或 '[' 或 '{'，则不合规
+    if pos < length:
+        if name_stripped[pos] in ['(', '[', '{']:
+            return False
+
+    # ------------------------
+    # 4) 保留 [vX] 和 [YYYYMMDD] 顺序检查
+    # ------------------------
+    # 整体如果没任何方括号 => 不合规（不过上面已检查过，这里留个保险）
+    if not re.search(r'\[.*?\]', name_stripped):
         return False
 
-    # =====================================================================
-    # 3) 保留对版本[vX] 与时间戳[YYYYMMDD]的顺序检查
-
-    # 若无 []，则直接不合规（不过上面早就判断过了，这里只是保底）
-    if not re.search(r'\[[^\]]+\]', name_stripped):
-        return False
-
-    # 找到所有方括号内容
     tags = re.findall(r'\[([^\]]+)\]', name_stripped)
     if not tags:
         return False
@@ -392,21 +398,21 @@ def is_filename_compliant(name):
     timestamp_tag = None
 
     for tag in tags:
-        # 检查版本标签 [v\d+]
+        # 检查 [v\d+]
         if re.search(r'^v\d+(?:\.\d+)?$', tag, re.IGNORECASE):
             version_tag = tag
-        # 检查时间戳标签 [YYYYMMDD] / [YYMMDD] / [YYYYMMDDxx(10位)]
+        # 检查 [YYYYMMDD] / [YYMMDD] / [YYYYMMDDxx(10位)]
         elif re.match(r'^(?:\d{6}|\d{8}|\d{10})$', tag):
             timestamp_tag = tag
 
-    # 如果同时存在 [vX] 和 [YYYYMMDD]，必须保证 [vX] 出现在 [YYYYMMDD] 前面
+    # 若同时存在版本与时间戳 => 需保证版本出现在时间戳之前
     if version_tag and timestamp_tag:
         version_pos = name_stripped.rindex(f'[{version_tag}]')
         timestamp_pos = name_stripped.rindex(f'[{timestamp_tag}]')
         if version_pos > timestamp_pos:
             return False
 
-    # 若所有检查都通过，就算合规
+    # 如果以上检查都通过 => 合规
     return True
 
 

@@ -24,6 +24,7 @@ def clean_empty_brackets(s: str) -> str:
         result = re.sub(r'\s+', ' ', result).strip()
     return result
 
+
 def light_bracket_fix(s: str) -> str:
     """
     尝试轻度修复: 
@@ -32,28 +33,25 @@ def light_bracket_fix(s: str) -> str:
     3) 同理对圆括号 '((' 或 '))'
     只做一次修复后返回，不做多轮循环。
     """
-    # 统计 '[' 和 ']' 的数量
     cnt_open_sq = s.count('[')
     cnt_close_sq = s.count(']')
-    # 统计 '(' 和 ')' 的数量
     cnt_open_par = s.count('(')
     cnt_close_par = s.count(')')
 
-    # 如果 '[' 多出 1 个，则尝试找到 '[[' => '['
+    # 修复方括号
     if cnt_open_sq == cnt_close_sq + 1:
         s = re.sub(r'\[\[', '[', s, count=1)
-
-    # 如果 ']' 多出 1 个，则尝试找到 ']]' => ']'
     elif cnt_close_sq == cnt_open_sq + 1:
         s = re.sub(r'\]\]', ']', s, count=1)
 
-    # 同理对圆括号
+    # 修复圆括号
     if cnt_open_par == cnt_close_par + 1:
         s = re.sub(r'\(\(', '(', s, count=1)
     elif cnt_close_par == cnt_open_par + 1:
         s = re.sub(r'\)\)', ')', s, count=1)
 
     return s
+
 
 def check_brackets(s):
     """
@@ -78,24 +76,81 @@ def check_brackets(s):
             )
     return True
 
+
+# ---------------------------------------------------------------------------
+# 这里只维护一个 category_keywords，
+# 括号替换时只用到其中的 part_keys = ('source','translator_group','translation_version')。
+# 标签重排时会用到全部类别。
+# ---------------------------------------------------------------------------
+category_keywords = {
+    'source': [
+        'Pixiv', 'Patreon', 'Fanbox', 'fanbox', 'pixiv', 'patreon', 'DL版'
+    ],
+    'translator_group': [
+        '汉化','翻译','漢化','翻譯','渣翻','机翻','个人','個人','死兆修会','去码','機翻','中文',
+        '繁体','想舔羽月的jio组','賣水槍的小男孩','同人组','烤肉man','漫画の茜','忍殺團','今泉紅太狼'
+    ],
+    'translation_version': [
+        '重嵌', '無修正', '换源', '換源'
+    ],
+    'version': [
+        'v2','v3','v4','v5','v6','v7','v8','v9','v10','v11','v12'
+    ],
+    # 如果你不需要 timestamp，可以设置为 [] 或 None
+    'timestamp': None  
+}
+
+# 括号替换时 只用这几个 key:
+part_keys_for_parentheses = ('source','translator_group','translation_version')
+
+def gather_bracket_keywords(cat_dict, keys):
+    """
+    从 category_keywords 中抽取指定 keys(如 source, translator_group, translation_version)
+    合并到一个大列表中返回，用于() -> []替换。
+    """
+    all_kw = []
+    for k in keys:
+        vals = cat_dict.get(k)
+        if vals:
+            all_kw.extend(vals)
+    # 去重并保持顺序
+    return list(dict.fromkeys(all_kw))
+
+
+def replace_paren_with_bracket_on_keywords(name: str, keywords_list) -> str:
+    """
+    将字符串中所有 '(...)' 内只要含有 keywords_list 里任何一个关键词，就替换成 '[...]'。
+    """
+    pattern_keywords = '|'.join(map(re.escape, keywords_list))
+    # 若想忽略大小写 => 加 re.IGNORECASE
+    pattern_paren = re.compile(r'\([^)]*(?:' + pattern_keywords + r')[^)]*\)', re.IGNORECASE)
+
+    def _replace(m):
+        content = m.group(0)
+        # 去掉首尾圆括号
+        inner = content[1:-1]
+        return "[" + inner + "]"
+
+    return pattern_paren.sub(_replace, name)
+
+
 def process_name(name):
     """
     对文件(或文件夹)名进行重命名逻辑：
     1. 全角 -> 半角
     2. 轻度修复、检查配对
     3. 去除 (同人誌)
-    4. () -> []（只要括号内包含关键字）
-    5. 如果开头是(关键字)，也转为[关键字]
-    6. v+数字 -> [v数字]（排除类似Rev3等）
-    7. 移动最前 [关键字] -> 后面
-    8. 替换下划线、加空格、精简空格
-    9. 最后调用 rearrange_tags
-    10. 再次清理空括号
+    4. () -> []（只要括号内包含关键词；仅限 source, translator_group, translation_version）
+    5. v+数字 -> [v数字]（排除类似Rev3等）
+    6. 移动最前 [关键字] -> 后面
+    7. 替换下划线、加空格、精简空格
+    8. 重新排序标签 rearrange_tags
+    9. 最后再次清理空括号
     """
-    # 先清理一次(有些场景下，名字里本身就有空括号)
+
     name = clean_empty_brackets(name)
 
-    # 1. 替换全角括号
+    # 1. 替换全角括号 -> 半角括号
     name = re.sub(r'[【［]', '[', name)
     name = re.sub(r'[】］]', ']', name)
     name = name.replace('（', '(').replace('）', ')')
@@ -110,54 +165,35 @@ def process_name(name):
     except ValueError:
         name = light_bracket_fix(name)
         name = clean_empty_brackets(name)
-        check_brackets(name)  # 若仍报错则抛出
+        check_brackets(name)  # 若仍出错则抛异常
 
     # 3. 去除 (同人誌)
     name = name.replace('(同人誌)', '')
     name = clean_empty_brackets(name)
 
-    # 4. 将包含关键字的 () -> []
-    keywords_list = [
-        '汉化','翻译','漢化','翻譯','渣翻','机翻','个人','個人','死兆修会','去码','機翻','重嵌',
-        'Pixiv','無修正','中文','繁体','想舔羽月的jio组','换源','換源','賣水槍的小男孩','同人组',
-        '烤肉man','漫画の茜','忍殺團','今泉紅太狼','Fanbox','fanbox','Patreon','patreon','DL版'
-    ]
-    pattern_keywords = '|'.join(map(re.escape, keywords_list))
-    pattern_paren = re.compile(r'\([^)]*(?:' + pattern_keywords + r')[^)]*\)')
-
-    def replace_paren_with_bracket(m):
-        content = m.group(0)  # e.g. "(xx汉化xx)"
-        inner = content[1:-1]
-        return "[" + inner + "]"
-
-    name = pattern_paren.sub(replace_paren_with_bracket, name)
+    # 4. 将括号内含有关键词的 () -> []
+    bracket_keywords = gather_bracket_keywords(category_keywords, part_keys_for_parentheses)
+    name = replace_paren_with_bracket_on_keywords(name, bracket_keywords)
     name = clean_empty_brackets(name)
 
-    # 5. 若开头是(关键字)，也替换为[关键字]
-    keywords = r'汉化|翻译|漢化|翻譯|渣翻|机翻|个人|個人|死兆修会|去码|機翻|重嵌|Pixiv|無修正|中文|繁体|想舔羽月的jio组|换源|換源|賣水槍的小男孩|機翻|同人组|烤肉man|漫画の茜|忍殺團|今泉紅太狼|Fanbox|fanbox|Patreon|patreon|DL版'
-    if name.startswith('(') and ')' in name:
-        start, rest = name.split(')', 1)
-        if re.search(keywords, start, re.IGNORECASE):
-            name = '[' + start[1:] + ']' + rest
-    name = clean_empty_brackets(name)
-
-    # 6. 将 v+数字 => [v数字]，排除 Rev3 / v3Anthor 等
+    # 5. 将 v+数字 => [v数字] (排除 Rev3 / v3Anthor 等)
     pattern_ver = re.compile(r'(?<![A-Za-z0-9])v(\d+)(?![A-Za-z0-9])', re.IGNORECASE)
     def replace_version(m):
         return f"[v{m.group(1)}]"
     name = pattern_ver.sub(replace_version, name)
     name = clean_empty_brackets(name)
 
-    # 7. 移动最前 [xxx] -> 后面 (如果含关键字)
-    move_keywords = r'汉化|翻译|漢化|翻譯|渣翻|机翻|个人|個人|死兆修会|去码|機翻|中文|繁体|想舔羽月的jio组|賣水槍的小男孩|同人组|烤肉man|漫画の茜|忍殺團|今泉紅太狼|Pixiv|Fanbox|fanbox|Patreon|patreon|DL版|無修正|重嵌|换源|換源'
-    match = re.match(r'^(\[[^\[\]]*(?:' + move_keywords + r')[^\[\]]*\])\s*(.*)', name)
+    # 6. 移动最前 [xxx] -> 后面 (如果含 keyword)
+    #    用同样的 bracket_keywords 做判断即可，也可以合并 version/translation_version
+    move_keywords = '|'.join(map(re.escape, bracket_keywords))
+    match = re.match(r'^(\[[^\[\]]*(?:' + move_keywords + r')[^\[\]]*\])\s*(.*)', name, flags=re.IGNORECASE)
     if match:
         bracket_to_move = match.group(1)
         rest_of_name = match.group(2)
         name = rest_of_name.strip() + ' ' + bracket_to_move
     name = clean_empty_brackets(name)
 
-    # 8. 替换下划线 -> 空格, 美化空格
+    # 7. 替换下划线 -> 空格, 美化空格
     name = name.replace('_', ' ')
     name = name.replace('[', ' [').replace(']', '] ').replace('(', ' (').replace(')', ') ')
     name = re.sub(r'\s+', ' ', name).strip()
@@ -166,44 +202,38 @@ def process_name(name):
     name = re.sub(r' \]', ']', name)
     name = clean_empty_brackets(name)
 
-    # 9. 重新排序标签
+    # 8. 重新排序标签
     name = rearrange_tags(name)
     name = clean_empty_brackets(name)
 
-    # 返回最终结果
     return name
+
 
 def rearrange_tags(name):
     """
     对 [Pixiv] [汉化] [v2] 等标签按特定顺序重新排列到后面。
     在返回前会再次清理空的[]标签。
     """
-    category_keywords = {
-        'source': ['Pixiv', 'Patreon', 'Fanbox', 'fanbox', 'pixiv', 'patreon', 'DL版'],
-        'translator_group': [
-            '汉化','翻译','漢化','翻譯','渣翻','机翻','个人','個人','死兆修会','去码','機翻','中文',
-            '繁体','想舔羽月的jio组','賣水槍的小男孩','同人组','烤肉man','漫画の茜','忍殺團','今泉紅太狼'
-        ],
-        'translation_version': ['重嵌', '無修正','换源','換源'],
-        'version': ['v2','v3','v4','v5','v6','v7','v8','v9','v10','v11','v12'],  # 可自行扩充
-        'timestamp': None  # 原脚本处理日期戳
-    }
+    # 我们直接复用同一个 category_keywords，按照自己想要的顺序排列
+    category_order = ['source', 'translator_group', 'translation_version', 'version', 'timestamp']
+
+    # 构建每个类别对应的匹配模式
     category_patterns = {}
-    for category, keywords in category_keywords.items():
-        if keywords:
+    for category, words in category_keywords.items():
+        if words:
             # 仅匹配完整标签(不匹配空)
-            pattern = re.compile(r'^(' + '|'.join(map(re.escape, keywords)) + r')$', re.IGNORECASE)
+            pattern = re.compile(r'^(' + '|'.join(map(re.escape, words)) + r')$', re.IGNORECASE)
             category_patterns[category] = pattern
         else:
-            category_patterns['timestamp'] = re.compile(r'^(\d{6,8}|\d{6,8}\d{2})$')
+            # 举例: timestamp 可能是正则判断某些数字格式
+            if category == 'timestamp':
+                category_patterns['timestamp'] = re.compile(r'^(\d{6,8}|\d{6,8}\d{2})$')
 
-    category_order = ['source','translator_group','translation_version','version','timestamp']
-    # 不匹配空标签: [^\[\]]+ 保证内部至少有1个字符
     bracket_tag_pattern = re.compile(r'\[([^\[\]]+)\]')
-
     matched_tag_positions = []
     category_tags = {cat: [] for cat in category_order}
 
+    # 找到所有 [xxx] 标签，判断分类
     for match in re.finditer(bracket_tag_pattern, name):
         tag_content = match.group(1).strip()
         tag_start = match.start()
@@ -211,8 +241,8 @@ def rearrange_tags(name):
         categorized = False
 
         for category in category_order:
-            pattern = category_patterns[category]
-            if pattern.match(tag_content):
+            ptn = category_patterns.get(category)
+            if ptn and ptn.match(tag_content):
                 category_tags[category].append(tag_content)
                 categorized = True
                 break
@@ -220,36 +250,38 @@ def rearrange_tags(name):
         if categorized:
             matched_tag_positions.append((tag_start, tag_end))
 
-    # 从后往前删除原标签
+    # 从后往前删掉原标签
     name_list = list(name)
     for start, end in sorted(matched_tag_positions, key=lambda x: -x[0]):
         del name_list[start:end]
     name_without_tags = ''.join(name_list).strip()
 
-    # 按顺序重新拼装
+    # 按顺序拼装
     rearranged_tags = []
     for category in category_order:
         tags = category_tags[category]
         if tags:
+            # 如果需要对标签做进一步排序，也可在这里 sort
             tags.sort(key=str.lower)
-            rearranged_tags.extend([f'[{tag}]' for tag in tags])
+            rearranged_tags.extend(f'[{tag}]' for tag in tags)
 
-    final_name = name_without_tags.strip()
+    final_name = name_without_tags
     if rearranged_tags:
         final_name = final_name + ' ' + ' '.join(rearranged_tags)
 
     # 去掉多余空格
     final_name = re.sub(r'\s+', ' ', final_name).strip()
 
-    # 再次清理空括号
+    # 再清理一下空 bracket
     final_name = clean_empty_brackets(final_name)
     return final_name
+
 
 def process_filename(filename):
     """
     对单个文件名做重命名处理(若有后缀则保留)。
     """
-    if filename.startswith('.'):
+    if filename.startswith('.'):  # 忽略隐藏文件或 .xxx 开头的文件
         return filename
 
     parts = filename.rsplit('.', 1)
@@ -264,6 +296,7 @@ def process_filename(filename):
         return name + '.' + ext
     else:
         return name
+
 
 def parse_starting_tokens(name):
     """
@@ -311,6 +344,7 @@ def parse_starting_tokens(name):
             break
     return tokens
 
+
 def is_filename_compliant(name):
     """
     原作者定义的合规检测逻辑。
@@ -344,6 +378,7 @@ def is_filename_compliant(name):
             return False
     return True
 
+
 def compare_files(file1, file2):
     """
     命名冲突时，比较修改时间和大小，返回需要移动的那个文件。
@@ -359,6 +394,7 @@ def compare_files(file1, file2):
 
     return file1
 
+
 def ensure_temp_dir(folder_path):
     """
     必要时创建 temp 文件夹。
@@ -367,6 +403,7 @@ def ensure_temp_dir(folder_path):
     if not os.path.exists(temp_dir):
         os.makedirs(temp_dir)
     return temp_dir
+
 
 def main(folder_path, dry_run):
     """
@@ -432,10 +469,7 @@ def main(folder_path, dry_run):
         sys.exit(1)
 
 
-
 if __name__ == '__main__':
-
-
     # 若要批量处理文件夹，命令行运行:
     # python script.py /path/to/folder --dry-run
     if len(sys.argv) >= 2:

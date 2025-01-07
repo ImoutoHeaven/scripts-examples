@@ -4,6 +4,10 @@ import re
 import shutil
 from datetime import datetime
 
+############################
+# 以下是原本的辅助函数们
+############################
+
 def clean_empty_brackets(s: str) -> str:
     prev = None
     result = s
@@ -53,6 +57,7 @@ def check_brackets(s):
             )
     return True
 
+# 分类关键词
 category_keywords = {
     'source': [
         'Pixiv', 'Patreon', 'Fanbox', 'fanbox', 'pixiv', 'patreon', 'DL版'
@@ -77,8 +82,8 @@ category_order = [
     'translator_group',    # [汉化组名]
     'translation_version', # [无修正]等版本类别
     'source',              # [DL版]等来源标记
-    'version',            # [v2]等版本号
-    'timestamp'           # 时间戳放最后
+    'version',             # [v2]等版本号
+    'timestamp'            # 时间戳放最后
 ]
 
 def gather_bracket_keywords(cat_dict, keys):
@@ -115,7 +120,7 @@ def create_category_pattern(category, words):
 def standardize_timestamp(timestamp_str):
     if not timestamp_str:
         return None
-        
+    
     digits = ''.join(filter(str.isdigit, timestamp_str))
     
     if len(digits) == 6:  # YYMMDD -> YYYYMMDD
@@ -127,12 +132,9 @@ def standardize_timestamp(timestamp_str):
     return None
 
 def process_version_tag(name):
-    """处理版本号标签，确保是单层方括号"""
-    # 先处理已经在方括号中的版本号，确保只有一层方括号
     pattern_bracketed = re.compile(r'\[+v(\d+(?:\.\d+)?)\]+', re.IGNORECASE)
     name = pattern_bracketed.sub(lambda m: f'[v{m.group(1)}]', name)
     
-    # 再处理没有方括号的版本号
     pattern = re.compile(r'(?<![A-Za-z0-9\[\]])v(\d+(?:\.\d+)?)(?![A-Za-z0-9\[\]])', re.IGNORECASE)
     name = pattern.sub(lambda m: f'[v{m.group(1)}]', name)
     
@@ -158,6 +160,7 @@ def rearrange_tags(name):
         tag_end = match.end()
         categorized = False
 
+        # 检查时间戳
         if category_patterns['timestamp'].match(tag_content):
             std_timestamp = standardize_timestamp(tag_content)
             if std_timestamp:
@@ -166,6 +169,7 @@ def rearrange_tags(name):
                 matched_tag_positions.append((tag_start, tag_end))
                 continue
 
+        # 检查其他分类
         for category in category_order:
             if category == 'timestamp':
                 continue
@@ -176,11 +180,13 @@ def rearrange_tags(name):
                 matched_tag_positions.append((tag_start, tag_end))
                 break
 
+    # 从后往前删除匹配的标签
     name_list = list(name)
     for start, end in sorted(matched_tag_positions, key=lambda x: -x[0]):
         del name_list[start:end]
     name_without_tags = ''.join(name_list).strip()
 
+    # 按顺序重组
     rearranged_tags = []
     for category in category_order:
         tags = category_tags[category]
@@ -261,30 +267,152 @@ def process_filename(filename):
     else:
         return name
 
+############################################
+# 重点：修改后的 is_filename_compliant 函数
+############################################
+
 def is_filename_compliant(name):
-    if not re.search(r'\[[^\]]+\]', name):
+    """
+    根据新的文件名开头要求判断合规性：
+    1) 可选的 (展会信息) 在最开头，内容不得包含翻译组/版本/来源/时间戳关键字
+       - 如果出现，只能出现一次，并且一定在 [] 之前。
+    2) 接下来必须出现且只能出现一个 [作者(可选)] 的方括号，也不能是系统关键字或时间戳。
+    3) 保留对版本[vX] 与时间戳[YYYYMMDD]的顺序检查 (如果两者同时存在，则 vX 必须在日期前)。
+    """
+    # 如果压根没有方括号，直接判不合规
+    if '[' not in name:
         return False
+
+    # 收集所有系统关键字（翻译组/版本/来源/translation_version 等）
+    system_keywords = set()
+    for k, vals in category_keywords.items():
+        if vals:
+            for v in vals:
+                system_keywords.add(v.lower())
+
+    # 用于检测是否是“类似时间戳(纯数字6,8,10位)”
+    def is_timestamp_like(s):
+        return re.match(r'^(?:\d{6}|\d{8}|\d{10})$', s)
+
+    name_stripped = name.strip()
+    pos = 0
+    length = len(name_stripped)
+
+    # 第一步：可能的 (展会信息)
+    has_paren = False
+    paren_content = ""
+
+    if name_stripped.startswith('('):
+        start = pos
+        depth = 0
+        while pos < length:
+            c = name_stripped[pos]
+            if c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+                if depth == 0:
+                    # 找到对应的闭合)
+                    has_paren = True
+                    paren_content = name_stripped[start+1:pos].strip()  # 拿到(...)内的内容
+                    pos += 1
+                    break
+            pos += 1
         
-    tags = re.findall(r'\[[^\]]+\]', name)
+        # 如果 depth != 0，表示括号不匹配
+        if depth != 0:
+            return False
+        
+        # 校验 (展会信息) 的内容是否是系统关键字或时间戳
+        if paren_content.lower() in system_keywords:
+            return False
+        if is_timestamp_like(paren_content):
+            return False
+
+    # 到这里，如果 has_paren == False，pos 还在开头(0)
+    # 如果 has_paren == True，pos 已经移动到 “(xxxx)” 之后
+
+    # 跳过可能的空格
+    while pos < length and name_stripped[pos].isspace():
+        pos += 1
+
+    # 第二步：必须出现一个 [方括号]
+    if pos >= length or name_stripped[pos] != '[':
+        return False
+
+    bracket_start = pos
+    pos += 1
+    depth = 1
+    while pos < length and depth > 0:
+        if name_stripped[pos] == '[':
+            depth += 1
+        elif name_stripped[pos] == ']':
+            depth -= 1
+        pos += 1
+
+    if depth != 0:
+        # 方括号不匹配
+        return False
+
+    bracket_end = pos
+    bracket_content = name_stripped[bracket_start+1:bracket_end-1].strip()
+    if not bracket_content:
+        # 空方括号不合规
+        return False
+
+    # 校验方括号内容是否是系统关键字或时间戳
+    if bracket_content.lower() in system_keywords:
+        return False
+    if is_timestamp_like(bracket_content):
+        return False
+
+    # 注意：目前只要求“开头必须有且只有一个 []”。
+    # 如果你想“紧跟着再出现第二个 []”也算不合规，这里可以再判断一下 bracket_end 后面是否又立刻出现 '['
+    # 但有些情况用户可能会加其他 [翻译组] [v2] 标签在后面几乎紧挨着，所以要不要严格禁止“紧挨着”这个要看你是否想要。
+    # 下面是一个更严格的写法：如果 bracket_end 后面紧跟 "["，就判不合规
+    # （可根据自己需求决定要不要加）
+    # next_part = name_stripped[bracket_end:].lstrip()
+    # if next_part.startswith('['):
+    #     # 又出现了一个方括号，且是紧随其后的 => 不合规
+    #     return False
+
+    # =====================================================================
+    # 3) 保留对版本[vX] 与时间戳[YYYYMMDD]的顺序检查
+
+    # 若无 []，则直接不合规（不过上面早就判断过了，这里只是保底）
+    if not re.search(r'\[[^\]]+\]', name_stripped):
+        return False
+
+    # 找到所有方括号内容
+    tags = re.findall(r'\[([^\]]+)\]', name_stripped)
     if not tags:
         return False
-        
+
     version_tag = None
     timestamp_tag = None
-    
+
     for tag in tags:
-        if re.search(r'\[v\d+(?:\.\d+)?\]', tag, re.IGNORECASE):
+        # 检查版本标签 [v\d+]
+        if re.search(r'^v\d+(?:\.\d+)?$', tag, re.IGNORECASE):
             version_tag = tag
-        elif re.search(r'\[(?:\d{6}|\d{8}|\d{10})\]', tag):
+        # 检查时间戳标签 [YYYYMMDD] / [YYMMDD] / [YYYYMMDDxx(10位)]
+        elif re.match(r'^(?:\d{6}|\d{8}|\d{10})$', tag):
             timestamp_tag = tag
-            
+
+    # 如果同时存在 [vX] 和 [YYYYMMDD]，必须保证 [vX] 出现在 [YYYYMMDD] 前面
     if version_tag and timestamp_tag:
-        version_pos = name.rindex(version_tag)
-        timestamp_pos = name.rindex(timestamp_tag)
+        version_pos = name_stripped.rindex(f'[{version_tag}]')
+        timestamp_pos = name_stripped.rindex(f'[{timestamp_tag}]')
         if version_pos > timestamp_pos:
             return False
-            
+
+    # 若所有检查都通过，就算合规
     return True
+
+
+############################
+# 下面是主流程和辅助函数
+############################
 
 def parse_starting_tokens(name):
     tokens = []
@@ -358,15 +486,15 @@ def main(folder_path, dry_run):
             total_files += len(files)
 
         for root, dirs, files in os.walk(folder_path):
+            # 忽略 temp 目录
             if 'temp' in dirs:
                 dirs.remove('temp')
-                
+            
             for item in files:
                 item_path = os.path.join(root, item)
                 processed_files += 1
                 
                 print(f"\rProcessing {processed_files}/{total_files} files...", end="")
-
                 try:
                     new_name = process_filename(item)
                     new_path = os.path.join(root, new_name)
@@ -379,6 +507,7 @@ def main(folder_path, dry_run):
                                 os.rename(item_path, new_path)
                                 print(f"\nRenamed: {item_path} -> {new_path}")
                             except OSError as e:
+                                # Windows 上特定错误号 183 表示已存在同名文件
                                 if hasattr(e, 'winerror') and e.winerror == 183:
                                     if temp_dir is None:
                                         temp_dir = ensure_temp_dir(folder_path)
@@ -398,6 +527,7 @@ def main(folder_path, dry_run):
                                     warnings.append((item_path, str(e)))
 
                     name_only = os.path.splitext(new_name)[0]
+                    # 核心：使用我们修改后的 is_filename_compliant 做检查
                     if not is_filename_compliant(name_only):
                         warnings.append((new_path, "Does not conform to naming convention"))
 
@@ -416,7 +546,6 @@ def main(folder_path, dry_run):
         print(f"\nError: {e}")
         print("Please handle the issue manually. No changes have been made.")
         sys.exit(1)
-
 
 if __name__ == '__main__':
     if len(sys.argv) < 2:

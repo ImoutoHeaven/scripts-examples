@@ -1,185 +1,321 @@
-#!/usr/bin/env python3
-"""
-文件重命名工具
-
-用于规范化文件名格式：
-1. 标准化括号（全角转半角）
-2. 验证和修复括号匹配
-3. 标准化空格
-4. 按规则重排序标签
-
-使用方法:
-    python rename_script.py <folder_path> [--dry-run] [--debug] [-i]
-
-参数:
-    folder_path: 要处理的文件夹路径
-    --dry-run: 模拟运行，不实际重命名文件
-    --debug: 启用调试模式，输出详细日志
-    -i: 交互式预览模式
-"""
-
 import os
 import sys
 import re
 import shutil
-import logging
-import argparse
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
 
-# 配置日志记录
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('rename.log', encoding='utf-8')
-    ]
-)
-logger = logging.getLogger(__name__)
-
-# 关键词分类定义
-CATEGORY_KEYWORDS = {
-    'source': ['Pixiv', 'Patreon', 'Fanbox', 'fanbox', 'pixiv', 'patreon', 'DL版'],
-    'translator_group': [
-        '汉化', '翻译', '漢化', '翻譯', '渣翻', '机翻', '个人', '個人', 
-        '死兆修会', '去码', '機翻', '中文', '繁体', '想舔羽月的jio组', 
-        '賣水槍的小男孩', '同人组', '烤肉man', '漫画の茜', '忍殺團', '今泉紅太狼'
-    ],
-    'translation_version': ['重嵌', '無修正', '换源', '換源'],
-    'version': ['v\\d+'],
-    'timestamp': None  # 时间戳使用正则匹配
-}
-
-def normalize_brackets(text: str) -> str:
-    """标准化括号，将全角括号转换为半角括号。"""
-    replacements = {
-        '【': '[', '［': '[',
-        '】': ']', '］': ']',
-        '（': '(', '）': ')'
-    }
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-    return text
-
-def attempt_auto_fix_brackets(s: str) -> Tuple[str, bool]:
+def clean_empty_brackets(s: str) -> str:
     """
-    尝试自动修复简单的括号不匹配。
-    返回: (修复后的字符串, 是否进行了修复)
+    清理字符串中形如 [] 或 [   ] 的空方括号
+    以及 () 或 (   ) 的空圆括号。
+    多次匹配，直到再也没有空括号出现为止。
     """
-    left_square = s.count('[')
-    right_square = s.count(']')
-    left_round = s.count('(')
-    right_round = s.count(')')
-    
-    if logger.isEnabledFor(logging.DEBUG):
-        logger.debug(f"括号统计: [ = {left_square}, ] = {right_square}, ( = {left_round}, ) = {right_round}")
-    
-    # 只处理明显的双括号错误
-    if '[[' in s:
-        s = s.replace('[[', '[', 1)
-        return s, True
-    elif ']]' in s:
-        s = s.replace(']]', ']', 1)
-        return s, True
-    elif '((' in s:
-        s = s.replace('((', '(', 1)
-        return s, True
-    elif '))' in s:
-        s = s.replace('))', ')', 1)
-        return s, True
-        
-    return s, False
+    prev = None
+    result = s
+    pattern_empty_square = re.compile(r'\[\s*\]')
+    pattern_empty_paren = re.compile(r'\(\s*\)')
+    while prev != result:
+        prev = result
+        # 先去除空的[]
+        result = pattern_empty_square.sub('', result)
+        # 再去除空的()
+        result = pattern_empty_paren.sub('', result)
+        # 如果有连续的空格，因为去掉括号后可能产生多余空格，这里顺手处理一下
+        result = re.sub(r'\s+', ' ', result).strip()
+    return result
 
-def validate_brackets(s: str) -> None:
+def light_bracket_fix(s: str) -> str:
     """
-    严格检查括号是否正确配对，如果有错误则抛出异常。
-    支持嵌套括号结构。
+    尝试轻度修复: 
+    1) 如果连续出现 '[['，且比 ']]' 多一次，就替换最左的 '[[' -> '['
+    2) 如果连续出现 ']]'，且比 '[[' 多一次，就替换最左的 ']]' -> ']'
+    3) 同理对圆括号 '((' 或 '))'
+    只做一次修复后返回，不做多轮循环。
     """
-    stack = []
+    # 统计 '[' 和 ']' 的数量
+    cnt_open_sq = s.count('[')
+    cnt_close_sq = s.count(']')
+    # 统计 '(' 和 ')' 的数量
+    cnt_open_par = s.count('(')
+    cnt_close_par = s.count(')')
+
+    # 如果 '[' 多出 1 个，则尝试找到 '[[' => '['
+    if cnt_open_sq == cnt_close_sq + 1:
+        s = re.sub(r'\[\[', '[', s, count=1)
+
+    # 如果 ']' 多出 1 个，则尝试找到 ']]' => ']'
+    elif cnt_close_sq == cnt_open_sq + 1:
+        s = re.sub(r'\]\]', ']', s, count=1)
+
+    # 同理对圆括号
+    if cnt_open_par == cnt_close_par + 1:
+        s = re.sub(r'\(\(', '(', s, count=1)
+    elif cnt_close_par == cnt_open_par + 1:
+        s = re.sub(r'\)\)', ')', s, count=1)
+
+    return s
+
+def check_brackets(s):
+    """
+    检查 s 中圆括号() 和方括号[] 是否匹配。
+    如果不匹配则抛出 ValueError。
+    """
     bracket_pairs = {'[': ']', '(': ')'}
-    
-    for i, char in enumerate(s):
-        if char in '[(':  # 左括号
-            stack.append((char, i))
-        elif char in '])':  # 右括号
-            if not stack:  # 栈空说明有未匹配的右括号
-                raise ValueError(f"位置 {i} 处有未匹配的右括号 '{char}'")
-            
-            last_left, pos = stack[-1]
-            if bracket_pairs[last_left] != char:  # 括号类型不匹配
-                raise ValueError(f"括号不匹配：位置 {i} 处期望 '{bracket_pairs[last_left]}' 但遇到 '{char}'")
-            
-            stack.pop()  # 匹配成功，弹出左括号
-    
-    # 检查是否有未闭合的左括号
-    if stack:
-        positions = [f"'{b[0]}' (位置 {pos})" for b, pos in stack]
-        raise ValueError(f"存在未闭合的左括号: {', '.join(positions)}")
+    for opening, closing in bracket_pairs.items():
+        depth = 0
+        for i, c in enumerate(s):
+            if c == opening:
+                depth += 1
+            elif c == closing:
+                depth -= 1
+                if depth < 0:
+                    raise ValueError(
+                        f"Unmatched closing '{closing}' in '{s}'. Please handle manually."
+                    )
+        if depth != 0:
+            raise ValueError(
+                f"Unmatched opening '{opening}' in '{s}'. Please handle manually."
+            )
+    return True
 
-def create_keywords_pattern() -> str:
-    """创建用于匹配所有关键词的正则表达式模式。"""
-    all_keywords = []
-    for category, keywords in CATEGORY_KEYWORDS.items():
-        if keywords and category not in ['version', 'timestamp']:
-            all_keywords.extend(keywords)
-    return '|'.join(map(re.escape, all_keywords))
+def process_name(name):
+    """
+    对文件(或文件夹)名进行重命名逻辑：
+    1. 全角 -> 半角
+    2. 轻度修复、检查配对
+    3. 去除 (同人誌)
+    4. () -> []（只要括号内包含关键字）
+    5. 如果开头是(关键字)，也转为[关键字]
+    6. v+数字 -> [v数字]（排除类似Rev3等）
+    7. 移动最前 [关键字] -> 后面
+    8. 替换下划线、加空格、精简空格
+    9. 最后调用 rearrange_tags
+    10. 再次清理空括号
+    """
+    # 先清理一次(有些场景下，名字里本身就有空括号)
+    name = clean_empty_brackets(name)
 
-def is_filename_compliant(name: str) -> bool:
+    # 1. 替换全角括号
+    name = re.sub(r'[【［]', '[', name)
+    name = re.sub(r'[】］]', ']', name)
+    name = name.replace('（', '(').replace('）', ')')
+
+    # 轻度修复一次、清理空括号
+    name = light_bracket_fix(name)
+    name = clean_empty_brackets(name)
+
+    # 2. 检查配对，如不配对，再修一次
+    try:
+        check_brackets(name)
+    except ValueError:
+        name = light_bracket_fix(name)
+        name = clean_empty_brackets(name)
+        check_brackets(name)  # 若仍报错则抛出
+
+    # 3. 去除 (同人誌)
+    name = name.replace('(同人誌)', '')
+    name = clean_empty_brackets(name)
+
+    # 4. 将包含关键字的 () -> []
+    keywords_list = [
+        '汉化','翻译','漢化','翻譯','渣翻','机翻','个人','個人','死兆修会','去码','機翻','重嵌',
+        'Pixiv','無修正','中文','繁体','想舔羽月的jio组','换源','換源','賣水槍的小男孩','同人组',
+        '烤肉man','漫画の茜','忍殺團','今泉紅太狼','Fanbox','fanbox','Patreon','patreon','DL版'
+    ]
+    pattern_keywords = '|'.join(map(re.escape, keywords_list))
+    pattern_paren = re.compile(r'\([^)]*(?:' + pattern_keywords + r')[^)]*\)')
+
+    def replace_paren_with_bracket(m):
+        content = m.group(0)  # e.g. "(xx汉化xx)"
+        inner = content[1:-1]
+        return "[" + inner + "]"
+
+    name = pattern_paren.sub(replace_paren_with_bracket, name)
+    name = clean_empty_brackets(name)
+
+    # 5. 若开头是(关键字)，也替换为[关键字]
+    keywords = r'汉化|翻译|漢化|翻譯|渣翻|机翻|个人|個人|死兆修会|去码|機翻|重嵌|Pixiv|無修正|中文|繁体|想舔羽月的jio组|换源|換源|賣水槍的小男孩|機翻|同人组|烤肉man|漫画の茜|忍殺團|今泉紅太狼|Fanbox|fanbox|Patreon|patreon|DL版'
+    if name.startswith('(') and ')' in name:
+        start, rest = name.split(')', 1)
+        if re.search(keywords, start, re.IGNORECASE):
+            name = '[' + start[1:] + ']' + rest
+    name = clean_empty_brackets(name)
+
+    # 6. 将 v+数字 => [v数字]，排除 Rev3 / v3Anthor 等
+    pattern_ver = re.compile(r'(?<![A-Za-z0-9])v(\d+)(?![A-Za-z0-9])', re.IGNORECASE)
+    def replace_version(m):
+        return f"[v{m.group(1)}]"
+    name = pattern_ver.sub(replace_version, name)
+    name = clean_empty_brackets(name)
+
+    # 7. 移动最前 [xxx] -> 后面 (如果含关键字)
+    move_keywords = r'汉化|翻译|漢化|翻譯|渣翻|机翻|个人|個人|死兆修会|去码|機翻|中文|繁体|想舔羽月的jio组|賣水槍的小男孩|同人组|烤肉man|漫画の茜|忍殺團|今泉紅太狼|Pixiv|Fanbox|fanbox|Patreon|patreon|DL版|無修正|重嵌|换源|換源'
+    match = re.match(r'^(\[[^\[\]]*(?:' + move_keywords + r')[^\[\]]*\])\s*(.*)', name)
+    if match:
+        bracket_to_move = match.group(1)
+        rest_of_name = match.group(2)
+        name = rest_of_name.strip() + ' ' + bracket_to_move
+    name = clean_empty_brackets(name)
+
+    # 8. 替换下划线 -> 空格, 美化空格
+    name = name.replace('_', ' ')
+    name = name.replace('[', ' [').replace(']', '] ').replace('(', ' (').replace(')', ') ')
+    name = re.sub(r'\s+', ' ', name).strip()
+    name = re.sub(r'\) \]', ')]', name)
+    name = re.sub(r'\[ ', '[', name)
+    name = re.sub(r' \]', ']', name)
+    name = clean_empty_brackets(name)
+
+    # 9. 重新排序标签
+    name = rearrange_tags(name)
+    name = clean_empty_brackets(name)
+
+    # 返回最终结果
+    return name
+
+def rearrange_tags(name):
     """
-    检查文件名是否符合命名规范。
+    对 [Pixiv] [汉化] [v2] 等标签按特定顺序重新排列到后面。
+    在返回前会再次清理空的[]标签。
     """
-    # 移除扩展名进行检查
-    name = os.path.splitext(name)[0]
-    
-    def parse_starting_tokens(text: str) -> List[Tuple[str, str]]:
-        """解析文件名开头的括号标记。"""
-        tokens = []
-        pos = 0
-        length = len(text)
-        
-        while pos < length:
-            # 跳过前导空格
-            while pos < length and text[pos].isspace():
-                pos += 1
-            if pos >= length:
+    category_keywords = {
+        'source': ['Pixiv', 'Patreon', 'Fanbox', 'fanbox', 'pixiv', 'patreon', 'DL版'],
+        'translator_group': [
+            '汉化','翻译','漢化','翻譯','渣翻','机翻','个人','個人','死兆修会','去码','機翻','中文',
+            '繁体','想舔羽月的jio组','賣水槍的小男孩','同人组','烤肉man','漫画の茜','忍殺團','今泉紅太狼'
+        ],
+        'translation_version': ['重嵌', '無修正','换源','換源'],
+        'version': ['v2','v3','v4','v5','v6','v7','v8','v9','v10','v11','v12'],  # 可自行扩充
+        'timestamp': None  # 原脚本处理日期戳
+    }
+    category_patterns = {}
+    for category, keywords in category_keywords.items():
+        if keywords:
+            # 仅匹配完整标签(不匹配空)
+            pattern = re.compile(r'^(' + '|'.join(map(re.escape, keywords)) + r')$', re.IGNORECASE)
+            category_patterns[category] = pattern
+        else:
+            category_patterns['timestamp'] = re.compile(r'^(\d{6,8}|\d{6,8}\d{2})$')
+
+    category_order = ['source','translator_group','translation_version','version','timestamp']
+    # 不匹配空标签: [^\[\]]+ 保证内部至少有1个字符
+    bracket_tag_pattern = re.compile(r'\[([^\[\]]+)\]')
+
+    matched_tag_positions = []
+    category_tags = {cat: [] for cat in category_order}
+
+    for match in re.finditer(bracket_tag_pattern, name):
+        tag_content = match.group(1).strip()
+        tag_start = match.start()
+        tag_end = match.end()
+        categorized = False
+
+        for category in category_order:
+            pattern = category_patterns[category]
+            if pattern.match(tag_content):
+                category_tags[category].append(tag_content)
+                categorized = True
                 break
-            
-            if text[pos] == '[':
-                start = pos
+
+        if categorized:
+            matched_tag_positions.append((tag_start, tag_end))
+
+    # 从后往前删除原标签
+    name_list = list(name)
+    for start, end in sorted(matched_tag_positions, key=lambda x: -x[0]):
+        del name_list[start:end]
+    name_without_tags = ''.join(name_list).strip()
+
+    # 按顺序重新拼装
+    rearranged_tags = []
+    for category in category_order:
+        tags = category_tags[category]
+        if tags:
+            tags.sort(key=str.lower)
+            rearranged_tags.extend([f'[{tag}]' for tag in tags])
+
+    final_name = name_without_tags.strip()
+    if rearranged_tags:
+        final_name = final_name + ' ' + ' '.join(rearranged_tags)
+
+    # 去掉多余空格
+    final_name = re.sub(r'\s+', ' ', final_name).strip()
+
+    # 再次清理空括号
+    final_name = clean_empty_brackets(final_name)
+    return final_name
+
+def process_filename(filename):
+    """
+    对单个文件名做重命名处理(若有后缀则保留)。
+    """
+    if filename.startswith('.'):
+        return filename
+
+    parts = filename.rsplit('.', 1)
+    if len(parts) == 2:
+        name, ext = parts
+    else:
+        name, ext = filename, ''
+
+    name = process_name(name)
+    ext = ext.strip()
+    if ext:
+        return name + '.' + ext
+    else:
+        return name
+
+def parse_starting_tokens(name):
+    """
+    检测文件名开头的 [] 或 () 用来判断是否符合某些规范。
+    """
+    tokens = []
+    pos = 0
+    length = len(name)
+    while pos < length:
+        while pos < length and name[pos] == ' ':
+            pos += 1
+        if pos >= length:
+            break
+        if name[pos] == '[':
+            start = pos
+            pos += 1
+            depth = 1
+            while pos < length and depth > 0:
+                if name[pos] == '[':
+                    depth += 1
+                elif name[pos] == ']':
+                    depth -= 1
                 pos += 1
-                depth = 1
-                while pos < length and depth > 0:
-                    if text[pos] == '[':
-                        depth += 1
-                    elif text[pos] == ']':
-                        depth -= 1
-                    pos += 1
-                if depth == 0:
-                    tokens.append(('[]', text[start:pos]))
-                else:
-                    break
-            elif text[pos] == '(':
-                start = pos
-                pos += 1
-                depth = 1
-                while pos < length and depth > 0:
-                    if text[pos] == '(':
-                        depth += 1
-                    elif text[pos] == ')':
-                        depth -= 1
-                    pos += 1
-                if depth == 0:
-                    tokens.append(('()', text[start:pos]))
-                else:
-                    break
+            if depth == 0:
+                token = name[start:pos]
+                tokens.append(('[]', token))
             else:
                 break
-        return tokens
-    
+        elif name[pos] == '(':
+            start = pos
+            pos += 1
+            depth = 1
+            while pos < length and depth > 0:
+                if name[pos] == '(':
+                    depth += 1
+                elif name[pos] == ')':
+                    depth -= 1
+                pos += 1
+            if depth == 0:
+                token = name[start:pos]
+                tokens.append(('()', token))
+            else:
+                break
+        else:
+            break
+    return tokens
+
+def is_filename_compliant(name):
+    """
+    原作者定义的合规检测逻辑。
+    """
     tokens = parse_starting_tokens(name)
-    
-    # 如果没有标记，检查第一个字符
     if not tokens:
         first_char = name.lstrip()[0] if name.lstrip() else ''
         if first_char not in ['[', '(']:
@@ -188,15 +324,13 @@ def is_filename_compliant(name: str) -> bool:
         token_types = [t[0] for t in tokens]
         if '[]' not in token_types:
             return False
-        
         first_bracket_type = token_types[0]
         if first_bracket_type == '()':
-            # 检查第一个 [] 前是否有多于一个 ()
             index_of_first_square = token_types.index('[]')
-            if index_of_first_square > 1:
+            num_paren_before_square = index_of_first_square
+            if num_paren_before_square > 1:
                 return False
         elif first_bracket_type == '[]':
-            # 检查是否有多个连续的开头 []
             num_initial_square = 1
             i = 1
             while i < len(token_types) and token_types[i] == '[]':
@@ -204,323 +338,107 @@ def is_filename_compliant(name: str) -> bool:
                 i += 1
             if num_initial_square > 1:
                 return False
-            # 检查下一个是否为 ()
             if i < len(token_types) and token_types[i] == '()':
                 return False
-    
+        else:
+            return False
     return True
 
-def rearrange_tags(name: str) -> str:
+def compare_files(file1, file2):
     """
-    按预定义的顺序重新排列标签。
+    命名冲突时，比较修改时间和大小，返回需要移动的那个文件。
     """
-    # 编译分类模式
-    category_patterns = {}
-    for category, keywords in CATEGORY_KEYWORDS.items():
-        if keywords:
-            pattern = '|'.join(keywords if category == 'version' else map(re.escape, keywords))
-            category_patterns[category] = re.compile(f'^({pattern})$', re.IGNORECASE)
-        elif category == 'timestamp':
-            category_patterns[category] = re.compile(r'^(\d{6,8}|\d{6,8}\d{2})$')
-    
-    # 标签顺序
-    category_order = ['source', 'translator_group', 'translation_version', 'version', 'timestamp']
-    
-    # 查找所有标签
-    bracket_tags = re.finditer(r'\[([^\[\]]+)\]', name)
-    matched_positions = []
-    category_tags = {category: [] for category in category_order}
-    
-    # 分类标签
-    for match in bracket_tags:
-        content = match.group(1).strip()
-        start, end = match.span()
-        
-        for category in category_order:
-            if category_patterns[category].match(content):
-                category_tags[category].append(content)
-                matched_positions.append((start, end))
-                break
-    
-    # 移除原有标签
-    name_chars = list(name)
-    for start, end in sorted(matched_positions, reverse=True):
-        del name_chars[start:end]
-    name_without_tags = ''.join(name_chars).strip()
-    
-    # 重建标签
-    new_tags = []
-    for category in category_order:
-        tags = category_tags[category]
-        if tags:
-            tags.sort(key=str.lower)
-            new_tags.extend(f'[{tag}]' for tag in tags)
-    
-    # 组合最终文件名
-    if new_tags:
-        return f"{name_without_tags} {' '.join(new_tags)}"
-    return name_without_tags
+    stat1 = os.stat(file1)
+    stat2 = os.stat(file2)
 
-def process_name(name: str) -> str:
-    """处理文件名，包括格式化和括号处理。"""
-    try:
-        # 标准化括号
-        name = normalize_brackets(name)
-        
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"处理前的文件名: {name}")
-        
-        # 自动修复括号
-        was_fixed = False
-        original = name
-        while True:
-            name, fixed = attempt_auto_fix_brackets(name)
-            if not fixed:
-                break
-            was_fixed = True
-            
-        if was_fixed and logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"修复后的文件名: {name}")
-            
-        # 验证括号
-        validate_brackets(name)
-        
-        # 处理关键词标签
-        name = name.replace('(同人誌)', '')
-        
-        # 替换包含关键词的小括号为中括号
-        keywords_pattern = create_keywords_pattern()
-        
-        def replace_if_keyword(match):
-            content = match.group(1)
-            if re.search(keywords_pattern, content, re.IGNORECASE):
-                return f'[{content}]'
-            return f'({content})'
-        
-        name = re.sub(r'\(([^()]+)\)', replace_if_keyword, name)
-        
-        # 移动开头的关键词标签到末尾
-        match = re.match(f'^(\\[[^\\[\\]]*(?:{keywords_pattern})[^\\[\\]]*\\])\\s*(.*)', name)
-        if match:
-            bracket_to_move = match.group(1)
-            rest_of_name = match.group(2)
-            name = f"{rest_of_name.strip()} {bracket_to_move}"
-            
-        # 规范化空格
-        name = re.sub(r'\s*\[\s*', ' [', name)  # 左方括号前后的空格
-        name = re.sub(r'\s*\]\s*', '] ', name)  # 右方括号前后的空格
-        name = re.sub(r'\s*\(\s*', ' (', name)  # 左圆括号前后的空格
-        name = re.sub(r'\s*\)\s*', ') ', name)  # 右圆括号前后的空格
-        name = re.sub(r'\s+', ' ', name).strip()
-        
-        # 处理版本号
-        name_parts = name.rsplit('.', 1)
-        main_name = name_parts[0]
-        main_name = re.sub(
-            r'(^|[\s\]\)])v\d+(?=[\s\.\[\(]|$)',
-            lambda m: f'[{m.group(0)}]' if not re.search(r'\[.*' + re.escape(m.group(0)) + r'.*\]', name) else m.group(0),
-            main_name
-        )
-        
-        name = f"{main_name}.{name_parts[1]}" if len(name_parts) > 1 else main_name
-        
-        # 重排序标签
-        name = rearrange_tags(name)
-        
-        # 添加新的处理：将 ") ]" 替换为 ")]"
-        name = re.sub(r'\)\s*\]', ')]', name)
-            
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug(f"最终处理后的文件名: {name}")
-            
-        return name
-            
-    except Exception as e:
-        logger.error(f"处理文件名时出错: {str(e)}")
-        raise
+    if stat1.st_mtime != stat2.st_mtime:
+        return file1 if stat1.st_mtime < stat2.st_mtime else file2
 
-def process_file(file_path: str, dry_run: bool = False) -> Optional[str]:
+    if stat1.st_size != stat2.st_size:
+        return file1 if stat1.st_size < stat2.st_size else file2
+
+    return file1
+
+def ensure_temp_dir(folder_path):
     """
-    处理单个文件，返回新的文件名或None。
+    必要时创建 temp 文件夹。
     """
-    try:
-        filename = os.path.basename(file_path)
-        if filename.startswith('.'):
-            return None
-            
-        new_name = process_name(filename)
-        return new_name if new_name != filename else None
-        
-    except Exception as e:
-        logger.error(f"处理文件 {file_path} 时出错: {str(e)}")
-        return None
-
-def ensure_unique_path(path: str) -> str:
-    """确保文件路径唯一，如果存在则添加数字后缀。"""
-    if not os.path.exists(path):
-        return path
-        
-    base, ext = os.path.splitext(path)
-    counter = 1
-    while True:
-        new_path = f"{base}_{counter}{ext}"
-        if not os.path.exists(new_path):
-            return new_path
-        counter += 1
-
-def preview_names(filenames: List[str]) -> None:
-    """预览文件名处理结果。"""
-    logger.info("\n预览重命名结果:")
-    logger.info("-" * 120)
-    logger.info(f"{'原文件名':<60} → {'新文件名':<60}")
-    logger.info("-" * 120)
-    
-    non_compliant_files = []
-    
-    for filename in filenames:
-        try:
-            new_name = process_name(filename.strip())
-            if not is_filename_compliant(new_name):
-                non_compliant_files.append(new_name)
-            
-            logger.info(f"{filename:<60} → {new_name:<60}")
-                
-        except ValueError as e:
-            # 对于验证错误（如括号不匹配），只显示错误信息
-            logger.error(f"处理文件名出错: {filename}")
-            logger.error(f"错误原因: {str(e)}")
-            
-        except Exception as e:
-            # 对于其他错误，显示详细的错误信息
-            logger.error(f"处理文件时发生未知错误: {filename}")
-            logger.error(f"错误原因: {str(e)}")
-    
-    logger.info("-" * 120)
-    
-    # 输出不符合命名规范的文件列表
-    if non_compliant_files:
-        logger.warning("\n警告：以下文件不遵循标准命名规范，建议手动检查:")
-        for file in non_compliant_files:
-            logger.warning(f"  - {file}")
-
-def main():
-    """主函数"""
-    parser = argparse.ArgumentParser(description="文件重命名工具")
-    parser.add_argument("folder", help="要处理的文件夹路径")
-    parser.add_argument("--dry-run", action="store_true", help="模拟运行，不实际重命名文件")
-    parser.add_argument("--debug", action="store_true", help="启用调试模式")
-    parser.add_argument("-i", "--interactive", action="store_true", help="交互式预览模式")
-    args = parser.parse_args()
-    
-    if args.debug:
-        logger.setLevel(logging.DEBUG)
-    
-    # 交互式预览模式
-    if args.interactive:
-        logger.info("进入交互式预览模式")
-        logger.info("请输入要预览的文件名(每行一个)")
-        logger.info("输入两个空行结束输入\n")
-        
-        filenames = []
-        empty_line_count = 0
-        
-        while empty_line_count < 2:
-            try:
-                line = input().strip()
-                if not line:
-                    empty_line_count += 1
-                else:
-                    empty_line_count = 0
-                    filenames.append(line)
-            except EOFError:
-                break
-            except KeyboardInterrupt:
-                logger.info("\n用户中断输入")
-                return 1
-        
-        if filenames:
-            preview_names(filenames)
-        else:
-            logger.warning("未输入任何文件名")
-        return 0
-    
-    # 常规处理模式
-    folder_path = args.folder
-    dry_run = args.dry_run
-    
-    if not os.path.isdir(folder_path):
-        logger.error(f"文件夹不存在: {folder_path}")
-        return 1
-    
-    # 创建临时文件夹
     temp_dir = os.path.join(folder_path, 'temp')
-    if not dry_run and not os.path.exists(temp_dir):
+    if not os.path.exists(temp_dir):
         os.makedirs(temp_dir)
-    
+    return temp_dir
+
+def main(folder_path, dry_run):
+    """
+    主逻辑：遍历 folder_path 下的所有文件和文件夹，处理名称，若冲突则移动到 temp。
+    """
+    warnings = []
+    temp_dir = None
+
     try:
-        processed_count = 0
-        skipped_count = 0
-        error_count = 0
-        non_compliant_files = []
-        
         for item in os.listdir(folder_path):
             if item == 'temp':
                 continue
-                
-            item_path = os.path.join(folder_path, item)
-            
-            try:
-                if os.path.isfile(item_path):
-                    new_name = process_file(item_path, dry_run)
-                    if new_name:
-                        # 检查新文件名是否符合命名规范
-                        if not is_filename_compliant(new_name):
-                            non_compliant_files.append(new_name)
-                        
-                        new_path = os.path.join(folder_path, new_name)
-                        
-                        if dry_run:
-                            logger.info(f"将重命名: {item} → {new_name}")
-                            processed_count += 1
-                        else:
-                            try:
-                                if os.path.exists(new_path) and new_path != item_path:
-                                    # 处理文件冲突
-                                    temp_path = ensure_unique_path(os.path.join(temp_dir, item))
-                                    logger.info(f"移动冲突文件到临时目录: {item} → {os.path.basename(temp_path)}")
-                                    shutil.move(item_path, temp_path)
-                                else:
-                                    # 直接重命名
-                                    os.rename(item_path, new_path)
-                                    logger.info(f"已重命名: {item} → {new_name}")
-                                    processed_count += 1
-                            except OSError as e:
-                                logger.error(f"重命名文件时出错 {item}: {str(e)}")
-                                error_count += 1
-                    else:
-                        skipped_count += 1
-                        
-            except Exception as e:
-                logger.error(f"处理 {item} 时出错: {str(e)}")
-                error_count += 1
-        
-        # 输出统计信息
-        logger.info(f"\n处理完成:")
-        logger.info(f"处理文件数: {processed_count}")
-        logger.info(f"跳过文件数: {skipped_count}")
-        logger.info(f"错误文件数: {error_count}")
-        
-        # 输出不符合命名规范的文件列表
-        if non_compliant_files:
-            logger.warning("\n警告：以下文件不遵循标准命名规范，建议手动检查:")
-            for file in non_compliant_files:
-                logger.warning(f"  - {file}")
-        
-    except Exception as e:
-        logger.error(f"执行过程中出错: {str(e)}")
-        return 1
-        
-    return 0
 
-if __name__ == "__main__":
-    sys.exit(main())
+            item_path = os.path.join(folder_path, item)
+            if os.path.isdir(item_path):
+                new_name = process_name(item)
+            else:
+                new_name = process_filename(item)
+
+            new_path = os.path.join(folder_path, new_name)
+
+            if item_path != new_path:
+                if dry_run:
+                    print(f"Would rename: {item_path} -> {new_path}")
+                else:
+                    try:
+                        os.rename(item_path, new_path)
+                        print(f"Renamed: {item_path} -> {new_path}")
+                    except OSError as e:
+                        # Windows下： [WinError 183] 当目标已存在
+                        if hasattr(e, 'winerror') and e.winerror == 183:
+                            if temp_dir is None:
+                                temp_dir = ensure_temp_dir(folder_path)
+                            file_to_move = compare_files(item_path, new_path)
+                            temp_path = os.path.join(temp_dir, os.path.basename(file_to_move))
+                            counter = 1
+                            base, ext = os.path.splitext(temp_path)
+                            while os.path.exists(temp_path):
+                                temp_path = f"{base}_{counter}{ext}"
+                                counter += 1
+                            shutil.move(file_to_move, temp_path)
+                            print(f"Conflict resolved: Moved {file_to_move} to {temp_path}")
+                            if file_to_move == item_path:
+                                continue
+                        else:
+                            print(f"Error renaming {item_path}: {str(e)}")
+            else:
+                new_name = item  # 无变化
+
+            # 检测是否符合命名规范
+            name_only = os.path.splitext(new_name)[0]
+            if not is_filename_compliant(name_only):
+                warnings.append(new_name)
+
+        if warnings:
+            print("\nWARNING: The following files do not conform to the naming convention and require manual renaming:")
+            for warning in warnings:
+                print(warning)
+
+    except ValueError as ve:
+        print(f"Error: {ve}")
+        print("Please handle the issue manually. No changes have been made.")
+        sys.exit(1)
+
+
+
+if __name__ == '__main__':
+
+
+    # 若要批量处理文件夹，命令行运行:
+    # python script.py /path/to/folder --dry-run
+    if len(sys.argv) >= 2:
+        folder_path = sys.argv[1]
+        dry_run = '--dry-run' in sys.argv
+        main(folder_path, dry_run)

@@ -371,10 +371,10 @@ def is_filename_compliant(name):
     # 但有些情况用户可能会加其他 [翻译组] [v2] 标签在后面几乎紧挨着，所以要不要严格禁止“紧挨着”这个要看你是否想要。
     # 下面是一个更严格的写法：如果 bracket_end 后面紧跟 "["，就判不合规
     # （可根据自己需求决定要不要加）
-    # next_part = name_stripped[bracket_end:].lstrip()
-    # if next_part.startswith('['):
+    next_part = name_stripped[bracket_end:].lstrip()
+    if next_part.startswith('['):
     #     # 又出现了一个方括号，且是紧随其后的 => 不合规
-    #     return False
+        return False
 
     # =====================================================================
     # 3) 保留对版本[vX] 与时间戳[YYYYMMDD]的顺序检查

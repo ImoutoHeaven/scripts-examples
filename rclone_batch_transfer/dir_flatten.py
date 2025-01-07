@@ -4,111 +4,195 @@
 import os
 import sys
 import shutil
+import logging
+
+# 配置日志输出
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+
+def merge_directory(src, dst):
+    """
+    将 src 目录的所有内容合并到 dst 目录中。
+    """
+    logger.info(f"开始合并目录: {src} -> {dst}")
+    
+    if not os.path.exists(dst):
+        logger.info(f"目标目录不存在，直接移动: {src} -> {dst}")
+        shutil.move(src, dst)
+        return
+
+    if not os.path.isdir(dst):
+        logger.warning(f"目标已存在且是文件，跳过合并: {dst}")
+        return
+
+    # dst 是已存在的目录 => 逐项合并
+    logger.info(f"目标是已存在的目录，开始逐项合并: {dst}")
+    for item in os.listdir(src):
+        src_item = os.path.join(src, item)
+        dst_item = os.path.join(dst, item)
+
+        if os.path.isdir(src_item):
+            if os.path.exists(dst_item):
+                if os.path.isdir(dst_item):
+                    logger.info(f"发现同名目录，进行递归合并: {dst_item}")
+                    merge_directory(src_item, dst_item)
+                else:
+                    logger.warning(f"同名文件已存在，跳过目录合并: {dst_item}")
+            else:
+                logger.info(f"移动目录: {src_item} -> {dst_item}")
+                shutil.move(src_item, dst_item)
+        else:
+            if os.path.exists(dst_item):
+                logger.warning(f"同名文件已存在，跳过: {dst_item}")
+            else:
+                logger.info(f"移动文件: {src_item} -> {dst_item}")
+                shutil.move(src_item, dst_item)
+
+    # 如果 src 现在空了，删掉
+    try:
+        os.rmdir(src)
+        logger.info(f"删除空源目录: {src}")
+    except OSError:
+        logger.debug(f"源目录非空或已删除: {src}")
+
 
 def flatten_shell(folder, depth=0):
     """
-    扁平化移除“无意义的外壳”目录。
-    :param folder: 要处理的目录
-    :param depth: 当前目录相对于“游戏顶层目录”的深度。
-                  depth=0 => folder是root_dir下的直接子目录（一个游戏/文件集的顶层）。
-                  depth>0 => folder是更深一层的嵌套目录（潜在的无意义壳）。
+    扁平化移除"无意义外壳"。
     """
+    logger.info(f"开始处理目录 (深度={depth}): {folder}")
+    changed = False
     items = os.listdir(folder)
 
-    # 如果此目录包含 >=2 个条目 => 视为“内容目录”，停止扁平化
+    # 1) 若 >=2 个条目 => 内容目录，不动
     if len(items) >= 2:
-        return
+        logger.info(f"目录包含多个项目，保持不变: {folder}")
+        return False
 
-    # 如果此目录为空
+    # 2) 若目录为空
     if len(items) == 0:
-        # 对于“深层壳”可直接删除
         if depth > 0:
             try:
                 os.rmdir(folder)
-                print(f"[删除空目录] {folder}")
-            except OSError as e:
-                print(f"[删除空目录失败] {folder}, 原因: {e}")
-        else:
-            # depth=0 => 顶层目录且为空，通常不动它，防止误删可能还要用的文件夹
-            pass
-        return
+                logger.info(f"删除空目录: {folder}")
+                changed = True
+            except OSError:
+                logger.error(f"删除空目录失败: {folder}")
+        return changed
 
-    # 现在只剩下 len(items) == 1 的情况
+    # 3) 只有 1 个条目
     only_item = items[0]
     only_item_path = os.path.join(folder, only_item)
+    logger.info(f"发现单个项目: {only_item_path}")
 
-    # 如果唯一条目是“文件”
+    # 3a) 若唯一条目是文件
     if os.path.isfile(only_item_path):
         if depth > 0:
-            # 将此唯一文件“上移”到父目录
             parent_folder = os.path.dirname(folder)
-            try:
-                shutil.move(only_item_path, parent_folder)
-                print(f"[上移文件] {only_item_path} => {parent_folder}")
-                # 移动后若 folder 为空，可删
+            target_file = os.path.join(parent_folder, only_item)
+            
+            if os.path.exists(target_file):
+                logger.warning(f"上移文件时发生冲突，跳过: {target_file}")
+            else:
                 try:
-                    os.rmdir(folder)
-                    print(f"[删除外壳目录] {folder}")
-                except OSError as e:
-                    print(f"[删除外壳目录失败] {folder}, 原因: {e}")
-            except Exception as e:
-                print(f"[移动文件时出现错误] {only_item_path} => {parent_folder}, 错误: {e}")
-        else:
-            # depth=0 => 顶层目录只有一个文件，不要把它扔到 root_dir
-            # 这个场景下就保持不动，防止把所有单文件都直接丢进root_dir。
-            pass
-        return
+                    logger.info(f"上移文件: {only_item_path} -> {parent_folder}")
+                    shutil.move(only_item_path, parent_folder)
+                    changed = True
+                except Exception as e:
+                    logger.error(f"移动文件失败: {only_item_path} -> {parent_folder}, 错误: {e}")
 
-    # 如果唯一条目是“目录”
-    if os.path.isdir(only_item_path):
-        # 这里不再判断它是否是“内容目录”，只要父目录只有它一个子目录，我们就把它的内容上移
-        # 这样就能把“subFolder2”中的多个文件 1.jpg,2.jpg,3.jpg 移到“subFolder1”。
-        for c in os.listdir(only_item_path):
-            src = os.path.join(only_item_path, c)
-            dst = os.path.join(folder, c)
             try:
-                shutil.move(src, dst)
-                print(f"[上移内容] {src} => {dst}")
-            except Exception as e:
-                print(f"[移动内容时出现错误] {src} => {dst}, 错误: {e}")
+                os.rmdir(folder)
+                logger.info(f"删除空壳目录: {folder}")
+                changed = True
+            except OSError:
+                logger.debug(f"目录非空或已删除: {folder}")
+        return changed
 
-        # 搬空后，尝试删除 only_item_path
+    # 3b) 若唯一条目是目录 => 将其内容上移到当前 folder
+    if os.path.isdir(only_item_path):
+        logger.info(f"处理单个子目录: {only_item_path}")
+        moved_any = False
+
+        for sub in os.listdir(only_item_path):
+            src = os.path.join(only_item_path, sub)
+            dst = os.path.join(folder, sub)
+
+            if os.path.exists(dst):
+                if os.path.isdir(src) and os.path.isdir(dst):
+                    logger.info(f"合并同名目录: {src} -> {dst}")
+                    merge_directory(src, dst)
+                    moved_any = True
+                elif os.path.isdir(src) and not os.path.isdir(dst):
+                    logger.warning(f"同名文件已存在，跳过目录合并: {dst}")
+                elif not os.path.isdir(src) and os.path.isdir(dst):
+                    logger.warning(f"同名目录已存在，跳过文件: {dst}")
+                else:
+                    logger.warning(f"同名文件已存在，跳过: {dst}")
+            else:
+                logger.info(f"移动项目: {src} -> {dst}")
+                shutil.move(src, dst)
+                moved_any = True
+
         try:
             os.rmdir(only_item_path)
-            print(f"[删除空目录] {only_item_path}")
+            logger.info(f"删除已清空的子目录: {only_item_path}")
+            moved_any = True
         except OSError:
-            pass
+            logger.debug(f"子目录非空或已删除: {only_item_path}")
 
-        # 现在 folder 里已经多了刚刚上移的内容 -> 重新判断一次
-        flatten_shell(folder, depth)
-        return
+        changed = changed or moved_any
+
+        if moved_any:
+            logger.info(f"重新检查目录是否可以继续扁平化: {folder}")
+            again = flatten_shell(folder, depth)
+            changed = changed or again
+
+        return changed
+
+    return changed
 
 
 def process_root_dir(root_dir):
     """
-    对 root_dir 下的所有“游戏顶层目录”进行扁平化处理。
-    注：不会把“游戏内容”直接移到 root_dir，以防多个游戏/文件集混杂。
+    处理根目录下的所有子目录。
     """
+    logger.info(f"开始处理根目录: {root_dir}")
+    
     for entry in os.listdir(root_dir):
         sub_path = os.path.join(root_dir, entry)
         if os.path.isdir(sub_path):
-            flatten_shell(sub_path, depth=0)
-            # 若你担心一次 flatten_shell 不够彻底，可再重复调用一次或多次
-            # flatten_shell(sub_path, depth=0)
+            logger.info(f"处理子目录: {sub_path}")
+            iteration = 1
+            while True:
+                logger.info(f"开始第 {iteration} 次扁平化尝试: {sub_path}")
+                if not flatten_shell(sub_path, depth=0):
+                    logger.info(f"目录 {sub_path} 已完成扁平化")
+                    break
+                iteration += 1
 
 
 def main():
     if len(sys.argv) != 2:
-        print(f"用法：python {sys.argv[0]} /path/to/root_dir")
+        logger.error(f"用法: python {sys.argv[0]} /path/to/root_dir")
         sys.exit(1)
 
     root_dir = sys.argv[1]
     if not os.path.isdir(root_dir):
-        print(f"[错误] {root_dir} 不是一个有效目录")
+        logger.error(f"{root_dir} 不是有效目录")
         sys.exit(1)
 
+    logger.info("=== 目录扁平化工具启动 ===")
+    logger.info(f"目标根目录: {root_dir}")
+    
     process_root_dir(root_dir)
-    print("处理完成。可以多次运行脚本查看是否还有可移除的外壳。")
+    
+    logger.info("=== 处理完成 ===")
 
 
 if __name__ == "__main__":

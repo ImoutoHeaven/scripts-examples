@@ -896,200 +896,186 @@ def ensure_temp_dir(folder_path, debug=False):
 
 def main(folder_path, dry_run=False, debug=False):
     """
-    只处理 root folder 下的【一级子目录】和【一级子文件】，不处理更深层次。
-    使得目录与文件享受同等待遇：
-      - 统一用 process_name 或近似逻辑进行规范化
-      - 检查 is_filename_compliant
-      - 如合规则 reorder_suffix
-    不同点：
-      - 目录无扩展名，不会在最后拼 ".ext"
+    改进后的主函数:
+      1) 先做预检, 如果发现括号不匹配, 打印问题文件名(去除后缀)让用户修正后退出
+      2) 若无括号问题, 开始正式改名, 并只在改名前后做一次rename, 
+         同时打印修改日志与不合规警告。
     """
-    warnings = []
-    temp_dir = None
 
-    # 获取 root folder 下的所有子项目(不递归)
+    # ------------------ 阶段1: 括号匹配预检 ------------------
+    unmatched_bracket_files = []
     try:
         items = os.listdir(folder_path)
     except FileNotFoundError:
         print(f"Error: Path '{folder_path}' does not exist.")
         return
-    
-    # 若存在名为 temp 的目录，就跳过它
+
+    # 跳过名为 temp 的目录
     if 'temp' in items:
         items.remove('temp')
 
-    # 统计要处理的总数
-    total_items = len(items)
-    processed_items = 0
-
+    # 对每个文件/目录，先只做 check_brackets 的预检
     for item in items:
-        item_path = os.path.join(folder_path, item)
-        processed_items += 1
-        print(f"\rProcessing {processed_items}/{total_items} items...", end="")
-
         # 跳过隐藏文件或隐藏目录
         if item.startswith('.'):
             continue
 
+        item_path = os.path.join(folder_path, item)
+
+        # 如果是文件，需要去掉扩展名后再做 bracket 检查
+        if os.path.isfile(item_path):
+            base_no_ext, _ = os.path.splitext(item)
+            try:
+                # 若有括号不匹配, process_name 会抛 ValueError
+                _ = process_name(base_no_ext, debug=debug)
+            except ValueError:
+                unmatched_bracket_files.append(base_no_ext)
+        elif os.path.isdir(item_path):
+            try:
+                _ = process_name(item, debug=debug)
+            except ValueError:
+                unmatched_bracket_files.append(item)
+
+    if unmatched_bracket_files:
+        print("检测到以下名称存在括号不匹配，请修正后再运行脚本：")
+        for fname in unmatched_bracket_files:
+            print(fname)
+        return  # 直接退出，不做后续改名
+
+    # ------------------ 阶段2: 正式改名处理 ------------------
+    warnings = []
+    temp_dir = None
+    rename_logs = []  # 用于记录所有实际(或将要)改名情况 (oldNameNoExt, newNameNoExt)
+
+    # 重新获取目录下的项目(因为上面只做了预检, 没改动)
+    items = os.listdir(folder_path)
+    if 'temp' in items:
+        items.remove('temp')
+
+    for item in items:
+        if item.startswith('.'):
+            # 跳过隐藏
+            continue
+
+        item_path = os.path.join(folder_path, item)
+
         # =============== 文件处理 ===============
         if os.path.isfile(item_path):
-            try:
-                # 用原逻辑先对文件名进行预处理（附带拓展名）
-                new_name = process_filename(item, debug=debug)  
-                new_path = os.path.join(folder_path, new_name)
+            old_name_no_ext, old_ext = os.path.splitext(item)
+            # 记录“原始名字(无后缀)”用于打印日志
+            original_basename = old_name_no_ext
 
-                # 发生改名才执行
-                if item_path != new_path:
-                    if dry_run:
-                        print(f"\n[DRY RUN] Would rename FILE: {item_path} -> {new_path}")
+            # 第一步: 用 process_filename 获取规范化后的名称(含后缀)
+            #         这里暂不改名, 仅得到“初步处理结果”
+            processed_fullname = process_filename(item, debug=debug)
+            processed_base_no_ext, processed_ext = os.path.splitext(processed_fullname)
+
+            # 第二步: 检查合规 => reorder_suffix => 得到最终名字
+            if is_filename_compliant(processed_base_no_ext, debug=debug):
+                reordered_base_no_ext = reorder_suffix(processed_base_no_ext, debug=debug)
+            else:
+                # 不合规则不做 reorder_suffix
+                reordered_base_no_ext = processed_base_no_ext
+                warnings.append((processed_base_no_ext, "Does not conform to naming convention"))
+
+            final_fullname = reordered_base_no_ext + processed_ext
+
+            # 第三步: 若 final_fullname != item (说明确实要改名), 就只执行一次改名
+            if final_fullname != item:
+                final_path = os.path.join(folder_path, final_fullname)
+                if not dry_run:
+                    try:
+                        os.rename(item_path, final_path)
+                    except OSError as e:
+                        # 处理重名冲突
+                        if hasattr(e, 'winerror') and e.winerror == 183:
+                            if temp_dir is None:
+                                temp_dir = ensure_temp_dir(folder_path, debug=debug)
+                            file_to_move = compare_files(item_path, final_path, debug=debug)
+                            temp_path = os.path.join(temp_dir, os.path.basename(file_to_move))
+                            counter = 1
+                            base, ext = os.path.splitext(temp_path)
+                            while os.path.exists(temp_path):
+                                temp_path = f"{base}_{counter}{ext}"
+                                counter += 1
+                            shutil.move(file_to_move, temp_path)
+                            # 若原文件被移走, 则无需再处理
+                            if file_to_move == item_path:
+                                continue
+                        else:
+                            # 其它错误 => 进 warnings
+                            warnings.append((processed_base_no_ext, str(e)))
                     else:
-                        try:
-                            os.rename(item_path, new_path)
-                            if debug:
-                                print(f"\n[DEBUG] Renamed FILE: {item_path} -> {new_path}")
-                        except OSError as e:
-                            # 处理重名冲突
-                            if hasattr(e, 'winerror') and e.winerror == 183:
-                                if temp_dir is None:
-                                    temp_dir = ensure_temp_dir(folder_path, debug=debug)
-                                file_to_move = compare_files(item_path, new_path, debug=debug)
-                                temp_path = os.path.join(temp_dir, os.path.basename(file_to_move))
-                                counter = 1
-                                base, ext = os.path.splitext(temp_path)
-                                while os.path.exists(temp_path):
-                                    temp_path = f"{base}_{counter}{ext}"
-                                    counter += 1
-                                shutil.move(file_to_move, temp_path)
-                                print(f"\nConflict resolved: Moved {file_to_move} to {temp_path}")
-                                if file_to_move == item_path:
-                                    continue
-                            else:
-                                print(f"\nError renaming {item_path}: {str(e)}")
-                                warnings.append((item_path, str(e)))
-
-                # 再进行合规检查 + reorder_suffix
-                base_no_ext, extension = os.path.splitext(new_name)
-                if is_filename_compliant(base_no_ext, debug=debug):
-                    reordered = reorder_suffix(base_no_ext, debug=debug)
-                    if reordered != base_no_ext:
-                        final_name = reordered + extension
-                        final_path = os.path.join(folder_path, final_name)
-
-                        if not dry_run and final_path != new_path:
-                            try:
-                                os.rename(new_path, final_path)
-                                if debug:
-                                    print(f"\n[DEBUG] Reordered FILE suffix: {new_path} -> {final_path}")
-                            except OSError as e:
-                                if hasattr(e, 'winerror') and e.winerror == 183:
-                                    if temp_dir is None:
-                                        temp_dir = ensure_temp_dir(folder_path, debug=debug)
-                                    file_to_move = compare_files(new_path, final_path, debug=debug)
-                                    temp_path = os.path.join(temp_dir, os.path.basename(file_to_move))
-                                    counter = 1
-                                    base, ext = os.path.splitext(temp_path)
-                                    while os.path.exists(temp_path):
-                                        temp_path = f"{base}_{counter}{ext}"
-                                        counter += 1
-                                    shutil.move(file_to_move, temp_path)
-                                    print(f"\nConflict resolved: Moved {file_to_move} to {temp_path}")
-                                    if file_to_move == new_path:
-                                        continue
-                                else:
-                                    print(f"\nError reordering {new_path}: {str(e)}")
-                                    warnings.append((new_path, str(e)))
-                        elif dry_run and final_path != new_path:
-                            print(f"\n[DRY RUN] Would reorder FILE suffix: {new_path} -> {final_path}")
+                        # 如果成功改名, 记录日志
+                        rename_logs.append((original_basename, reordered_base_no_ext))
                 else:
-                    # 不合规 => 警告
-                    warnings.append((new_path, "Does not conform to naming convention"))
-
-            except Exception as e:
-                print(f"\nError processing FILE {item_path}: {str(e)}")
-                warnings.append((item_path, str(e)))
+                    # dry-run 模式只记录日志, 不实际改名
+                    rename_logs.append((original_basename, reordered_base_no_ext))
 
         # =============== 目录处理 ===============
         elif os.path.isdir(item_path):
-            try:
-                # 1) 先用 process_name 对目录名进行基本规范化
-                new_dir_name = process_name(item, debug=debug)
-                new_dir_path = os.path.join(folder_path, new_dir_name)
+            old_dir_name = item
+            original_basename = old_dir_name  # 目录没有扩展名
 
-                # 2) 重命名(若有变化)
-                if item_path != new_dir_path:
-                    if dry_run:
-                        print(f"\n[DRY RUN] Would rename DIR: {item_path} -> {new_dir_path}")
+            # 第一步: 用 process_name 做初步规范化(目录无后缀)
+            processed_dir_name = process_name(old_dir_name, debug=debug)
+
+            # 第二步: 合规检查
+            if is_filename_compliant(processed_dir_name, debug=debug):
+                reordered_dir_name = reorder_suffix(processed_dir_name, debug=debug)
+            else:
+                reordered_dir_name = processed_dir_name
+                warnings.append((processed_dir_name, "Does not conform to naming convention"))
+
+            final_dir_name = reordered_dir_name
+
+            # 第三步: 若有变化, 执行一次改名
+            if final_dir_name != old_dir_name:
+                final_path = os.path.join(folder_path, final_dir_name)
+                if not dry_run:
+                    try:
+                        os.rename(item_path, final_path)
+                    except OSError as e:
+                        # 处理重名冲突
+                        if hasattr(e, 'winerror') and e.winerror == 183:
+                            if temp_dir is None:
+                                temp_dir = ensure_temp_dir(folder_path, debug=debug)
+                            file_to_move = compare_files(item_path, final_path, debug=debug)
+                            temp_path = os.path.join(temp_dir, os.path.basename(file_to_move))
+                            counter = 1
+                            base, ext = os.path.splitext(temp_path)
+                            while os.path.exists(temp_path):
+                                temp_path = f"{base}_{counter}{ext}"
+                                counter += 1
+                            shutil.move(file_to_move, temp_path)
+                            # 若原目录被移走, 则无需再处理
+                            if file_to_move == item_path:
+                                continue
+                        else:
+                            warnings.append((processed_dir_name, str(e)))
                     else:
-                        try:
-                            os.rename(item_path, new_dir_path)
-                            if debug:
-                                print(f"\n[DEBUG] Renamed DIR: {item_path} -> {new_dir_path}")
-                        except OSError as e:
-                            # 同名冲突处理
-                            if hasattr(e, 'winerror') and e.winerror == 183:
-                                if temp_dir is None:
-                                    temp_dir = ensure_temp_dir(folder_path, debug=debug)
-                                file_to_move = compare_files(item_path, new_dir_path, debug=debug)
-                                temp_path = os.path.join(temp_dir, os.path.basename(file_to_move))
-                                counter = 1
-                                base, ext = os.path.splitext(temp_path)
-                                while os.path.exists(temp_path):
-                                    temp_path = f"{base}_{counter}{ext}"
-                                    counter += 1
-                                shutil.move(file_to_move, temp_path)
-                                print(f"\nConflict resolved: Moved {file_to_move} to {temp_path}")
-                                if file_to_move == item_path:
-                                    continue
-                            else:
-                                print(f"\nError renaming DIR {item_path}: {str(e)}")
-                                warnings.append((item_path, str(e)))
-
-                # 3) 再进行合规检查
-                #    对目录名来说,没有扩展名, 直接看 new_dir_name
-                if is_filename_compliant(new_dir_name, debug=debug):
-                    # 如果合规则 reorder_suffix
-                    reordered = reorder_suffix(new_dir_name, debug=debug)
-                    if reordered != new_dir_name:
-                        final_dir_path = os.path.join(folder_path, reordered)
-
-                        if not dry_run and final_dir_path != new_dir_path:
-                            try:
-                                os.rename(new_dir_path, final_dir_path)
-                                if debug:
-                                    print(f"\n[DEBUG] Reordered DIR suffix: {new_dir_path} -> {final_dir_path}")
-                            except OSError as e:
-                                if hasattr(e, 'winerror') and e.winerror == 183:
-                                    if temp_dir is None:
-                                        temp_dir = ensure_temp_dir(folder_path, debug=debug)
-                                    file_to_move = compare_files(new_dir_path, final_dir_path, debug=debug)
-                                    temp_path = os.path.join(temp_dir, os.path.basename(file_to_move))
-                                    counter = 1
-                                    base, ext = os.path.splitext(temp_path)
-                                    while os.path.exists(temp_path):
-                                        temp_path = f"{base}_{counter}{ext}"
-                                        counter += 1
-                                    shutil.move(file_to_move, temp_path)
-                                    print(f"\nConflict resolved: Moved {file_to_move} to {temp_path}")
-                                    if file_to_move == new_dir_path:
-                                        continue
-                                else:
-                                    print(f"\nError reordering DIR {new_dir_path}: {str(e)}")
-                                    warnings.append((new_dir_path, str(e)))
-                        elif dry_run and final_dir_path != new_dir_path:
-                            print(f"\n[DRY RUN] Would reorder DIR suffix: {new_dir_path} -> {final_dir_path}")
+                        rename_logs.append((original_basename, reordered_dir_name))
                 else:
-                    # 不合规 => 警告
-                    warnings.append((new_dir_path, "Does not conform to naming convention"))
+                    rename_logs.append((original_basename, reordered_dir_name))
 
-            except Exception as e:
-                print(f"\nError processing DIR {item_path}: {str(e)}")
-                warnings.append((item_path, str(e)))
+    # ------------------ 打印改名日志 ------------------
+    # 只打印确实发生(或将会发生)变化的条目: old => new
+    # 其中 old/new 都是去掉后缀的部分(对目录名无所谓, 直接就是名称)
+    if rename_logs:
+        for i, (old_no_ext, new_no_ext) in enumerate(rename_logs, start=1):
+            if old_no_ext != new_no_ext:
+                print(f"--- file {i}/{len(rename_logs)} ---")
+                print(f"{old_no_ext} ==>")
+                print(f"{new_no_ext}")
 
-    print("\nProcessing complete!")
+    # ------------------ 打印警告 ------------------
     if warnings:
         print("\nWARNING: The following items had issues:")
-        for file_path, error in warnings:
-            print(f"{file_path}: {error}")
+        shown_set = set()
+        for (w_name, w_err) in warnings:
+            if w_name not in shown_set:
+                print(w_name)
+                shown_set.add(w_name)
 
 
 

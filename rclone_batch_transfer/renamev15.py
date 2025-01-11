@@ -32,10 +32,10 @@ part_keys_for_parentheses = ('source', 'translator_group', 'translation_version'
 
 # 分类顺序，注意在里面新增了一个 'misc' 用来容纳不匹配任何关键词的 []
 category_order = [
+    'misc',                # 不匹配任何已知关键字的归到 misc
     'translator_group',    # [汉化组名]
     'translation_version', # [无修正]等版本类别
     'source',              # [DL版]等来源标记
-    'misc',                # 不匹配任何已知关键字的归到 misc
     'version',             # [v2]等版本号
     'timestamp'            # 时间戳放最后
 ]

@@ -168,7 +168,6 @@ def monitor_gclone():
         error_count = 0
         last_transferred = 0
         consecutive_same_transfer = 0
-        last_output_time = time.time()
         in_transferring_section = False
 
         # 实时读取输出
@@ -178,7 +177,6 @@ def monitor_gclone():
                 while True:
                     try:
                         line = stdout_queue.get_nowait()
-                        last_output_time = time.time()
                         
                         # 清除ANSI转义序列并打印
                         clean_line = clean_ansi(line)
@@ -227,21 +225,10 @@ def monitor_gclone():
                 while True:
                     try:
                         err = stderr_queue.get_nowait()
-                        last_output_time = time.time()
                         clean_err = clean_ansi(err)
                         print(clean_err, end='', flush=True, file=sys.stderr)
-                        
                     except Empty:
                         break
-
-                # 检查是否有一段时间没有输出（可能是卡住了）
-                if time.time() - last_output_time > 300:  # 5分钟没有任何输出
-                    print(f"\n[{datetime.now()}] 检测到5分钟无输出，重新启动任务", flush=True)
-                    try:
-                        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-                    except:
-                        process.terminate()
-                    break
 
                 time.sleep(0.1)  # 避免CPU占用过高
 

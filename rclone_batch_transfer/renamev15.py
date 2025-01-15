@@ -272,6 +272,27 @@ def rearrange_tags(name, debug=False):
         print(f"[DEBUG] rearrange_tags: output => '{final_name}'")
     return final_name
 
+
+
+def convert_naked_timestamp_to_bracket(name: str, debug=False) -> str:
+    """
+    将文件名中裸奔的 6/8/10/11 位数字（疑似时间戳）加上方括号。
+    例如:
+      "Fur just wanna be friend 20250113 [水猫汉化]" 
+      => "Fur just wanna be friend [20250113] [水猫汉化]"
+    """
+    # \b(...)\b 确保是“单词边界”，避免把 longer123456short 这种中途片段误当作时间戳
+    pattern = re.compile(r'\b(\d{6}|\d{8}|\d{10}|\d{11})\b')
+
+    def _replace(m):
+        digits = m.group(1)
+        return f'[{digits}]'
+
+    new_name = pattern.sub(_replace, name)
+    if debug and new_name != name:
+        print(f"[DEBUG] convert_naked_timestamp_to_bracket: '{name}' => '{new_name}'")
+    return new_name
+
 ############################
 # 分类辅助: detect_category_for_bracket
 ############################
@@ -279,8 +300,10 @@ def rearrange_tags(name, debug=False):
 def detect_category_for_bracket(tag_content, debug=False):
     """
     根据已有的 category_keywords 来判断属于哪个分类，
+    只要包含任意一个关键词，即可视为对应分类，
     如果都不匹配则归入 'misc'。
     """
+
     # 先检查是否是时间戳
     if re.match(r'^(?:\d{6}|\d{8}|\d{10})$', tag_content):
         if debug:
@@ -289,14 +312,20 @@ def detect_category_for_bracket(tag_content, debug=False):
     
     # 再检查其他分类
     for cat, keywords in category_keywords.items():
+        # 跳过 'timestamp'
         if cat == 'timestamp':
             continue
+        
+        # 如果这个分类定义了关键词，遍历检查
         if keywords:
-            if tag_content.lower() in [k.lower() for k in keywords]:
-                if debug:
-                    print(f"[DEBUG] detect_category_for_bracket: '{tag_content}' => '{cat}'")
-                return cat
+            # “只要包含关键词，就认定为此分类”
+            for kw in keywords:
+                if kw.lower() in tag_content.lower():
+                    if debug:
+                        print(f"[DEBUG] detect_category_for_bracket: '{tag_content}' => '{cat}' (matched '{kw}')")
+                    return cat
 
+    # 若所有分类都不匹配则归入 'misc'
     if debug:
         print(f"[DEBUG] detect_category_for_bracket: '{tag_content}' => 'misc'")
     return 'misc'
@@ -632,6 +661,9 @@ def process_name(name, debug=False):
 
     # 10) rearrange_tags (初步分类)
     old_name = name
+    
+    name = convert_naked_timestamp_to_bracket(name, debug=debug)
+    
     name = rearrange_tags(name, debug=debug)
     if debug and name != old_name:
         print(f"[DEBUG] rearrange_tags => '{old_name}' => '{name}'")

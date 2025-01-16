@@ -58,22 +58,37 @@ def enqueue_output(out, queue):
         out.close()
 
 def monitor_gclone():
+    """
+    监控 gclone 进程。
+    
+    当检测到：
+      - 连续错误数 >= 5
+      - 且已传输文件数多次保持不变（consecutive_same_transfer >= 5）
+    时，设置 need_retry = True 并返回。
+
+    外层可根据 need_retry 的值，决定是否进行 8 小时休眠并重试，
+    或者是直接退出不再重试。
+    
+    :return: bool, 为 True 表示需要外部休眠 8 小时再重试；False 表示无需重试，脚本可以结束。
+    """
     print("请输入要执行的指令:", flush=True)
     cmd = input().strip()
     input()  # 等待第二次回车
     
     if not cmd:
         print("指令不能为空", flush=True)
-        return
+        return False  # 不需要重试，直接退出
 
     # 确保命令中包含 -P 参数
     if '-P' not in cmd:
         cmd += ' -P'
 
+    need_retry = False  # 用于标记是否需要外部 sleep 8h 后重试
+
     while True:
         print(f"\n[{datetime.now()}] 执行命令: {cmd}", flush=True)
         
-        # 使用 subprocess.STARTUPINFO 来隐藏新窗口
+        # 使用 subprocess.STARTUPINFO 来隐藏新窗口（仅在 Windows 有效）
         startupinfo = None
         if sys.platform == 'win32':
             startupinfo = subprocess.STARTUPINFO()
@@ -104,8 +119,7 @@ def monitor_gclone():
         error_count = 0
         last_transferred = 0
         consecutive_same_transfer = 0
-        last_output_time = time.time()
-        in_transferring_section = False  # 标记是否在 Transferring 部分
+        in_transferring_section = False  # 标记是否在 "Transferring:" 部分内
 
         # 实时读取输出
         while process.poll() is None:
@@ -114,13 +128,12 @@ def monitor_gclone():
                 while True:
                     try:
                         line = stdout_queue.get_nowait()
-                        last_output_time = time.time()
                         
-                        # 清除ANSI转义序列并打印
+                        # 清除 ANSI 转义序列并打印
                         clean_line = clean_ansi(line)
                         print(clean_line, end='', flush=True)
                         
-                        # 检查是否进入或离开 Transferring 部分
+                        # 检查是否进入或离开 "Transferring:" 部分
                         if 'Transferring:' in clean_line:
                             in_transferring_section = True
                         elif clean_line.strip() and not clean_line.startswith(' '):
@@ -145,68 +158,83 @@ def monitor_gclone():
                                 consecutive_same_transfer = 0
                                 last_transferred = transferred
                         
-                        # 检查是否需要暂停
+                        # 当检测到连续错误数 >= 5 且传输数停滞 >= 5 时
+                        # 标记 need_retry=True，终止当前 gclone，并返回到外层处理
                         if error_count >= 5 and consecutive_same_transfer >= 5:
-                            print(f"\n[{datetime.now()}] 检测到连续错误且传输停滞，暂停8小时后重试", flush=True)
+                            print(f"\n[{datetime.now()}] 检测到连续错误且传输停滞，需要休眠后重试", flush=True)
                             process.terminate()
-                            time.sleep(8 * 3600)  # 休眠8小时
-                            error_count = 0
-                            consecutive_same_transfer = 0
+                            need_retry = True
                             break
 
                     except Empty:
                         break
 
+                # 若需要重试则跳出最外层循环
+                if need_retry:
+                    break
+
                 # 检查错误输出
                 while True:
                     try:
                         err = stderr_queue.get_nowait()
-                        last_output_time = time.time()
                         clean_err = clean_ansi(err)
                         print(clean_err, end='', flush=True, file=sys.stderr)
-                        
                     except Empty:
                         break
 
-                # 检查是否有一段时间没有输出（可能是卡住了）
-                if time.time() - last_output_time > 300:  # 5分钟没有任何输出
-                    print(f"\n[{datetime.now()}] 检测到5分钟无输出，重新启动任务", flush=True)
-                    process.terminate()
-                    break
-
-                time.sleep(0.1)  # 避免CPU占用过高
+                time.sleep(0.1)  # 避免 CPU 占用过高
 
             except KeyboardInterrupt:
                 process.terminate()
                 print("\n程序被用户中断", flush=True)
-                return
+                return False  # 不需要重试，用户主动中断
 
         # 进程结束后的处理
         exit_code = process.poll()
         
         # 清空剩余输出
-        for queue in [stdout_queue, stderr_queue]:
+        for q in (stdout_queue, stderr_queue):
             while True:
                 try:
-                    line = queue.get_nowait()
+                    line = q.get_nowait()
                     clean_line = clean_ansi(line)
                     print(clean_line, end='', flush=True)
                 except Empty:
                     break
 
+        # 如果在循环中被标记了 need_retry，就直接返回 True
+        if need_retry:
+            return True  # 通知外层脚本：需要 8 小时休眠后重试
+
+        # 正常情况下，根据退出码判断是否成功或失败
         if exit_code == 0:
             print(f"\n[{datetime.now()}] 命令执行完成", flush=True)
-            break
-        elif error_count >= 5 and consecutive_same_transfer >= 5:
-            continue
+            return False  # 成功执行，不需要重试
         else:
             print(f"\n[{datetime.now()}] 命令执行失败，退出码: {exit_code}", flush=True)
+            return False  # 失败退出，不需要重试
+
+def main():
+    """
+    程序入口：连续检测 monitor_gclone() 的返回值。
+    如果返回 True，则等待 8 小时后再重试。
+    如果返回 False，则表示无需继续重试，直接退出。
+    """
+    while True:
+        try:
+            need_retry = monitor_gclone()
+            if need_retry:
+                print("\n[主进程] 检测到 need_retry=True，等待 8 小时后重试...", flush=True)
+                time.sleep(8 * 3600)  # 休眠 8 小时
+            else:
+                # 不需要重试，直接退出循环
+                break
+        except KeyboardInterrupt:
+            print("\n[主进程] 程序被用户中断", flush=True)
+            break
+        except Exception as e:
+            print(f"[主进程] 发生错误: {e}", flush=True)
             break
 
 if __name__ == "__main__":
-    try:
-        monitor_gclone()
-    except KeyboardInterrupt:
-        print("\n程序被用户中断", flush=True)
-    except Exception as e:
-        print(f"发生错误: {e}", flush=True)
+    main()

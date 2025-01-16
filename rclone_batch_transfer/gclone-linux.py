@@ -136,10 +136,10 @@ def monitor_gclone():
     if '-P' not in cmd:
         cmd += ' -P'
 
+    # 这里开始外层循环，用于在错误时重试
     while True:
         print(f"\n[{datetime.now()}] 执行命令: {cmd}", flush=True)
         
-        # 在Linux下创建进程
         try:
             process = subprocess.Popen(
                 cmd,
@@ -170,7 +170,10 @@ def monitor_gclone():
         consecutive_same_transfer = 0
         in_transferring_section = False
 
-        # 实时读取输出
+        # 用于标记“脚本主动杀死进程，准备重试”
+        need_retry = False
+
+        # 实时读取输出，内层循环
         while process.poll() is None:
             try:
                 # 检查标准输出
@@ -206,7 +209,7 @@ def monitor_gclone():
                                 consecutive_same_transfer = 0
                                 last_transferred = transferred
 
-                        # 检查是否需要暂停
+                        # 当检测到连续错误且传输停滞时，杀进程 & 休眠 8 小时 & 准备重试
                         if error_count >= 5 and consecutive_same_transfer >= 5:
                             print(f"\n[{datetime.now()}] 检测到连续错误且传输停滞，暂停8小时后重试", flush=True)
                             try:
@@ -214,12 +217,19 @@ def monitor_gclone():
                             except:
                                 process.terminate()
                             time.sleep(8 * 3600)  # 休眠8小时
+                            # 重置计数
                             error_count = 0
                             consecutive_same_transfer = 0
+                            need_retry = True
+                            # 跳出内层循环
                             break
 
                     except Empty:
                         break
+
+                # 如果 need_retry 标记已置为 True，立即跳出外层 while process.poll() is None
+                if need_retry:
+                    break
 
                 # 检查错误输出
                 while True:
@@ -240,10 +250,10 @@ def monitor_gclone():
                 print("\n程序被用户中断", flush=True)
                 return
 
-        # 进程结束后的处理
+        # 内层循环结束（进程结束或 need_retry=True）
         exit_code = process.poll()
-        
-        # 清空剩余输出
+
+        # 把剩余的输出打印出来
         for queue in [stdout_queue, stderr_queue]:
             while True:
                 try:
@@ -253,11 +263,15 @@ def monitor_gclone():
                 except Empty:
                     break
 
+        # 如果是我们主动杀死进程来重试，那么直接 continue 到外层循环重新执行命令
+        if need_retry:
+            need_retry = False
+            continue
+
+        # 否则根据 exit_code 判断退出原因
         if exit_code == 0:
             print(f"\n[{datetime.now()}] 命令执行完成", flush=True)
             break
-        elif error_count >= 5 and consecutive_same_transfer >= 5:
-            continue
         else:
             print(f"\n[{datetime.now()}] 命令执行失败，退出码: {exit_code}", flush=True)
             break

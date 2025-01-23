@@ -35,23 +35,6 @@ def normalize_encoding(text):
     except Exception:
         return text
 
-def parse_transferred_count(line):
-    """解析已传输文件数量，排除包含容量单位的行"""
-    if any(unit in line for unit in ['B', 'iB', 'KB', 'MB', 'GB', 'TB']):
-        return None
-    
-    match = re.search(r'Transferred:\s*(\d+)\s*/\s*\d+', line)
-    if match:
-        return int(match.group(1))
-    return None
-
-def parse_error_count(line):
-    """解析错误计数行"""
-    match = re.search(r'Errors:\s*(\d+)', line)
-    if match:
-        return int(match.group(1))
-    return None
-
 def try_decode(byte_string):
     """尝试使用多种编码解码字节串"""
     if not isinstance(byte_string, bytes):
@@ -123,6 +106,16 @@ def setup_signal_handlers():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
+def parse_transferred_count(line):
+    """解析已传输文件数量，排除包含容量单位的行"""
+    if any(unit in line for unit in ['B', 'iB', 'KB', 'MB', 'GB', 'TB']):
+        return None
+    
+    match = re.search(r'Transferred:\s*(\d+)\s*/\s*\d+', line)
+    if match:
+        return int(match.group(1))
+    return None
+
 def monitor_gclone():
     print("请输入要执行的指令:", flush=True)
     cmd = input().strip()
@@ -136,7 +129,6 @@ def monitor_gclone():
     if '-P' not in cmd:
         cmd += ' -P'
 
-    # 这里开始外层循环，用于在错误时重试
     while True:
         print(f"\n[{datetime.now()}] 执行命令: {cmd}", flush=True)
         
@@ -165,7 +157,8 @@ def monitor_gclone():
         stdout_thread.start()
         stderr_thread.start()
 
-        error_count = 0
+        # 仅对包含"403"的ERROR进行计数
+        error_count_403 = 0  
         last_transferred = 0
         consecutive_same_transfer = 0
         in_transferring_section = False
@@ -173,32 +166,27 @@ def monitor_gclone():
         # 用于标记“脚本主动杀死进程，准备重试”
         need_retry = False
 
-        # 实时读取输出，内层循环
         while process.poll() is None:
             try:
-                # 检查标准输出
+                # 读取并处理 stdout
                 while True:
                     try:
                         line = stdout_queue.get_nowait()
                         
-                        # 清除ANSI转义序列并打印
                         clean_line = clean_ansi(line)
                         print(clean_line, end='', flush=True)
                         
-                        # 检查是否进入或离开 Transferring 部分
+                        # 是否进入或离开 Transferring 部分
                         if 'Transferring:' in clean_line:
                             in_transferring_section = True
                         elif clean_line.strip() and not clean_line.startswith(' '):
                             in_transferring_section = False
                         
-                        # 只在非 Transferring 部分检查错误
-                        if not in_transferring_section:
-                            errors = parse_error_count(clean_line)
-                            if errors is not None:
-                                error_count = errors
-                                if error_count > 0:
-                                    print(f"[DEBUG] Error count: {error_count}", flush=True)
-                        
+                        # ★ 新增：检测所有 stdout 日志中的 "ERROR" 且包含 "403" 时才计数
+                        if "ERROR" in clean_line and "403" in clean_line:
+                            error_count_403 += 1
+                            print(f"[DEBUG] 403 Error count: {error_count_403}", flush=True)
+
                         # 解析传输数量
                         transferred = parse_transferred_count(clean_line)
                         if transferred is not None:
@@ -209,29 +197,27 @@ def monitor_gclone():
                                 consecutive_same_transfer = 0
                                 last_transferred = transferred
 
-                        # 当检测到连续错误且传输停滞时，杀进程 & 休眠 8 小时 & 准备重试
-                        if error_count >= 5 and consecutive_same_transfer >= 5:
-                            print(f"\n[{datetime.now()}] 检测到连续错误且传输停滞，暂停8小时后重试", flush=True)
+                        # 当检测到 403 错误累计 >=5 且传输停滞次数 >=5 时，执行休眠 8 小时
+                        if error_count_403 >= 5 and consecutive_same_transfer >= 5:
+                            print(f"\n[{datetime.now()}] 检测到403错误且传输停滞，暂停8小时后重试", flush=True)
                             try:
                                 os.killpg(os.getpgid(process.pid), signal.SIGTERM)
                             except:
                                 process.terminate()
                             time.sleep(8 * 3600)  # 休眠8小时
                             # 重置计数
-                            error_count = 0
+                            error_count_403 = 0
                             consecutive_same_transfer = 0
                             need_retry = True
-                            # 跳出内层循环
                             break
 
                     except Empty:
                         break
 
-                # 如果 need_retry 标记已置为 True，立即跳出外层 while process.poll() is None
                 if need_retry:
                     break
 
-                # 检查错误输出
+                # 读取并处理 stderr
                 while True:
                     try:
                         err = stderr_queue.get_nowait()
@@ -240,7 +226,7 @@ def monitor_gclone():
                     except Empty:
                         break
 
-                time.sleep(0.1)  # 避免CPU占用过高
+                time.sleep(0.1)
 
             except KeyboardInterrupt:
                 try:
@@ -250,10 +236,9 @@ def monitor_gclone():
                 print("\n程序被用户中断", flush=True)
                 return
 
-        # 内层循环结束（进程结束或 need_retry=True）
         exit_code = process.poll()
 
-        # 把剩余的输出打印出来
+        # 输出可能残留在队列中的内容
         for queue in [stdout_queue, stderr_queue]:
             while True:
                 try:
@@ -263,12 +248,11 @@ def monitor_gclone():
                 except Empty:
                     break
 
-        # 如果是我们主动杀死进程来重试，那么直接 continue 到外层循环重新执行命令
         if need_retry:
             need_retry = False
             continue
 
-        # 否则根据 exit_code 判断退出原因
+        # 根据 exit_code 判断退出
         if exit_code == 0:
             print(f"\n[{datetime.now()}] 命令执行完成", flush=True)
             break

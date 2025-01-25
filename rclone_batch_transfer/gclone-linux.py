@@ -23,6 +23,38 @@ ENCODINGS = [
     'iso-8859-1'
 ]
 
+def is_http_403_error(line):
+    """
+    判断是否为真正的HTTP 403错误
+    
+    判断标准：
+    1. 包含 "Error 403:" 或 "403" + 以下关键词之一：
+       - quota
+       - limit
+       - exceeded
+       - rate
+       - forbidden
+    2. 403不能作为数字的一部分出现（如文件大小）
+    
+    返回：bool
+    """
+    # 直接匹配 Google API 的 403 错误格式
+    if "Error 403:" in line:
+        return True
+        
+    # 确保 403 不是文件大小的一部分
+    # 使用正则表达式检查 403 的前后字符
+    # 检查是否包含常见的 403 错误关键词组合
+    error_patterns = [
+        r'(?<!\d)403(?!\d).*(?:quota|limit|exceed|rate|forbidden)',  # 403后跟错误关键词
+        r'(?:quota|limit|exceed|rate|forbidden).*(?<!\d)403(?!\d)',  # 403前有错误关键词
+        r'HTTP.*(?<!\d)403(?!\d)',  # HTTP相关的403
+        r'(?<!\d)403(?!\d).*Forbidden',  # 403 Forbidden
+    ]
+    
+    # 任一模式匹配即认为是 HTTP 403 错误
+    return any(re.search(pattern, line, re.IGNORECASE) for pattern in error_patterns)
+
 def normalize_encoding(text):
     """标准化文本编码，处理特殊字符和组合字符"""
     import unicodedata
@@ -157,13 +189,13 @@ def monitor_gclone():
         stdout_thread.start()
         stderr_thread.start()
 
-        # 仅对包含"403"的ERROR进行计数
+        # 仅对HTTP 403错误进行计数
         error_count_403 = 0  
         last_transferred = 0
         consecutive_same_transfer = 0
         in_transferring_section = False
 
-        # 用于标记“脚本主动杀死进程，准备重试”
+        # 用于标记"脚本主动杀死进程，准备重试"
         need_retry = False
 
         while process.poll() is None:
@@ -182,8 +214,8 @@ def monitor_gclone():
                         elif clean_line.strip() and not clean_line.startswith(' '):
                             in_transferring_section = False
                         
-                        # ★ 新增：检测所有 stdout 日志中的 "ERROR" 且包含 "403" 时才计数
-                        if "ERROR" in clean_line and "403" in clean_line:
+                        # 检测HTTP 403错误
+                        if "ERROR" in clean_line and is_http_403_error(clean_line):
                             error_count_403 += 1
                             print(f"[DEBUG] 403 Error count: {error_count_403}", flush=True)
 
@@ -199,7 +231,7 @@ def monitor_gclone():
 
                         # 当检测到 403 错误累计 >=5 且传输停滞次数 >=5 时，执行休眠 8 小时
                         if error_count_403 >= 5 and consecutive_same_transfer >= 5:
-                            print(f"\n[{datetime.now()}] 检测到403错误且传输停滞，暂停8小时后重试", flush=True)
+                            print(f"\n[{datetime.now()}] 检测到HTTP 403错误且传输停滞，暂停8小时后重试", flush=True)
                             try:
                                 os.killpg(os.getpgid(process.pid), signal.SIGTERM)
                             except:

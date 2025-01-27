@@ -8,6 +8,8 @@ from datetime import datetime
 from threading import Thread
 from queue import Queue, Empty
 import signal
+import ctypes
+import msvcrt
 
 # 尝试的编码列表，优化顺序和组合
 ENCODINGS = [
@@ -22,6 +24,38 @@ ENCODINGS = [
     'euc-kr',
     'iso-8859-1'
 ]
+
+def is_http_403_error(line):
+    """
+    判断是否为真正的HTTP 403错误
+    
+    判断标准：
+    1. 包含 "Error 403:" 或 "403" + 以下关键词之一：
+       - quota
+       - limit
+       - exceeded
+       - rate
+       - forbidden
+    2. 403不能作为数字的一部分出现（如文件大小）
+    
+    返回：bool
+    """
+    # 直接匹配 Google API 的 403 错误格式
+    if "Error 403:" in line:
+        return True
+        
+    # 确保 403 不是文件大小的一部分
+    # 使用正则表达式检查 403 的前后字符
+    # 检查是否包含常见的 403 错误关键词组合
+    error_patterns = [
+        r'(?<!\d)403(?!\d).*(?:quota|limit|exceed|rate|forbidden)',  # 403后跟错误关键词
+        r'(?:quota|limit|exceed|rate|forbidden).*(?<!\d)403(?!\d)',  # 403前有错误关键词
+        r'HTTP.*(?<!\d)403(?!\d)',  # HTTP相关的403
+        r'(?<!\d)403(?!\d).*Forbidden',  # 403 Forbidden
+    ]
+    
+    # 任一模式匹配即认为是 HTTP 403 错误
+    return any(re.search(pattern, line, re.IGNORECASE) for pattern in error_patterns)
 
 def normalize_encoding(text):
     """标准化文本编码，处理特殊字符和组合字符"""
@@ -98,12 +132,12 @@ def enqueue_output(out, queue):
             pass
 
 def setup_signal_handlers():
-    """设置信号处理器 - Windows版本"""
+    """设置Windows下的信号处理器"""
     def signal_handler(signum, frame):
         print("\n程序被用户中断", flush=True)
         sys.exit(0)
     
-    # Windows下只支持这些信号
+    # Windows下只支持有限的信号
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
@@ -134,11 +168,7 @@ def monitor_gclone():
         print(f"\n[{datetime.now()}] 执行命令: {cmd}", flush=True)
         
         try:
-            # Windows版本的进程创建
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = subprocess.SW_HIDE
-
+            # Windows下使用CREATE_NEW_PROCESS_GROUP标志
             process = subprocess.Popen(
                 cmd,
                 shell=True,
@@ -146,7 +176,7 @@ def monitor_gclone():
                 stderr=subprocess.PIPE,
                 stdin=subprocess.PIPE,
                 bufsize=0,  # 无缓冲
-                startupinfo=startupinfo,  # Windows特定参数
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,  # Windows特有
                 encoding=None  # 不指定编码，使用bytes
             )
         except Exception as e:
@@ -163,7 +193,7 @@ def monitor_gclone():
         stdout_thread.start()
         stderr_thread.start()
 
-        # 仅对包含"403"的ERROR进行计数
+        # 仅对HTTP 403错误进行计数
         error_count_403 = 0  
         last_transferred = 0
         consecutive_same_transfer = 0
@@ -188,8 +218,8 @@ def monitor_gclone():
                         elif clean_line.strip() and not clean_line.startswith(' '):
                             in_transferring_section = False
                         
-                        # 检测所有 stdout 日志中的 "ERROR" 且包含 "403" 时才计数
-                        if "ERROR" in clean_line and "403" in clean_line:
+                        # 检测HTTP 403错误
+                        if "ERROR" in clean_line and is_http_403_error(clean_line):
                             error_count_403 += 1
                             print(f"[DEBUG] 403 Error count: {error_count_403}", flush=True)
 
@@ -205,9 +235,9 @@ def monitor_gclone():
 
                         # 当检测到 403 错误累计 >=5 且传输停滞次数 >=5 时，执行休眠 8 小时
                         if error_count_403 >= 5 and consecutive_same_transfer >= 5:
-                            print(f"\n[{datetime.now()}] 检测到403错误且传输停滞，暂停8小时后重试", flush=True)
-                            # Windows下终止进程
-                            process.terminate()
+                            print(f"\n[{datetime.now()}] 检测到HTTP 403错误且传输停滞，暂停8小时后重试", flush=True)
+                            # Windows下终止进程树
+                            subprocess.call(['taskkill', '/F', '/T', '/PID', str(process.pid)])
                             time.sleep(8 * 3600)  # 休眠8小时
                             # 重置计数
                             error_count_403 = 0
@@ -233,8 +263,8 @@ def monitor_gclone():
                 time.sleep(0.1)
 
             except KeyboardInterrupt:
-                # Windows下终止进程
-                process.terminate()
+                # Windows下终止进程树
+                subprocess.call(['taskkill', '/F', '/T', '/PID', str(process.pid)])
                 print("\n程序被用户中断", flush=True)
                 return
 

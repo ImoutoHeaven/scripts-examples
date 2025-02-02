@@ -4,6 +4,7 @@
 import subprocess
 import posixpath
 import sys
+import argparse
 
 def list_ipfs_directory(path):
     """
@@ -39,15 +40,15 @@ def parse_listing_line(line):
         print(f"解析行时出错: {line}", file=sys.stderr)
         return None
 
-def recursive_parse(path, file_list, folder_list):
+def recursive_parse(ipfs_path, current_rel, file_list, folder_list):
     """
-    递归查询指定 path 下的内容：
+    递归查询指定 ipfs_path 下的内容，同时记录相对于起始路径的相对路径 current_rel：
       - 当检测到名称以 "/" 结尾时，认为这是一个文件夹，
-        保存时去掉末尾的 "/"（仅保留文件夹名称，不含路径），
+        保存时存储相对于起始路径的相对路径，
         同时构造完整路径用于递归调用。
-      - 否则认为是文件，直接保存 ipfs 输出的文件名（已经为当前目录下的名称）。
+      - 否则认为是文件，直接保存相对于起始路径的相对路径。
     """
-    lines = list_ipfs_directory(path)
+    lines = list_ipfs_directory(ipfs_path)
     for line in lines:
         parsed = parse_listing_line(line)
         if parsed is None:
@@ -55,36 +56,45 @@ def recursive_parse(path, file_list, folder_list):
         name, cid, size = parsed
 
         if name.endswith("/"):
-            # 构造完整路径以便递归调用 ipfs 命令
-            full_path = posixpath.join(path, name) if path != "/" else "/" + name
-            # 仅保存文件夹名称：去掉末尾的 "/" 后即为名称，不包含路径
             folder_name = name.rstrip("/")
-            folder_list.append((folder_name, cid, size))
-            recursive_parse(full_path, file_list, folder_list)
+            # 计算该文件夹相对于起始路径的相对路径
+            new_rel = posixpath.join(current_rel, folder_name) if current_rel else folder_name
+            folder_list.append((new_rel, cid, size))
+            # 构造完整路径以便递归调用 ipfs 命令
+            full_path = posixpath.join(ipfs_path, name) if ipfs_path != "/" else "/" + name
+            recursive_parse(full_path, new_rel, file_list, folder_list)
         else:
-            file_list.append((name, cid, size))
+            # 计算文件相对于起始路径的相对路径
+            rel_path = posixpath.join(current_rel, name) if current_rel else name
+            file_list.append((rel_path, cid, size))
 
 def main():
-    # 支持用户传入起始 IPFS 路径，默认为 "/"
-    if len(sys.argv) > 1:
-        start_path = sys.argv[1]
-    else:
-        start_path = "/"
-        
+    parser = argparse.ArgumentParser(description='IPFS 目录递归查询并显示文件和文件夹的 CID 表')
+    parser.add_argument('start_path', nargs='?', default='/', help='起始 IPFS 路径，默认 "/"')
+    parser.add_argument('--show-mode', choices=['filename', 'relativepath'], default='filename',
+                        help='显示模式: "filename" 表示仅显示文件名，"relativepath" 表示显示相对于起始路径的相对路径')
+    args = parser.parse_args()
+
+    start_path = args.start_path
+    show_mode = args.show_mode
+
     file_list = []
     folder_list = []
-    
-    # 从用户指定的起始路径开始递归查询
-    recursive_parse(start_path, file_list, folder_list)
-    
+
+    # 从用户指定的起始路径开始递归查询，初始相对路径为空
+    recursive_parse(start_path, "", file_list, folder_list)
+
     print(f"Starting from IPFS path: {start_path}")
     print("===File Cid Table===")
-    for filename, cid, size in file_list:
-        print(f"{filename} {cid} {size}")
-    
+    for rel_path, cid, size in file_list:
+        # 根据显示模式选择展示内容
+        display_name = posixpath.basename(rel_path) if show_mode == 'filename' else rel_path
+        print(f"{display_name} {cid} {size}")
+
     print("\n===Folder Cid Table===")
-    for folder_name, cid, size in folder_list:
-        print(f"{folder_name} {cid} {size}")
+    for rel_path, cid, size in folder_list:
+        display_name = posixpath.basename(rel_path) if show_mode == 'filename' else rel_path
+        print(f"{display_name} {cid} {size}")
 
 if __name__ == '__main__':
     main()

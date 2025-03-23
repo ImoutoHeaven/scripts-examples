@@ -84,15 +84,29 @@ async function handleDownload(request) {
   // 检查响应类型
   const contentType = resp.headers.get("content-type") || "";
   
-  // 如果不是JSON格式，直接返回响应
+  // 如果不是JSON格式，返回自定义错误响应
   if (!contentType.includes("application/json")) {
-    const errorResp = new Response(resp.body, {
-      status: resp.status,
-      statusText: resp.statusText,
-      headers: resp.headers
+    // 获取原始响应的状态码
+    const originalStatus = resp.status;
+    // 创建一个简单的错误消息，不包含敏感信息
+    const safeErrorMessage = JSON.stringify({
+      code: originalStatus,
+      message: `Request failed with status: ${originalStatus}`
     });
-    errorResp.headers.set("Access-Control-Allow-Origin", origin);
-    return errorResp;
+    
+    // 创建全新的headers对象，只添加必要的安全headers
+    const safeHeaders = new Headers();
+    safeHeaders.set("content-type", "application/json;charset=UTF-8");
+    safeHeaders.set("Access-Control-Allow-Origin", origin);
+    safeHeaders.append("Vary", "Origin");
+    
+    const safeErrorResp = new Response(safeErrorMessage, {
+      status: originalStatus,
+      statusText: "Error",  // 使用通用状态文本
+      headers: safeHeaders  // 使用安全的headers集合
+    });
+    
+    return safeErrorResp;
   }
   
   // 如果是JSON，按原来的逻辑处理

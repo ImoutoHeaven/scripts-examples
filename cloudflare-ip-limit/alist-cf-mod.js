@@ -6,7 +6,7 @@ var verifyHeader = "YOUR_HEADER";
 var verifySecret = "YOUR_HEADER_SECRET";
 
 // src/verify.ts
-var verify = async (data, _sign) => {
+const verify = async (data, _sign) => {
   const signSlice = _sign.split(":");
   if (!signSlice[signSlice.length - 1]) {
     return "expire missing";
@@ -24,7 +24,8 @@ var verify = async (data, _sign) => {
   }
   return "";
 };
-var hmacSha256Sign = async (data, expire) => {
+
+const hmacSha256Sign = async (data, expire) => {
   const key = await crypto.subtle.importKey(
     "raw",
     new TextEncoder().encode(TOKEN),
@@ -57,6 +58,7 @@ async function handleDownload(request) {
         message: verifyResult
       }),
       {
+        status: 401,
         headers: {
           "content-type": "application/json;charset=UTF-8"
         }
@@ -65,6 +67,8 @@ async function handleDownload(request) {
     resp2.headers.set("Access-Control-Allow-Origin", origin);
     return resp2;
   }
+  
+  // 发送请求到AList服务
   let resp = await fetch(`${ADDRESS}/api/fs/link`, {
     method: "POST",
     headers: {
@@ -76,10 +80,36 @@ async function handleDownload(request) {
       path
     })
   });
+  
+  // 检查响应类型
+  const contentType = resp.headers.get("content-type") || "";
+  
+  // 如果不是JSON格式，直接返回响应
+  if (!contentType.includes("application/json")) {
+    const errorResp = new Response(resp.body, {
+      status: resp.status,
+      statusText: resp.statusText,
+      headers: resp.headers
+    });
+    errorResp.headers.set("Access-Control-Allow-Origin", origin);
+    return errorResp;
+  }
+  
+  // 如果是JSON，按原来的逻辑处理
   let res = await resp.json();
   if (res.code !== 200) {
-    return new Response(JSON.stringify(res));
+    // 将错误状态码也反映在HTTP响应中
+    const httpStatus = res.code >= 100 && res.code < 600 ? res.code : 500;
+    const errorResp = new Response(JSON.stringify(res), {
+      status: httpStatus,
+      headers: {
+        "content-type": "application/json;charset=UTF-8"
+      }
+    });
+    errorResp.headers.set("Access-Control-Allow-Origin", origin);
+    return errorResp;
   }
+  
   request = new Request(res.data.url, request);
   if (res.data.header) {
     for (const k in res.data.header) {
@@ -88,6 +118,7 @@ async function handleDownload(request) {
       }
     }
   }
+  
   let response = await fetch(request);
   while (response.status >= 300 && response.status < 400) {
     const location = response.headers.get("Location");
@@ -103,6 +134,7 @@ async function handleDownload(request) {
       break;
     }
   }
+  
   response = new Response(response.body, response);
   response.headers.delete("set-cookie");
   response.headers.set("Access-Control-Allow-Origin", origin);
@@ -144,12 +176,8 @@ async function handleRequest(request) {
 }
 
 // src/index.ts
-var src_default = {
+export default {
   async fetch(request, env, ctx) {
     return await handleRequest(request);
   }
 };
-export {
-  src_default as default
-};
-//# sourceMappingURL=index.js.map

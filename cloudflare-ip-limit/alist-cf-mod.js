@@ -52,6 +52,11 @@ async function handleDownload(request) {
   const sign = url.searchParams.get("sign") ?? "";
   const verifyResult = await verify(path, sign);
   if (verifyResult !== "") {
+    const safeHeaders = new Headers();
+    safeHeaders.set("content-type", "application/json;charset=UTF-8");
+    safeHeaders.set("Access-Control-Allow-Origin", origin);
+    safeHeaders.append("Vary", "Origin");
+    
     const resp2 = new Response(
       JSON.stringify({
         code: 401,
@@ -59,12 +64,9 @@ async function handleDownload(request) {
       }),
       {
         status: 401,
-        headers: {
-          "content-type": "application/json;charset=UTF-8"
-        }
+        headers: safeHeaders
       }
     );
-    resp2.headers.set("Access-Control-Allow-Origin", origin);
     return resp2;
   }
   
@@ -114,13 +116,16 @@ async function handleDownload(request) {
   if (res.code !== 200) {
     // 将错误状态码也反映在HTTP响应中
     const httpStatus = res.code >= 100 && res.code < 600 ? res.code : 500;
+    
+    const safeHeaders = new Headers();
+    safeHeaders.set("content-type", "application/json;charset=UTF-8");
+    safeHeaders.set("Access-Control-Allow-Origin", origin);
+    safeHeaders.append("Vary", "Origin");
+    
     const errorResp = new Response(JSON.stringify(res), {
       status: httpStatus,
-      headers: {
-        "content-type": "application/json;charset=UTF-8"
-      }
+      headers: safeHeaders
     });
-    errorResp.headers.set("Access-Control-Allow-Origin", origin);
     return errorResp;
   }
   
@@ -149,11 +154,41 @@ async function handleDownload(request) {
     }
   }
   
-  response = new Response(response.body, response);
-  response.headers.delete("set-cookie");
-  response.headers.set("Access-Control-Allow-Origin", origin);
-  response.headers.append("Vary", "Origin");
-  return response;
+  // 创建仅包含安全必要headers的响应
+  const safeHeaders = new Headers();
+  
+  // 保留重要的内容相关headers
+  const preserveHeaders = [
+    'content-type', 
+    'content-disposition',
+    'content-length',
+    'cache-control',
+    'content-encoding',
+    'accept-ranges',
+    'etag',             // 根据需求保留
+    'last-modified'     // 根据需求保留
+  ];
+  
+  // 仅复制必要的headers
+  preserveHeaders.forEach(header => {
+    const value = response.headers.get(header);
+    if (value) {
+      safeHeaders.set(header, value);
+    }
+  });
+  
+  // 设置CORS headers
+  safeHeaders.set("Access-Control-Allow-Origin", origin);
+  safeHeaders.append("Vary", "Origin");
+  
+  // 创建带有安全headers的新响应
+  const safeResponse = new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: safeHeaders
+  });
+  
+  return safeResponse;
 }
 
 // src/handleOptions.ts
@@ -165,18 +200,22 @@ function handleOptions(request) {
   };
   let headers = request.headers;
   if (headers.get("Origin") !== null && headers.get("Access-Control-Request-Method") !== null) {
-    let respHeaders = {
-      ...corsHeaders,
-      "Access-Control-Allow-Headers": request.headers.get("Access-Control-Request-Headers") || ""
-    };
+    // 使用安全的响应头
+    const safeHeaders = new Headers();
+    safeHeaders.set("Access-Control-Allow-Origin", headers.get("Origin") || "*");
+    safeHeaders.set("Access-Control-Allow-Methods", "GET,HEAD,POST,OPTIONS");
+    safeHeaders.set("Access-Control-Max-Age", "86400");
+    safeHeaders.set("Access-Control-Allow-Headers", request.headers.get("Access-Control-Request-Headers") || "");
+    
     return new Response(null, {
-      headers: respHeaders
+      headers: safeHeaders
     });
   } else {
+    const safeHeaders = new Headers();
+    safeHeaders.set("Allow", "GET, HEAD, POST, OPTIONS");
+    
     return new Response(null, {
-      headers: {
-        Allow: "GET, HEAD, POST, OPTIONS"
-      }
+      headers: safeHeaders
     });
   }
 }

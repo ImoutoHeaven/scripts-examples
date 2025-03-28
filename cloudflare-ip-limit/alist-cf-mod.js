@@ -71,12 +71,14 @@ async function handleDownload(request) {
   }
   
   // 发送请求到AList服务
+  const clientIP = request.headers.get("CF-Connecting-IP") || "";
   let resp = await fetch(`${ADDRESS}/api/fs/link`, {
     method: "POST",
     headers: {
       "content-type": "application/json;charset=UTF-8",
       [verifyHeader]: verifySecret,
-      Authorization: TOKEN
+      Authorization: TOKEN,
+      "CF-Connecting-IP": clientIP, // Forward the client's IP address
     },
     body: JSON.stringify({
       path

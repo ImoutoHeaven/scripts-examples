@@ -72,10 +72,6 @@ while read -r ip; do
     echo "set_real_ip_from $ip;" >> "$NEW_CONFIG"
 done < "${IPV6_TEMP}.clean"
 
-# 添加real_ip_header指令
-echo "" >> "$NEW_CONFIG"
-echo "real_ip_header CF-Connecting-IP;" >> "$NEW_CONFIG"
-
 # 计算IP范围数量
 IPV4_COUNT=$(wc -l < "${IPV4_TEMP}.clean")
 IPV6_COUNT=$(wc -l < "${IPV6_TEMP}.clean")

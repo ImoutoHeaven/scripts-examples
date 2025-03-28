@@ -78,7 +78,7 @@ async function handleDownload(request) {
       "content-type": "application/json;charset=UTF-8",
       [verifyHeader]: verifySecret,
       Authorization: TOKEN,
-      "CF-Connecting-IP": clientIP, // Forward the client's IP address
+      "CF-Connecting-IP-WORKERS": clientIP, // Forward the client's IP address, since default CF-Connecting-IP will be overwritten by CF, we should include original CF-Connecting-IP and forward it into a new header.
     },
     body: JSON.stringify({
       path

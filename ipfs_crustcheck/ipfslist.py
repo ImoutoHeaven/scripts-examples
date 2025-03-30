@@ -5,13 +5,24 @@ import subprocess
 import posixpath
 import sys
 import argparse
+import os
+import shlex
+
+# 获取环境变量中的 ipfs 执行命令，并分割成列表
+def get_ipfs_cmd():
+    ipfs_exec = os.environ.get('ipfsexec')
+    if ipfs_exec:
+        # 使用 shlex.split 正确处理带空格的命令
+        return shlex.split(ipfs_exec)
+    return ['ipfs']  # 默认命令
 
 def list_ipfs_directory(path):
     """
     调用 ipfs 命令列出指定目录下的文件和文件夹信息，
     返回输出的每一行组成的列表。
     """
-    cmd = ["ipfs", "files", "ls", "-l", path]
+    # 获取基础命令列表
+    cmd = get_ipfs_cmd() + ["files", "ls", "-l", path]
     try:
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, check=True)
@@ -21,8 +32,11 @@ def list_ipfs_directory(path):
         else:
             return []
     except subprocess.CalledProcessError as e:
-        print(f"执行命令 {cmd} 时出错: {e}", file=sys.stderr)
+        print(f"执行命令 {' '.join(cmd)} 时出错: {e}", file=sys.stderr)
         return []
+    except FileNotFoundError as e:
+        print(f"找不到可执行文件: {cmd[0]} - {e}", file=sys.stderr)
+        sys.exit(1)
 
 def parse_listing_line(line):
     """
@@ -69,6 +83,9 @@ def recursive_parse(ipfs_path, current_rel, file_list, folder_list):
             file_list.append((rel_path, cid, size))
 
 def main():
+    ipfs_cmd = get_ipfs_cmd()
+    print(f"使用 IPFS 命令: {' '.join(ipfs_cmd)}")
+    
     parser = argparse.ArgumentParser(description='IPFS 目录递归查询并显示文件和文件夹的 CID 表')
     parser.add_argument('start_path', nargs='?', default='/', help='起始 IPFS 路径，默认 "/"')
     parser.add_argument('--show-mode', choices=['filename', 'relativepath'], default='filename',

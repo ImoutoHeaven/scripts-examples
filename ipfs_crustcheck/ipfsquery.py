@@ -7,6 +7,17 @@ import os
 import fcntl
 from datetime import datetime
 
+# 获取环境变量中的 ipfs 执行命令，并分割成列表
+def get_ipfs_cmd():
+    ipfs_exec = os.environ.get('ipfsexec')
+    if ipfs_exec:
+        # 使用 shlex.split 正确处理带空格的命令
+        return shlex.split(ipfs_exec)
+    return ['ipfs']  # 默认命令
+
+# 全局变量保存 IPFS 命令
+IPFS_CMD = get_ipfs_cmd()
+
 def run_command(cmd_args):
     """
     直接调用外部命令, 返回 stdout(str)。
@@ -23,6 +34,9 @@ def run_command(cmd_args):
     except subprocess.CalledProcessError as e:
         print(f"[ERROR] 调用命令失败: {' '.join(cmd_args)}", file=sys.stderr)
         print(e.stderr, file=sys.stderr)
+        sys.exit(1)
+    except FileNotFoundError as e:
+        print(f"[ERROR] 找不到可执行文件: {cmd_args[0]} - {e}", file=sys.stderr)
         sys.exit(1)
 
 def parse_ipfs_ls_line(line):
@@ -64,7 +78,7 @@ def list_files_recursive(mfs_path, collected_files):
     if not mfs_path.endswith("/"):
         mfs_path = mfs_path + "/"
 
-    cmd = ["ipfs", "files", "ls", "-l", mfs_path]
+    cmd = IPFS_CMD + ["files", "ls", "-l", mfs_path]
     output = run_command(cmd)
 
     for line in output.splitlines():
@@ -91,6 +105,9 @@ def main():
       - 如果指定了 relative_path（必须以 "/" 开头），则使用该目录作为递归起点。
       - 如果未指定或第一个参数以 "-" 开头，则默认使用 "/"。
     """
+    # 在开始时打印使用的 IPFS 命令
+    print(f"[INFO] 使用 IPFS 命令: {' '.join(IPFS_CMD)}")
+    
     # 根据命令行参数确定起始目录和传递给 crustcheck 的参数
     if len(sys.argv) > 1:
         if sys.argv[1].startswith("/"):

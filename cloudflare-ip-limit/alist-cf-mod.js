@@ -161,14 +161,19 @@ async function handleDownload(request) {
   
   // 保留重要的内容相关headers
   const preserveHeaders = [
-    'content-type', 
-    'content-disposition',
-    'content-length',
-    'cache-control',
-    'content-encoding',
-    'accept-ranges',
-    'etag',             // 根据需求保留
-    'last-modified'     // 根据需求保留
+  'content-type', 
+  'content-disposition',
+  'content-length',
+  'cache-control',
+  'content-encoding',
+  'accept-ranges',
+  'content-range',    // Added for partial downloads
+  'transfer-encoding', // Added for chunked transfers
+  'content-language',  // Added for internationalization
+  'expires',           // Added for cache control
+  'pragma',            // Added for cache control
+  'etag',             
+  'last-modified'     
   ];
   
   // 仅复制必要的headers

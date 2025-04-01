@@ -5,6 +5,7 @@ import shlex
 import sys
 import os
 import fcntl
+import time
 from datetime import datetime
 
 # 获取环境变量中的 ipfs 执行命令，并分割成列表
@@ -18,26 +19,42 @@ def get_ipfs_cmd():
 # 全局变量保存 IPFS 命令
 IPFS_CMD = get_ipfs_cmd()
 
-def run_command(cmd_args):
+def run_command_with_retry(cmd_args, max_attempts=3, retry_delay=2):
     """
-    直接调用外部命令, 返回 stdout(str)。
+    带重试逻辑的命令执行，最多尝试指定次数。
     cmd_args 是一个列表，例如 ["ipfs", "files", "ls", "-l", "/some/path"]。
     """
-    try:
-        result = subprocess.run(
-            cmd_args, 
-            text=True,
-            capture_output=True,
-            check=True
-        )
-        return result.stdout
-    except subprocess.CalledProcessError as e:
-        print(f"[ERROR] 调用命令失败: {' '.join(cmd_args)}", file=sys.stderr)
-        print(e.stderr, file=sys.stderr)
-        sys.exit(1)
-    except FileNotFoundError as e:
-        print(f"[ERROR] 找不到可执行文件: {cmd_args[0]} - {e}", file=sys.stderr)
-        sys.exit(1)
+    attempts = 0
+    last_error = None
+    
+    while attempts < max_attempts:
+        attempts += 1
+        try:
+            print(f"[EXEC] {''.join(cmd_args)} (尝试 {attempts}/{max_attempts})")
+            result = subprocess.run(
+                cmd_args, 
+                text=True,
+                capture_output=True,
+                check=True
+            )
+            return result.stdout
+        except subprocess.CalledProcessError as e:
+            last_error = e
+            print(f"[ERROR] 调用命令失败: {' '.join(cmd_args)} (尝试 {attempts}/{max_attempts})", file=sys.stderr)
+            print(e.stderr, file=sys.stderr)
+            
+            if attempts < max_attempts:
+                print(f"[INFO] {retry_delay} 秒后重试...")
+                time.sleep(retry_delay)
+        except FileNotFoundError as e:
+            print(f"[ERROR] 找不到可执行文件: {cmd_args[0]} - {e}", file=sys.stderr)
+            sys.exit(1)
+    
+    # 所有重试都失败
+    print(f"[ERROR] 命令 {' '.join(cmd_args)} 在 {max_attempts} 次尝试后仍然失败", file=sys.stderr)
+    if last_error:
+        print(last_error.stderr, file=sys.stderr)
+    return None
 
 def parse_ipfs_ls_line(line):
     """
@@ -64,12 +81,13 @@ def parse_ipfs_ls_line(line):
 
     return name, cid, size
 
-def list_files_recursive(mfs_path, collected_files):
+def list_files_recursive(mfs_path, collected_files, max_retries=3):
     """
     递归列出 MFS 路径下所有文件（非文件夹）。
 
     mfs_path: 形如 "/", "/some folder/", "/some folder/inner folder/" 等。
     collected_files: 用于存放 (文件名, CID, 大小) 的列表。
+    max_retries: 每个IPFS命令的最大重试次数
 
     注意：
     - 如果 mfs_path 末尾没有 '/', 则自动补上。
@@ -79,7 +97,12 @@ def list_files_recursive(mfs_path, collected_files):
         mfs_path = mfs_path + "/"
 
     cmd = IPFS_CMD + ["files", "ls", "-l", mfs_path]
-    output = run_command(cmd)
+    output = run_command_with_retry(cmd, max_attempts=max_retries)
+    
+    # 如果即使在重试后命令仍然失败，则跳过此目录
+    if output is None:
+        print(f"[WARN] 无法列出目录 {mfs_path}，跳过此目录")
+        return
 
     for line in output.splitlines():
         if not line.strip():
@@ -94,9 +117,14 @@ def list_files_recursive(mfs_path, collected_files):
             new_path = os.path.join(mfs_path, folder_name)
             # 清理可能出现的多余斜杠
             new_path = new_path.replace("//", "/")
-            list_files_recursive(new_path, collected_files)
+            list_files_recursive(new_path, collected_files, max_retries)
         else:
-            collected_files.append((name, cid, size))
+            # 对于文件，我们检查是否已经获取了有效的 CID
+            if cid and len(cid) > 0:
+                file_path = os.path.join(mfs_path, name).replace("//", "/")
+                collected_files.append((file_path, cid, size))
+            else:
+                print(f"[WARN] 跳过无效 CID 的文件: {os.path.join(mfs_path, name)}")
 
 def main():
     """
@@ -123,17 +151,38 @@ def main():
         mfs_root = "/"
         crustcheck_args = []
 
-    # 收集所有文件信息
+    # 收集所有文件信息（添加重试逻辑）
     collected_files = []
-    list_files_recursive(mfs_root, collected_files)
+    try:
+        list_files_recursive(mfs_root, collected_files, max_retries=3)
+    except Exception as e:
+        print(f"[ERROR] 列出文件时发生错误: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # 如果没有收集到任何文件，打印警告并退出
+    if not collected_files:
+        print(f"[WARN] 在路径 {mfs_root} 下没有找到任何文件")
+        sys.exit(0)
+    
+    print(f"[INFO] 共收集了 {len(collected_files)} 个文件")
 
     # 生成临时日志文件，文件名基于时间戳
     timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     tmp_file_path = f"/tmp/{timestamp_str}.log"
 
-    with open(tmp_file_path, "w", encoding="utf-8") as f:
+    with open(tmp_file_path, "w", encoding="utf-8", errors="replace") as f:
         for (file_name, file_cid, file_size) in collected_files:
-            f.write(f"{file_name}\t{file_cid}\t{file_size}\n")
+            # 确保任何文件名都是有效的 UTF-8，替换任何无法编码的字符
+            try:
+                safe_file_name = file_name
+                safe_line = f"{safe_file_name}\t{file_cid}\t{file_size}\n"
+                f.write(safe_line)
+            except UnicodeEncodeError:
+                # 如果有编码问题，使用 repr() 来获取一个安全的可打印表示
+                safe_file_name = repr(file_name)[1:-1]  # 去掉引号
+                safe_line = f"{safe_file_name}\t{file_cid}\t{file_size}\n"
+                print(f"[WARN] 文件名包含特殊字符，进行转义: {safe_file_name}")
+                f.write(safe_line)
 
     # 打开日志文件上锁，并调用 crustcheck 程序
     f_log = open(tmp_file_path, "r+")
@@ -143,20 +192,35 @@ def main():
         # 组装 crustcheck 命令：添加 --input 参数和其它传入的参数
         cmd = ["crustcheck", "--input", tmp_file_path] + crustcheck_args
         print(f"[INFO] 正在调用: {' '.join(shlex.quote(x) for x in cmd)}")
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1
-        )
+        
+        # 使用带有重试逻辑的方式启动 crustcheck
+        max_crustcheck_attempts = 1  # crustcheck 本身已经有重试逻辑，所以这里只尝试一次
+        returncode = None
+        
+        try:
+            # 不使用 text=True，而是手动处理字节流，更安全地处理特殊字符
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=False,  # 使用二进制模式
+                bufsize=1
+            )
 
-        # 实时打印 crustcheck 的输出
-        for line in process.stdout:
-            print(line, end='')
+            # 实时打印 crustcheck 的输出，使用 errors='replace' 来处理无法解码的字符
+            for line_bytes in process.stdout:
+                try:
+                    line = line_bytes.decode('utf-8')
+                except UnicodeDecodeError:
+                    # 对于无法解码的部分，使用替代字符
+                    line = line_bytes.decode('utf-8', errors='replace')
+                print(line, end='')
 
-        returncode = process.wait()
-        print(f"[INFO] crustcheck 退出码: {returncode}")
+            returncode = process.wait()
+            print(f"[INFO] crustcheck 退出码: {returncode}")
+        except Exception as e:
+            print(f"[ERROR] 执行 crustcheck 出错: {e}", file=sys.stderr)
+            returncode = 1
 
     finally:
         fcntl.flock(f_log, fcntl.LOCK_UN)
@@ -166,7 +230,7 @@ def main():
         except OSError as e:
             print(f"[WARN] 删除临时文件 {tmp_file_path} 失败: {e}", file=sys.stderr)
 
-    sys.exit(returncode)
+    sys.exit(returncode if returncode is not None else 1)
 
 if __name__ == "__main__":
     main()

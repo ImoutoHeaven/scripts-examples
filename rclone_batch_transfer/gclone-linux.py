@@ -4,6 +4,7 @@ import time
 import sys
 import os
 import locale
+import argparse
 from datetime import datetime
 from threading import Thread
 from queue import Queue, Empty
@@ -133,7 +134,7 @@ def setup_signal_handlers():
     """设置信号处理器"""
     def signal_handler(signum, frame):
         print("\n程序被用户中断", flush=True)
-        sys.exit(0)
+        sys.exit(130)  # 标准的SIGINT错误代码
     
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -148,18 +149,39 @@ def parse_transferred_count(line):
         return int(match.group(1))
     return None
 
-def monitor_gclone():
-    print("请输入要执行的指令:", flush=True)
-    cmd = input().strip()
-    input()  # 等待第二次回车
+def parse_args():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(description='监控并执行gclone/rclone/fclone命令，处理HTTP 403错误')
+    parser.add_argument('-shell', type=str, help='非交互式执行的命令')
+    return parser.parse_args()
+
+def monitor_gclone(cmd=None):
+    """监控gclone命令执行，处理HTTP 403错误并在必要时重试
+    
+    参数:
+        cmd: 可选，直接指定要执行的命令
+        
+    返回:
+        int: 命令执行的退出代码
+    """
+    if cmd is None:
+        # 交互式模式
+        print("请输入要执行的指令:", flush=True)
+        cmd = input().strip()
+        try:
+            input()  # 等待第二次回车
+        except EOFError:
+            pass  # 如果在管道中运行，可能没有第二个输入
     
     if not cmd:
         print("指令不能为空", flush=True)
-        return
+        return 1  # 返回错误代码
 
     # 确保命令中包含 -P 参数
     if '-P' not in cmd:
         cmd += ' -P'
+
+    last_exit_code = 0  # 初始化为0，表示成功
 
     while True:
         print(f"\n[{datetime.now()}] 执行命令: {cmd}", flush=True)
@@ -172,12 +194,12 @@ def monitor_gclone():
                 stderr=subprocess.PIPE,
                 stdin=subprocess.PIPE,
                 bufsize=0,  # 无缓冲
-                preexec_fn=os.setsid,  # Linux特有，设置进程组
+                preexec_fn=os.setsid if hasattr(os, 'setsid') else None,  # Linux特有，设置进程组
                 encoding=None  # 不指定编码，使用bytes
             )
         except Exception as e:
             print(f"启动进程失败: {e}", flush=True)
-            return
+            return 1  # 返回错误代码
 
         # 创建输出队列和线程
         stdout_queue = Queue()
@@ -233,7 +255,10 @@ def monitor_gclone():
                         if error_count_403 >= 5 and consecutive_same_transfer >= 5:
                             print(f"\n[{datetime.now()}] 检测到HTTP 403错误且传输停滞，暂停8小时后重试", flush=True)
                             try:
-                                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                                if hasattr(os, 'killpg'):
+                                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                                else:
+                                    process.terminate()
                             except:
                                 process.terminate()
                             time.sleep(8 * 3600)  # 休眠8小时
@@ -262,13 +287,17 @@ def monitor_gclone():
 
             except KeyboardInterrupt:
                 try:
-                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                    if hasattr(os, 'killpg'):
+                        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                    else:
+                        process.terminate()
                 except:
                     process.terminate()
                 print("\n程序被用户中断", flush=True)
-                return
+                return 130  # 标准的SIGINT错误代码
 
         exit_code = process.poll()
+        last_exit_code = exit_code  # 保存最后一次的退出代码
 
         # 输出可能残留在队列中的内容
         for queue in [stdout_queue, stderr_queue]:
@@ -292,11 +321,28 @@ def monitor_gclone():
             print(f"\n[{datetime.now()}] 命令执行失败，退出码: {exit_code}", flush=True)
             break
 
-if __name__ == "__main__":
+    return last_exit_code  # 返回最后一次的退出代码
+
+def main():
     try:
+        args = parse_args()
         setup_signal_handlers()
-        monitor_gclone()
+        
+        if args.shell:
+            # 非交互式模式
+            exit_code = monitor_gclone(args.shell)
+        else:
+            # 交互式模式
+            exit_code = monitor_gclone()
+        
+        sys.exit(exit_code)  # 使用gclone命令的退出代码作为脚本的退出代码
+            
     except KeyboardInterrupt:
         print("\n程序被用户中断", flush=True)
+        sys.exit(130)  # 标准的SIGINT错误代码
     except Exception as e:
         print(f"发生错误: {e}", flush=True)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

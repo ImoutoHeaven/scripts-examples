@@ -5,6 +5,14 @@ var WORKER_ADDRESS = "YOUR_WORKER_ADDRESS";
 var verifyHeader = "YOUR_HEADER";
 var verifySecret = "YOUR_HEADER_SECRET";
 
+// Add IPv4 only switch - set to true to block IPv6 access
+var IPV4_ONLY = true;  // Change to false to allow IPv6 access
+
+// Helper function to check if an IP is IPv6
+function isIPv6(ip) {
+  return ip && ip.includes(':');
+}
+
 // src/verify.ts
 const verify = async (data, _sign) => {
   const signSlice = _sign.split(":");
@@ -24,7 +32,6 @@ const verify = async (data, _sign) => {
   }
   return "";
 };
-
 const hmacSha256Sign = async (data, expire) => {
   const key = await crypto.subtle.importKey(
     "raw",
@@ -43,7 +50,6 @@ const hmacSha256Sign = async (data, expire) => {
   );
   return btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_") + ":" + expire;
 };
-
 // src/handleDownload.ts
 async function handleDownload(request) {
   const origin = request.headers.get("origin") ?? "*";
@@ -197,7 +203,6 @@ async function handleDownload(request) {
   
   return safeResponse;
 }
-
 // src/handleOptions.ts
 function handleOptions(request) {
   const corsHeaders = {
@@ -227,14 +232,36 @@ function handleOptions(request) {
   }
 }
 
-// src/handleRequest.ts
+// src/handleRequest.ts - Modified to check IPv6 addresses
 async function handleRequest(request) {
+  // Check for IPv6 access if IPv4_ONLY is enabled
+  if (IPV4_ONLY) {
+    const clientIP = request.headers.get("CF-Connecting-IP") || "";
+    if (isIPv6(clientIP)) {
+      const safeHeaders = new Headers();
+      safeHeaders.set("content-type", "application/json;charset=UTF-8");
+      safeHeaders.set("Access-Control-Allow-Origin", request.headers.get("origin") ?? "*");
+      safeHeaders.append("Vary", "Origin");
+      
+      return new Response(
+        JSON.stringify({
+          code: 403,
+          message: "ipv6 access is prohibited"
+        }),
+        {
+          status: 403,
+          headers: safeHeaders
+        }
+      );
+    }
+  }
+  
+  // Continue with normal processing if not blocked
   if (request.method === "OPTIONS") {
     return handleOptions(request);
   }
   return await handleDownload(request);
 }
-
 // src/index.ts
 export default {
   async fetch(request, env, ctx) {

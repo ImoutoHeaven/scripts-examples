@@ -37,6 +37,11 @@ FILTER_PATTERN = args.filter  # 只监控包含此模式的请求
 MIN_RELOAD_INTERVAL = 300  # 最小重载Nginx间隔（秒）
 REAL_IP_HEADER = args.ip_header  # 真实IP的HTTP头
 
+# 新增: 待重载队列相关变量
+pending_reload = False  # 是否有待执行的重载
+pending_reload_time = 0  # 预计执行重载的时间
+pending_ban_updates = False  # 标记是否有待更新的封禁
+
 # 配置日志
 if args.debug:
     LOG_LEVEL = logging.DEBUG
@@ -63,6 +68,7 @@ def print_usage_info():
     logging.info(f"  - 监控路径: 包含 {FILTER_PATTERN} 的请求")
     logging.info(f"  - 封禁阈值: {REQUEST_THRESHOLD}个请求/{TIME_WINDOW}秒")
     logging.info(f"  - 封禁时长: {BLOCK_DURATION}秒")
+    logging.info(f"  - Nginx重载冷却时间: {MIN_RELOAD_INTERVAL}秒")
     if args.debug:
         logging.info(f"调试模式已启用 - 将显示详细的IP请求统计")
     logging.info("=" * 30)
@@ -260,12 +266,16 @@ def load_ban_list():
 
 # 重新加载Nginx配置
 def reload_nginx(last_reload_time):
+    global pending_reload, pending_reload_time, pending_ban_updates
     current_time = time.time()
     
     # 检查是否符合最小重载间隔
     if current_time - last_reload_time < MIN_RELOAD_INTERVAL:
         time_left = int(MIN_RELOAD_INTERVAL - (current_time - last_reload_time))
-        logging.info(f"跳过Nginx重载: 需等待 {time_left} 秒才能再次重载")
+        logging.info(f"延迟Nginx重载: 将在 {time_left} 秒后执行")
+        # 设置待执行重载标志和预计执行时间
+        pending_reload = True
+        pending_reload_time = last_reload_time + MIN_RELOAD_INTERVAL
         return last_reload_time
     
     try:
@@ -278,13 +288,27 @@ def reload_nginx(last_reload_time):
         # 重载配置
         subprocess.run(["systemctl", "reload", "nginx"], check=True)
         logging.info("Nginx配置已重新加载")
+        # 重置待重载标志
+        pending_reload = False
+        pending_ban_updates = False
         return current_time  # 更新上次重载时间
     except subprocess.CalledProcessError as e:
         logging.error(f"重新加载Nginx配置失败: {e}")
         return last_reload_time
 
+# 更新封禁时间使其基于实际重载时间计算
+def update_ban_expiry_times(ban_dict):
+    current_time = datetime.now()
+    # 更新所有IP的封禁时间，从当前时间开始计算
+    for ip in ban_dict:
+        ban_dict[ip] = current_time + timedelta(seconds=BLOCK_DURATION)
+        if args.debug:
+            logging.debug(f"更新IP {ip} 的封禁过期时间: {ban_dict[ip].strftime('%Y-%m-%d %H:%M:%S')}")
+    return ban_dict
+
 # 清理过期的IP封禁
 def clean_expired_bans(ban_dict, last_reload_time):
+    global pending_ban_updates
     current_time = datetime.now()
     expired_ips = [ip for ip, expiry in ban_dict.items() if expiry <= current_time]
     if expired_ips:
@@ -292,6 +316,7 @@ def clean_expired_bans(ban_dict, last_reload_time):
             logging.info(f"移除已过期的IP封禁: {ip}")
             del ban_dict[ip]
         if save_ban_list(ban_dict):
+            pending_ban_updates = True
             return reload_nginx(last_reload_time)
     return last_reload_time
 
@@ -327,6 +352,8 @@ def print_ip_stats(request_records):
 
 # 主监控函数
 def monitor_logs():
+    global pending_reload, pending_reload_time, pending_ban_updates
+    
     # 按站点分别存储每个IP的请求时间戳: site -> ip -> [timestamps]
     request_records = defaultdict(lambda: defaultdict(list))
     changes_made = False
@@ -365,8 +392,20 @@ def monitor_logs():
     
     try:
         while True:
+            # 检查是否有待执行的重载请求
+            current_time = time.time()
+            if pending_reload and current_time >= pending_reload_time:
+                logging.info("执行延迟的Nginx重载")
+                if pending_ban_updates:
+                    # 更新所有封禁IP的过期时间
+                    ban_dict = update_ban_expiry_times(ban_dict)
+                    # 保存更新后的封禁列表
+                    save_ban_list(ban_dict)
+                # 执行重载
+                last_reload_time = reload_nginx(pending_reload_time - MIN_RELOAD_INTERVAL)
+            
             # 定期刷新日志文件列表
-            if time.time() - last_cleanup_time >= 60:  # 每分钟刷新一次文件列表
+            if current_time - last_cleanup_time >= 60:  # 每分钟刷新一次文件列表
                 new_log_files = get_log_files(LOG_DIR)
                 # 合并新发现的日志文件
                 for file, pos in new_log_files.items():
@@ -461,10 +500,10 @@ def monitor_logs():
                             count_before = len(request_records[site][ip_key])
                         
                         # 移除时间窗口外的记录
-                        current_time = datetime.now()
+                        current_time_dt = datetime.now()
                         request_records[site][ip_key] = [
                             t for t in request_records[site][ip_key] 
-                            if (current_time - t).total_seconds() <= TIME_WINDOW
+                            if (current_time_dt - t).total_seconds() <= TIME_WINDOW
                         ]
                         
                         if args.debug:
@@ -474,8 +513,9 @@ def monitor_logs():
                         
                         # 检查IP在单个站点是否超过阈值
                         if len(request_records[site][ip_key]) > REQUEST_THRESHOLD:
-                            # 添加到封禁列表
-                            expiry = current_time + timedelta(seconds=BLOCK_DURATION)
+                            # 添加到封禁列表 - 临时设置过期时间，真正重载时会调整
+                            # 临时设置成功只是为了日志显示和内部判断
+                            expiry = current_time_dt + timedelta(seconds=BLOCK_DURATION)
                             ban_dict[ip_key] = expiry
                             stats["banned_ips"] += 1
                             logging.warning(
@@ -483,6 +523,7 @@ def monitor_logs():
                                 f"站点 {site} 上有 {len(request_records[site][ip_key])} 个请求在 {TIME_WINDOW} 秒内"
                             )
                             changes_made = True
+                            pending_ban_updates = True  # 标记有待更新的封禁时间
                             
                             # 清除此IP的计数（所有站点）
                             for s in request_records:
@@ -504,12 +545,12 @@ def monitor_logs():
                     changes_made = False
             
             # 清理内存中的旧记录
-            current_time = datetime.now()
+            current_time_dt = datetime.now()
             for site in list(request_records.keys()):
                 for ip in list(request_records[site].keys()):
                     old_count = len(request_records[site][ip])
                     request_records[site][ip] = [t for t in request_records[site][ip] 
-                                      if (current_time - t).total_seconds() <= TIME_WINDOW]
+                                      if (current_time_dt - t).total_seconds() <= TIME_WINDOW]
                     if not request_records[site][ip]:
                         if args.debug and old_count > 0:
                             logging.debug(f"从记录中移除不活跃的IP: 站点 {site} - IP {ip}")
@@ -519,10 +560,10 @@ def monitor_logs():
                     del request_records[site]
             
             # 定期检查过期封禁并打印统计信息
-            current_time_sec = time.time()
-            if current_time_sec - last_cleanup_time >= CHECK_INTERVAL:
+            current_time = time.time()
+            if current_time - last_cleanup_time >= CHECK_INTERVAL:
                 last_reload_time = clean_expired_bans(ban_dict, last_reload_time)
-                last_cleanup_time = current_time_sec
+                last_cleanup_time = current_time
                 
                 # 调试模式下定期打印统计信息
                 if args.debug:
@@ -538,15 +579,19 @@ def monitor_logs():
                     logging.debug(f"当前活跃站点数: {len(request_records)}")
                     logging.debug(f"当前活跃IP数: {active_ips_count}")
                     logging.debug(f"当前封禁IP数: {len(ban_dict)}")
+                    logging.debug(f"是否有待执行的重载: {pending_reload}")
+                    if pending_reload:
+                        time_left = int(pending_reload_time - current_time)
+                        logging.debug(f"重载倒计时: {time_left}秒")
                     logging.debug("--------------------")
                     
                     # 重置统计时间
-                    last_stats_time = current_time_sec
+                    last_stats_time = current_time
             
             # 调试模式下定期打印IP统计
-            if args.debug and current_time_sec - last_stats_time >= 5:  # 每5秒打印一次统计
+            if args.debug and current_time - last_stats_time >= 5:  # 每5秒打印一次统计
                 print_ip_stats(request_records)
-                last_stats_time = current_time_sec
+                last_stats_time = current_time
                 
     except KeyboardInterrupt:
         logging.info("脚本被用户终止")

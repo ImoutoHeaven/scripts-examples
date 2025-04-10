@@ -59,7 +59,7 @@ def print_usage_info():
     logging.info(f"  - HTTP块配置: {HTTP_CONF_FILE} (包含map指令，请放在http块中)")
     logging.info(f"  - Location块配置: {LOCATION_CONF_FILE} (包含if条件，请放在location块中)")
     logging.info(f"监控设置:")
-    logging.info(f"  - 使用的IP头: {REAL_IP_HEADER}")
+    logging.info(f"  - 使用的IP头: {REAL_IP_HEADER} (仅对携带此头的请求进行限流)")
     logging.info(f"  - 监控路径: 包含 {FILTER_PATTERN} 的请求")
     logging.info(f"  - 封禁阈值: {REQUEST_THRESHOLD}个请求/{TIME_WINDOW}秒")
     logging.info(f"  - 封禁时长: {BLOCK_DURATION}秒")
@@ -124,15 +124,12 @@ def save_ban_list(ban_dict):
 # 使用的真实IP头: {REAL_IP_HEADER} (变量: ${real_ip_var})
 # 总封禁IP数: {len(ban_dict)}
 
-# 处理可能不存在的IP头
-map ${real_ip_var} $real_client_ip {{
-    ""      $remote_addr;  # 如果头不存在，使用remote_addr
-    default ${real_ip_var}; # 否则使用头中的值
-}}
-
-# IP封禁映射表
-map $real_client_ip $is_banned_ip {{
-    default 0;
+# IP封禁映射表 - 只检查有特定头的请求
+# 如果请求没有携带{REAL_IP_HEADER}头，$is_banned_ip将返回0（不封禁）
+map ${real_ip_var} $is_banned_ip {{
+    # 头部不存在或为空时，直接放行
+    ""      0;
+    default 0;  # 默认不封禁
 """
 
         # IPv4 地址直接添加到映射
@@ -163,7 +160,7 @@ map $real_client_ip $is_banned_ip {{
 # 使用的真实IP头: {REAL_IP_HEADER}
 # 总封禁IP数: {len(ban_dict)}
 
-# 应用封禁规则
+# 应用封禁规则 - 仅当$is_banned_ip为1时才封禁
 if ($is_banned_ip = 1) {{
     return 429;
 }}

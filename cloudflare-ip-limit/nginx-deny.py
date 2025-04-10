@@ -59,7 +59,7 @@ def print_usage_info():
     logging.info(f"  - HTTP块配置: {HTTP_CONF_FILE} (包含map指令，请放在http块中)")
     logging.info(f"  - Location块配置: {LOCATION_CONF_FILE} (包含if条件，请放在location块中)")
     logging.info(f"监控设置:")
-    logging.info(f"  - 使用的IP头: {REAL_IP_HEADER} (仅对携带此头的请求进行限流)")
+    logging.info(f"  - 使用的IP头: {REAL_IP_HEADER}")
     logging.info(f"  - 监控路径: 包含 {FILTER_PATTERN} 的请求")
     logging.info(f"  - 封禁阈值: {REQUEST_THRESHOLD}个请求/{TIME_WINDOW}秒")
     logging.info(f"  - 封禁时长: {BLOCK_DURATION}秒")
@@ -77,6 +77,18 @@ def ipv6_to_subnet(ip_str):
         return ip_str
     except:
         return ip_str
+
+# 转义IPv6地址中的特殊字符，使其在Nginx正则表达式中安全
+def escape_ip_for_regex(ip_str):
+    if ':' in ip_str:  # IPv6地址
+        # 转义冒号，因为在正则表达式中有特殊含义
+        if '/' in ip_str:  # CIDR格式
+            ip_part = ip_str.split('/')[0]
+            escaped = ip_part.replace(':', '\\:')
+            return escaped
+        else:
+            return ip_str.replace(':', '\\:')
+    return ip_str  # IPv4地址，无需转义
 
 # 从日志文件名提取站点名称
 def extract_site_name(log_file):
@@ -124,12 +136,15 @@ def save_ban_list(ban_dict):
 # 使用的真实IP头: {REAL_IP_HEADER} (变量: ${real_ip_var})
 # 总封禁IP数: {len(ban_dict)}
 
-# IP封禁映射表 - 只检查有特定头的请求
-# 如果请求没有携带{REAL_IP_HEADER}头，$is_banned_ip将返回0（不封禁）
-map ${real_ip_var} $is_banned_ip {{
-    # 头部不存在或为空时，直接放行
-    ""      0;
-    default 0;  # 默认不封禁
+# 检查IP头是否存在
+map ${real_ip_var} $has_real_ip {{
+    ""      0;  # 头不存在，跳过封禁检查
+    default 1;  # 头存在，进行封禁检查
+}}
+
+# IP封禁映射表 - 仅当$has_real_ip=1时有效
+map ${real_ip_var} $ip_is_banned {{
+    default 0;
 """
 
         # IPv4 地址直接添加到映射
@@ -147,12 +162,21 @@ map ${real_ip_var} $is_banned_ip {{
             
             # 处理CIDR格式
             if '/' in ip:
-                # 这里采用简化方法，使用完整的子网表示
-                http_config += f'    "~^{ip.split("/")[0]}" 1; # 子网 {ip}\n'
+                # 添加IPv6子网CIDR作为完整匹配，避免正则表达式问题
+                http_config += f'    "{ip}" 1; # IPv6子网\n'
             else:
                 http_config += f'    "{ip}" 1;\n'
         
         http_config += "}\n"
+
+        # 组合两个条件：IP头存在且IP被封禁
+        http_config += """
+# 最终封禁决定 - 只有当IP头存在且IP在封禁列表中时才封禁
+map $has_real_ip $is_banned_ip {
+    0       0;  # IP头不存在，强制不封禁
+    1       $ip_is_banned;  # IP头存在，使用封禁结果
+}
+"""
 
         # 2. 创建Location块配置文件（使用if条件）
         location_config = f"""# 自动生成的IP封禁配置（Location块） - 请勿手动编辑
@@ -160,7 +184,7 @@ map ${real_ip_var} $is_banned_ip {{
 # 使用的真实IP头: {REAL_IP_HEADER}
 # 总封禁IP数: {len(ban_dict)}
 
-# 应用封禁规则 - 仅当$is_banned_ip为1时才封禁
+# 应用封禁规则
 if ($is_banned_ip = 1) {{
     return 429;
 }}
@@ -212,13 +236,13 @@ def load_ban_list():
                 except:
                     pass
             
-            # 查找正则匹配的IPv6子网
-            pattern_regex = r'#\s+封禁到:\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+"~\^([0-9a-fA-F:]+)"\s+1;\s+#\s+子网\s+([0-9a-fA-F:]+/\d+)'
-            matches = re.finditer(pattern_regex, content)
+            # 查找IPv6子网（CIDR格式）
+            pattern_ipv6_cidr = r'#\s+封禁到:\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+"\s*([0-9a-fA-F:]+/\d+)\s*"\s+1;\s+#\s+IPv6子网'
+            matches = re.finditer(pattern_ipv6_cidr, content)
             
             for match in matches:
                 expiry_str = match.group(1)
-                cidr = match.group(3)  # 直接使用注释中的CIDR格式
+                cidr = match.group(2)
                 try:
                     expiry = datetime.strptime(expiry_str, "%Y-%m-%d %H:%M:%S")
                     ban_dict[cidr] = expiry

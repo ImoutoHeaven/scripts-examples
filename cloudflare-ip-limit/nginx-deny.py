@@ -8,19 +8,23 @@ import signal
 import logging
 import argparse
 import glob
+import statistics
 from collections import defaultdict
 from datetime import datetime, timedelta
 
 # 解析命令行参数
-parser = argparse.ArgumentParser(description='Nginx日志监控与IP封禁工具')
+parser = argparse.ArgumentParser(description='Nginx日志监控与自适应IP封禁工具')
 parser.add_argument('--debug', action='store_true', help='启用调试模式，输出更详细的IP计数统计和封禁判断信息')
 parser.add_argument('--log-dir', default='/var/log/nginx', help='日志文件目录路径')
 parser.add_argument('--filter', default='/api/fs/link', help='请求路径过滤模式')
 parser.add_argument('--ip-header', default='CF-CONNECTING-IP', 
                     help='包含真实IP的HTTP头名称(如CF-CONNECTING-IP, X-REAL-IP, X-FORWARDED-FOR等)')
-parser.add_argument('--threshold', type=int, default=50, help='10秒内请求数阈值，超过此值将被封禁')
-parser.add_argument('--time-window', type=int, default=10, help='检测时间窗口（秒）')
+parser.add_argument('--burst-limit', type=int, default=100, help='短期爆发请求数阈值，允许10秒内的高流量爆发')
+parser.add_argument('--avg-limit', type=float, default=5.0, help='长期平均TPS限制')
+parser.add_argument('--short-window', type=int, default=10, help='短期爆发检测时间窗口（秒）')
+parser.add_argument('--long-window', type=int, default=60, help='长期平均检测时间窗口（秒）')
 parser.add_argument('--block-duration', type=int, default=1200, help='封禁持续时间（秒）')
+parser.add_argument('--warning-duration', type=int, default=120, help='警告封禁持续时间（秒）')
 parser.add_argument('--http-conf', default='/etc/nginx/limit-http.conf', help='HTTP块封禁配置文件路径')
 parser.add_argument('--location-conf', default='/etc/nginx/limit-location.conf', help='Location块封禁配置文件路径')
 args = parser.parse_args()
@@ -29,13 +33,20 @@ args = parser.parse_args()
 LOG_DIR = args.log_dir
 HTTP_CONF_FILE = args.http_conf
 LOCATION_CONF_FILE = args.location_conf
-REQUEST_THRESHOLD = args.threshold  # 时间窗口内超过阈值的请求数将被封禁
-TIME_WINDOW = args.time_window  # 时间窗口（秒）
-BLOCK_DURATION = args.block_duration  # 封禁持续时间（秒）
+BURST_LIMIT = args.burst_limit  # 短期爆发请求限制
+AVG_LIMIT = args.avg_limit  # 长期平均TPS限制
+SHORT_WINDOW = args.short_window  # 短期检测窗口（秒）
+LONG_WINDOW = args.long_window  # 长期检测窗口（秒）
+BLOCK_DURATION = args.block_duration  # 严重违规的封禁持续时间（秒）
+WARNING_DURATION = args.warning_duration  # 警告封禁持续时间（秒）
 CHECK_INTERVAL = 5  # 检查过期封禁的间隔（秒）
 FILTER_PATTERN = args.filter  # 只监控包含此模式的请求
 MIN_RELOAD_INTERVAL = 300  # 最小重载Nginx间隔（秒）
 REAL_IP_HEADER = args.ip_header  # 真实IP的HTTP头
+
+# 封禁类型
+BAN_TYPE_WARNING = "warning"  # 警告级别封禁
+BAN_TYPE_BLOCK = "block"  # 完全封禁
 
 # 新增: 待重载队列相关变量
 pending_reload = False  # 是否有待执行的重载
@@ -57,18 +68,175 @@ logging.basicConfig(
 # Nginx日志解析正则表达式
 LOG_PATTERN = r'^(\d+\.\d+\.\d+\.\d+|[0-9a-fA-F:]+) - - \[([^\]]+)\] "([^"]*)" ([^ ]+) (\d+) "([^"]*)" "([^"]*)"'
 
+# 自适应速率限制器
+class AdaptiveRateLimiter:
+    def __init__(self, ip, short_window=SHORT_WINDOW, long_window=LONG_WINDOW, burst_limit=BURST_LIMIT, avg_limit=AVG_LIMIT):
+        self.ip = ip
+        self.short_window = short_window  # 短期窗口（秒）
+        self.long_window = long_window    # 长期窗口（秒）
+        self.burst_limit = burst_limit    # 短期爆发请求限制
+        self.avg_limit = avg_limit        # 长期平均TPS限制
+        self.request_history = []         # 请求时间戳历史
+        self.warning_count = 0            # 警告计数
+        self.last_warning_time = None     # 上次警告时间
+        self.warned_until = None          # 警告状态持续到
+        self.sites = set()                # 该IP访问过的站点
+        self.regular_pattern_flag = False # 标记是否检测到规律模式但未超TPS限制
+    
+    def add_request(self, timestamp, site):
+        """添加新请求并清理过期记录"""
+        self.request_history.append(timestamp)
+        self.sites.add(site)
+        # 清理超出长期窗口的记录
+        cutoff = timestamp - timedelta(seconds=self.long_window)
+        self.request_history = [t for t in self.request_history if t >= cutoff]
+    
+    def evaluate(self, current_time):
+        """评估IP行为并返回应采取的动作"""
+        if not self.request_history:
+            return "allow"
+            
+        # 如果当前处于警告状态
+        if self.warned_until and current_time < self.warned_until:
+            return "warning"  # 维持警告状态
+            
+        # 计算短期窗口内的请求数
+        short_cutoff = current_time - timedelta(seconds=self.short_window)
+        short_requests = [t for t in self.request_history if t >= short_cutoff]
+        short_count = len(short_requests)
+        
+        # 计算长期窗口内的平均TPS
+        time_span = (current_time - self.request_history[0]).total_seconds() if self.request_history else 0
+        # 确保时间跨度至少为1秒避免除零错误
+        effective_time_span = max(1.0, time_span)
+        long_tps = len(self.request_history) / effective_time_span
+        
+        # 短期爆发检查
+        if short_count > self.burst_limit:
+            self.warning_count += 1
+            if self.warning_count >= 3:
+                logging.warning(f"IP {self.ip} 多次超过爆发限制 ({short_count}/{self.burst_limit})，执行完全封禁")
+                return "block"
+            else:
+                logging.warning(f"IP {self.ip} 请求爆发超过限制 ({short_count}/{self.burst_limit})，发出警告 (#{self.warning_count})")
+                self.warned_until = current_time + timedelta(seconds=WARNING_DURATION)
+                return "warning"
+        
+        # 长期平均检查（只有在有足够样本时才检查）
+        if time_span >= self.long_window * 0.3 and len(self.request_history) > 15:
+            if long_tps > self.avg_limit:
+                logging.warning(f"IP {self.ip} 长期TPS超过限制 ({long_tps:.2f}/{self.avg_limit})，执行封禁")
+                return "block"
+        
+        # 请求模式分析 - 修改后只有当TPS也超限时才封禁
+        if len(self.request_history) >= 20:  # 至少有20个请求才进行模式分析
+            pattern_score = self.analyze_request_pattern()
+            
+            # 只有当模式异常且TPS超限时才封禁
+            if pattern_score > 0.85 and long_tps > self.avg_limit:
+                logging.warning(f"IP {self.ip} 请求模式异常 (得分:{pattern_score:.2f}) 且 TPS过高 ({long_tps:.2f}/{self.avg_limit})，执行封禁")
+                return "block"
+            elif pattern_score > 0.85:
+                # 记录规律模式但不封禁
+                if not self.regular_pattern_flag:
+                    logging.info(f"检测到规律请求模式: IP {self.ip} (得分:{pattern_score:.2f}) 但TPS在限制内 ({long_tps:.2f}/{self.avg_limit})，允许通过")
+                    self.regular_pattern_flag = True
+        
+        return "allow"
+    
+    def analyze_request_pattern(self):
+        """分析请求模式，返回0-1之间的异常分数"""
+        if len(self.request_history) < 10:
+            return 0.0  # 样本太少，无法判断
+        
+        # 计算请求间隔
+        intervals = []
+        for i in range(1, len(self.request_history)):
+            interval = (self.request_history[i] - self.request_history[i-1]).total_seconds()
+            intervals.append(interval)
+        
+        if not intervals:
+            return 0.0
+        
+        # 计算间隔的标准差
+        try:
+            mean_interval = sum(intervals) / len(intervals)
+            if mean_interval < 0.001:  # 防止除零错误
+                mean_interval = 0.001
+                
+            # 计算变异系数（标准差/平均值）- 衡量相对分散程度
+            std_dev = statistics.stdev(intervals) if len(intervals) > 1 else 0
+            cv = std_dev / mean_interval
+            
+            # 正常用户行为的特征是间隔有一定的随机性，CV通常较高
+            # 爬虫的特征是间隔非常规律，CV通常很低（接近0）
+            
+            # 转换成异常分数 (0-1)
+            # CV值越小，越可能是爬虫，分数越高
+            regularity_score = max(0, min(1, 1.0 - min(cv, 1.0)))
+            
+            # 极短间隔的规律请求更可疑，但不再增加额外权重
+            # 移除基于请求数量的加权，专注于请求模式
+            
+            return min(1.0, regularity_score)
+            
+        except (statistics.StatisticsError, ZeroDivisionError):
+            # 处理统计计算中可能出现的错误
+            return 0.3  # 返回中等程度的怀疑分数
+    
+    def get_stats(self):
+        """获取此IP的统计信息，用于调试"""
+        if not self.request_history:
+            return "无请求记录"
+            
+        now = datetime.now()
+        short_cutoff = now - timedelta(seconds=self.short_window)
+        short_requests = [t for t in self.request_history if t >= short_cutoff]
+        short_count = len(short_requests)
+        
+        time_span = (now - self.request_history[0]).total_seconds()
+        tps = len(self.request_history) / max(1.0, time_span)
+        
+        status = "正常"
+        if self.warned_until and now < self.warned_until:
+            time_left = (self.warned_until - now).total_seconds()
+            status = f"警告中 ({time_left:.0f}秒)"
+            
+        pattern_score = self.analyze_request_pattern() if len(self.request_history) >= 10 else 0
+        pattern_flag = "是" if self.regular_pattern_flag else "否"
+        
+        stats = (
+            f"站点: {', '.join(self.sites)}, "
+            f"状态: {status}, "
+            f"短期: {short_count}/{self.burst_limit}, "
+            f"TPS: {tps:.2f}/{self.avg_limit}, "
+            f"模式得分: {pattern_score:.2f}, "
+            f"规律模式: {pattern_flag}, "
+            f"警告次数: {self.warning_count}, "
+            f"总请求: {len(self.request_history)}"
+        )
+        return stats
+
 # 脚本说明信息
 def print_usage_info():
-    logging.info("=== Nginx IP封禁监控器 ===")
+    logging.info("=== Nginx 自适应IP封禁监控器 ===")
     logging.info(f"配置文件:")
     logging.info(f"  - HTTP块配置: {HTTP_CONF_FILE} (包含map指令，请放在http块中)")
     logging.info(f"  - Location块配置: {LOCATION_CONF_FILE} (包含if条件，请放在location块中)")
     logging.info(f"监控设置:")
     logging.info(f"  - 使用的IP头: {REAL_IP_HEADER}")
     logging.info(f"  - 监控路径: 包含 {FILTER_PATTERN} 的请求")
-    logging.info(f"  - 封禁阈值: {REQUEST_THRESHOLD}个请求/{TIME_WINDOW}秒")
-    logging.info(f"  - 封禁时长: {BLOCK_DURATION}秒")
+    logging.info(f"  - 短期爆发限制: {BURST_LIMIT}个请求/{SHORT_WINDOW}秒")
+    logging.info(f"  - 长期平均限制: {AVG_LIMIT} TPS (在 {LONG_WINDOW}秒 窗口内)")
+    logging.info(f"  - 警告封禁时长: {WARNING_DURATION}秒")
+    logging.info(f"  - 完全封禁时长: {BLOCK_DURATION}秒")
     logging.info(f"  - Nginx重载冷却时间: {MIN_RELOAD_INTERVAL}秒")
+    logging.info(f"封禁规则:")
+    logging.info(f"  - 短期爆发超限 > {BURST_LIMIT}个请求/{SHORT_WINDOW}秒: 发出警告")
+    logging.info(f"  - 连续3次短期爆发超限: 执行完全封禁")
+    logging.info(f"  - 长期TPS > {AVG_LIMIT}: 执行完全封禁")
+    logging.info(f"  - 规律请求模式 + TPS > {AVG_LIMIT}: 执行完全封禁")
+    logging.info(f"  - 规律请求模式但TPS <= {AVG_LIMIT}: 允许通过")
     if args.debug:
         logging.info(f"调试模式已启用 - 将显示详细的IP请求统计")
     logging.info("=" * 30)
@@ -153,26 +321,38 @@ map ${real_ip_var} $ip_is_banned {{
     default 0;
 """
 
-        # IPv4 地址直接添加到映射
-        ipv4_bans = [ip for ip in ban_dict.keys() if ':' not in ip]
-        for ip in sorted(ipv4_bans):
-            expiry = ban_dict[ip].strftime('%Y-%m-%d %H:%M:%S')
-            http_config += f'    # 封禁到: {expiry}\n'
-            http_config += f'    "{ip}" 1;\n'
-        
-        # IPv6 地址/64子网匹配，作为精确匹配添加到映射
-        ipv6_bans = [ip for ip in ban_dict.keys() if ':' in ip]
-        for ip in sorted(ipv6_bans):
-            expiry = ban_dict[ip].strftime('%Y-%m-%d %H:%M:%S')
-            http_config += f'    # 封禁到: {expiry}\n'
-            
-            # 处理CIDR格式
-            if '/' in ip:
-                # 添加IPv6子网CIDR作为完整匹配，避免正则表达式问题
-                http_config += f'    "{ip}" 1; # IPv6子网\n'
-            else:
+        # 将被完全封禁的IP添加到原始封禁映射中(完全封禁才会出现在ip_is_banned中)
+        for ip, ban_info in ban_dict.items():
+            ban_type = ban_info['type']
+            if ban_type == BAN_TYPE_BLOCK:  # 只有完全封禁才添加到原始映射
+                expiry = ban_info['expiry'].strftime('%Y-%m-%d %H:%M:%S')
+                http_config += f'    # 封禁到: {expiry} - 类型: {ban_type}\n'
                 http_config += f'    "{ip}" 1;\n'
         
+        # 关闭第一个map指令
+        http_config += "}\n\n"
+
+        # 创建一个单独的封禁级别映射（独立的map指令）
+        http_config += f"""# IP封禁级别映射表 - 0=不封禁, 1=警告, 2=完全封禁
+map ${real_ip_var} $ip_ban_level {{
+    default 0;
+"""
+
+        # IPv4 和 IPv6 地址添加到级别映射
+        for ip, ban_info in sorted(ban_dict.items()):
+            expiry = ban_info['expiry'].strftime('%Y-%m-%d %H:%M:%S')
+            ban_type = ban_info['type']
+            ban_level = "1" if ban_type == BAN_TYPE_WARNING else "2"
+            
+            http_config += f'    # 封禁到: {expiry} - 类型: {ban_type}\n'
+            
+            # 处理CIDR格式的IPv6
+            if ':' in ip and '/' in ip:
+                http_config += f'    "{ip}" {ban_level}; # IPv6子网\n'
+            else:
+                http_config += f'    "{ip}" {ban_level};\n'
+        
+        # 关闭级别映射
         http_config += "}\n"
 
         # 组合两个条件：IP头存在且IP被封禁
@@ -181,6 +361,12 @@ map ${real_ip_var} $ip_is_banned {{
 map $has_real_ip $is_banned_ip {
     0       0;  # IP头不存在，强制不封禁
     1       $ip_is_banned;  # IP头存在，使用封禁结果
+}
+
+# 最终封禁级别 - 只有当IP头存在时才返回封禁级别
+map $has_real_ip $ban_level {
+    0       0;  # IP头不存在，强制不封禁
+    1       $ip_ban_level;  # IP头存在，使用封禁级别
 }
 """
 
@@ -191,7 +377,14 @@ map $has_real_ip $is_banned_ip {
 # 总封禁IP数: {len(ban_dict)}
 
 # 应用封禁规则
-if ($is_banned_ip = 1) {{
+if ($ban_level = 2) {{
+    # 完全封禁
+    return 429;
+}}
+
+if ($ban_level = 1) {{
+    # 警告级别封禁 - 429状态码但有不同的响应头
+    add_header X-Rate-Limit-Warning "请减缓请求速率，您已接近封禁阈值" always;
     return 429;
 }}
 """
@@ -227,35 +420,29 @@ def load_ban_list():
                 logging.warning("将重新创建配置文件")
                 return {}
             
-            # 查找所有封禁IP及其过期时间 - 精确匹配的IPv4/IPv6
-            pattern = r'#\s+封禁到:\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+"\s*([0-9a-fA-F:.]+)\s*"\s+1;'
+            # 查找所有封禁IP及其级别 - 使用修复后的格式
+            # 统一格式：封禁时间+类型+IP+级别;
+            pattern = r'#\s+封禁到:\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+-\s+类型:\s+(\w+)\s*\n\s*"([^"]+)"\s+(\d);'
             matches = re.finditer(pattern, content)
             
             for match in matches:
                 expiry_str = match.group(1)
-                ip = match.group(2)
+                ban_type = match.group(2)
+                ip = match.group(3)
+                level = match.group(4)
+                
                 try:
                     expiry = datetime.strptime(expiry_str, "%Y-%m-%d %H:%M:%S")
-                    ban_dict[ip] = expiry
-                    if args.debug:
-                        logging.debug(f"加载已封禁IP: {ip}, 到期时间: {expiry_str}")
-                except:
-                    pass
-            
-            # 查找IPv6子网（CIDR格式）
-            pattern_ipv6_cidr = r'#\s+封禁到:\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+"\s*([0-9a-fA-F:]+/\d+)\s*"\s+1;\s+#\s+IPv6子网'
-            matches = re.finditer(pattern_ipv6_cidr, content)
-            
-            for match in matches:
-                expiry_str = match.group(1)
-                cidr = match.group(2)
-                try:
-                    expiry = datetime.strptime(expiry_str, "%Y-%m-%d %H:%M:%S")
-                    ban_dict[cidr] = expiry
-                    if args.debug:
-                        logging.debug(f"加载已封禁IPv6子网: {cidr}, 到期时间: {expiry_str}")
-                except:
-                    pass
+                    # 检查是否已存在，避免重复添加
+                    if ip not in ban_dict:
+                        ban_dict[ip] = {
+                            'expiry': expiry,
+                            'type': ban_type
+                        }
+                        if args.debug:
+                            logging.debug(f"加载已封禁IP: {ip}, 类型: {ban_type}, 到期时间: {expiry_str}")
+                except Exception as e:
+                    logging.error(f"解析封禁时间出错: {ip}, {e}")
                     
     except FileNotFoundError:
         # 如果文件不存在则创建空的封禁列表
@@ -301,16 +488,18 @@ def update_ban_expiry_times(ban_dict):
     current_time = datetime.now()
     # 更新所有IP的封禁时间，从当前时间开始计算
     for ip in ban_dict:
-        ban_dict[ip] = current_time + timedelta(seconds=BLOCK_DURATION)
+        ban_type = ban_dict[ip]['type']
+        duration = WARNING_DURATION if ban_type == BAN_TYPE_WARNING else BLOCK_DURATION
+        ban_dict[ip]['expiry'] = current_time + timedelta(seconds=duration)
         if args.debug:
-            logging.debug(f"更新IP {ip} 的封禁过期时间: {ban_dict[ip].strftime('%Y-%m-%d %H:%M:%S')}")
+            logging.debug(f"更新IP {ip} 的封禁过期时间: {ban_dict[ip]['expiry'].strftime('%Y-%m-%d %H:%M:%S')}")
     return ban_dict
 
 # 清理过期的IP封禁
 def clean_expired_bans(ban_dict, last_reload_time):
     global pending_ban_updates
     current_time = datetime.now()
-    expired_ips = [ip for ip, expiry in ban_dict.items() if expiry <= current_time]
+    expired_ips = [ip for ip, ban_info in ban_dict.items() if ban_info['expiry'] <= current_time]
     if expired_ips:
         for ip in expired_ips:
             logging.info(f"移除已过期的IP封禁: {ip}")
@@ -321,41 +510,40 @@ def clean_expired_bans(ban_dict, last_reload_time):
     return last_reload_time
 
 # 打印当前IP统计信息（调试模式）
-def print_ip_stats(request_records):
+def print_ip_stats(rate_limiters):
     if not args.debug:
         return
     
-    # 检查是否有活跃站点
-    if not request_records:
+    # 检查是否有活跃IP
+    if not rate_limiters:
         return
     
     current_time = datetime.now()
-    logging.debug("----------当前站点IP请求统计（%d秒内）----------" % TIME_WINDOW)
+    logging.debug("----------当前活跃IP统计----------")
     
-    # 按站点分别打印IP统计
-    for site, ips in sorted(request_records.items()):
-        # 跳过没有活跃IP的站点
-        if not ips:
-            continue
-            
-        logging.debug(f"\n站点: {site}")
-        
-        # 对当前站点的IP按请求数排序
-        sorted_ips = sorted(ips.items(), key=lambda x: len(x[1]), reverse=True)
-        for ip, timestamps in sorted_ips:
-            # 过滤最近时间窗口内的请求
-            recent = [t for t in timestamps if (current_time - t).total_seconds() <= TIME_WINDOW]
-            if recent:
-                logging.debug(f"  IP: {ip} - 请求数: {len(recent)} - 阈值: {REQUEST_THRESHOLD}")
+    # 按IP请求数排序
+    sorted_ips = sorted(rate_limiters.items(), 
+                        key=lambda x: len(x[1].request_history) if x[1].request_history else 0, 
+                        reverse=True)
     
-    logging.debug("----------------------------------------")
+    # 只显示前20个最活跃的IP
+    for ip, limiter in sorted_ips[:20]:
+        stats = limiter.get_stats()
+        logging.debug(f"IP: {ip} - {stats}")
+    
+    # 统计规律模式但未封禁的IP数量
+    regular_pattern_count = sum(1 for _, limiter in rate_limiters.items() if limiter.regular_pattern_flag)
+    if regular_pattern_count > 0:
+        logging.debug(f"检测到 {regular_pattern_count} 个具有规律模式但TPS在限制内的IP（可能是良好爬虫）")
+    
+    logging.debug("-----------------------------------")
 
 # 主监控函数
 def monitor_logs():
     global pending_reload, pending_reload_time, pending_ban_updates
     
-    # 按站点分别存储每个IP的请求时间戳: site -> ip -> [timestamps]
-    request_records = defaultdict(lambda: defaultdict(list))
+    # 存储每个IP的速率限制器
+    rate_limiters = {}
     changes_made = False
     
     # 加载现有封禁列表
@@ -381,12 +569,15 @@ def monitor_logs():
         "total_requests": 0,
         "filtered_requests": 0,
         "banned_ips": 0,
+        "warned_ips": 0,
+        "regular_pattern_ips": 0,
         "start_time": datetime.now()
     }
     
     logging.info(f"开始监控日志文件，过滤模式: {FILTER_PATTERN}, 使用IP头: {REAL_IP_HEADER}")
-    logging.info(f"封禁阈值: {REQUEST_THRESHOLD}个请求/{TIME_WINDOW}秒, 封禁时长: {BLOCK_DURATION}秒")
+    logging.info(f"短期爆发限制: {BURST_LIMIT}个请求/{SHORT_WINDOW}秒, 长期平均限制: {AVG_LIMIT} TPS")
     logging.info(f"监控 {len(site_names)} 个站点: {', '.join(set(site_names.values()))}")
+    logging.info(f"规律模式爬虫处理策略: 只要TPS不超过{AVG_LIMIT}，即使是规律性请求也允许通过")
     if args.debug:
         logging.debug(f"调试模式已启用 - 将显示详细的IP请求统计")
     
@@ -493,46 +684,44 @@ def monitor_logs():
                                 logging.debug(f"跳过已封禁的IP: {ip_key}")
                             continue
                         
-                        # 记录请求时间（按站点分别记录）
-                        request_records[site][ip_key].append(log_time)
+                        # 为该IP创建或获取速率限制器
+                        if ip_key not in rate_limiters:
+                            rate_limiters[ip_key] = AdaptiveRateLimiter(ip_key)
                         
-                        if args.debug:
-                            count_before = len(request_records[site][ip_key])
+                        # 记录请求
+                        rate_limiters[ip_key].add_request(log_time, site)
                         
-                        # 移除时间窗口外的记录
+                        # 评估IP行为
                         current_time_dt = datetime.now()
-                        request_records[site][ip_key] = [
-                            t for t in request_records[site][ip_key] 
-                            if (current_time_dt - t).total_seconds() <= TIME_WINDOW
-                        ]
+                        action = rate_limiters[ip_key].evaluate(current_time_dt)
                         
-                        if args.debug:
-                            count_after = len(request_records[site][ip_key])
-                            if count_before != count_after:
-                                logging.debug(f"站点 {site} - IP {ip_key} 请求计数清理: {count_before} -> {count_after} (移除过期记录)")
+                        # 更新规律模式IP统计
+                        if rate_limiters[ip_key].regular_pattern_flag:
+                            stats["regular_pattern_ips"] += 1
                         
-                        # 检查IP在单个站点是否超过阈值
-                        if len(request_records[site][ip_key]) > REQUEST_THRESHOLD:
-                            # 添加到封禁列表 - 临时设置过期时间，真正重载时会调整
-                            # 临时设置成功只是为了日志显示和内部判断
-                            expiry = current_time_dt + timedelta(seconds=BLOCK_DURATION)
-                            ban_dict[ip_key] = expiry
-                            stats["banned_ips"] += 1
-                            logging.warning(
-                                f"封禁 {ip_key} 直到 {expiry.strftime('%Y-%m-%d %H:%M:%S')} - "
-                                f"站点 {site} 上有 {len(request_records[site][ip_key])} 个请求在 {TIME_WINDOW} 秒内"
-                            )
-                            changes_made = True
-                            pending_ban_updates = True  # 标记有待更新的封禁时间
+                        # 根据评估结果采取行动
+                        if action != "allow":
+                            # 确定封禁类型和持续时间
+                            if action == "warning":
+                                ban_type = BAN_TYPE_WARNING
+                                duration = WARNING_DURATION
+                                stats["warned_ips"] += 1
+                                logging.warning(f"警告IP {ip_key} - 请求过于频繁 (持续{duration}秒)")
+                            else:  # action == "block"
+                                ban_type = BAN_TYPE_BLOCK
+                                duration = BLOCK_DURATION
+                                stats["banned_ips"] += 1
+                                logging.warning(f"封禁IP {ip_key} - 疑似高频爬虫 (持续{duration}秒)")
                             
-                            # 清除此IP的计数（所有站点）
-                            for s in request_records:
-                                if ip_key in request_records[s]:
-                                    request_records[s][ip_key] = []
-                        elif args.debug:
-                            current_count = len(request_records[site][ip_key])
-                            if current_count > 0 and current_count % 5 == 0:  # 每增加5个请求打印一次
-                                logging.debug(f"站点 {site} - IP {ip_key} 当前请求数: {current_count}/{REQUEST_THRESHOLD}")
+                            # 添加到封禁列表
+                            expiry = current_time_dt + timedelta(seconds=duration)
+                            ban_dict[ip_key] = {
+                                'expiry': expiry,
+                                'type': ban_type
+                            }
+                            
+                            changes_made = True
+                            pending_ban_updates = True
             
             # 如果没有文件变化，等待一会儿
             if not changes_in_files:
@@ -544,20 +733,19 @@ def monitor_logs():
                     last_reload_time = reload_nginx(last_reload_time)
                     changes_made = False
             
-            # 清理内存中的旧记录
+            # 清理内存中的不活跃IP记录
             current_time_dt = datetime.now()
-            for site in list(request_records.keys()):
-                for ip in list(request_records[site].keys()):
-                    old_count = len(request_records[site][ip])
-                    request_records[site][ip] = [t for t in request_records[site][ip] 
-                                      if (current_time_dt - t).total_seconds() <= TIME_WINDOW]
-                    if not request_records[site][ip]:
-                        if args.debug and old_count > 0:
-                            logging.debug(f"从记录中移除不活跃的IP: 站点 {site} - IP {ip}")
-                        del request_records[site][ip]
-                # 如果站点没有活跃IP，删除站点记录
-                if not request_records[site]:
-                    del request_records[site]
+            inactive_cutoff = current_time_dt - timedelta(seconds=LONG_WINDOW * 2)
+            inactive_ips = []
+            
+            for ip, limiter in rate_limiters.items():
+                if not limiter.request_history or limiter.request_history[-1] < inactive_cutoff:
+                    inactive_ips.append(ip)
+            
+            for ip in inactive_ips:
+                if args.debug:
+                    logging.debug(f"从内存中移除不活跃的IP: {ip}")
+                del rate_limiters[ip]
             
             # 定期检查过期封禁并打印统计信息
             current_time = time.time()
@@ -568,16 +756,18 @@ def monitor_logs():
                 # 调试模式下定期打印统计信息
                 if args.debug:
                     runtime = (datetime.now() - stats["start_time"]).total_seconds() / 60
-                    # 计算当前活跃IP总数
-                    active_ips_count = sum(len(ips) for ips in request_records.values())
+                    
+                    # 更新规律模式IP计数
+                    regular_pattern_count = sum(1 for _, limiter in rate_limiters.items() if limiter.regular_pattern_flag)
                     
                     logging.debug("----- 运行统计 -----")
                     logging.debug(f"运行时间: {runtime:.1f} 分钟")
                     logging.debug(f"总请求数: {stats['total_requests']}")
                     logging.debug(f"过滤的请求数: {stats['filtered_requests']}")
+                    logging.debug(f"警告的IP数: {stats['warned_ips']}")
                     logging.debug(f"封禁的IP数: {stats['banned_ips']}")
-                    logging.debug(f"当前活跃站点数: {len(request_records)}")
-                    logging.debug(f"当前活跃IP数: {active_ips_count}")
+                    logging.debug(f"规律模式但允许的IP数: {regular_pattern_count}")
+                    logging.debug(f"当前监控的IP数: {len(rate_limiters)}")
                     logging.debug(f"当前封禁IP数: {len(ban_dict)}")
                     logging.debug(f"是否有待执行的重载: {pending_reload}")
                     if pending_reload:
@@ -590,13 +780,13 @@ def monitor_logs():
             
             # 调试模式下定期打印IP统计
             if args.debug and current_time - last_stats_time >= 5:  # 每5秒打印一次统计
-                print_ip_stats(request_records)
+                print_ip_stats(rate_limiters)
                 last_stats_time = current_time
                 
     except KeyboardInterrupt:
         logging.info("脚本被用户终止")
         if args.debug:
-            print_ip_stats(request_records)
+            print_ip_stats(rate_limiters)
 
 # 处理终止信号
 def signal_handler(sig, frame):

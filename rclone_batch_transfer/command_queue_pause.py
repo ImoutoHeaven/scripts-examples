@@ -5,6 +5,9 @@ import sys
 import time
 import threading
 import queue
+import os
+import signal
+import platform
 
 # Global state for pause/resume functionality
 execution_paused = False
@@ -72,27 +75,57 @@ def execute_command(cmd, total_retries):
         user_terminated = False  # Reset the user termination flag
         
         try:
+            # Configure process creation based on platform
+            popen_kwargs = {
+                'shell': True,
+                'stdout': subprocess.PIPE,
+                'stderr': subprocess.STDOUT,
+                'bufsize': 1,  # Line buffered
+            }
+            
+            # On Unix-like systems, create a new process group
+            if platform.system() != "Windows":
+                popen_kwargs['preexec_fn'] = os.setsid
+            
             # Use subprocess.Popen to capture output in real-time
-            current_process = subprocess.Popen(
-                cmd,
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                bufsize=1,  # Line buffered
-            )
+            current_process = subprocess.Popen(cmd, **popen_kwargs)
+            
+            # Store the process ID for later termination
+            process_id = current_process.pid
             
             # Print output in real-time with unicode error handling
             while True:
                 # Check for pause command
                 if execution_paused:
-                    print("\n[Command terminated due to pause]")
+                    print("\n[Command and all child processes terminated due to pause]")
+                    
                     if current_process:
                         try:
-                            # Kill the process
-                            current_process.terminate()
-                            time.sleep(0.5)
-                            if current_process.poll() is None:  # If still running
-                                current_process.kill()  # Force kill
+                            # Kill the entire process group on Unix-like systems
+                            if platform.system() != "Windows":
+                                # Send SIGTERM to the process group
+                                pgid = os.getpgid(process_id)
+                                os.killpg(pgid, signal.SIGTERM)
+                                time.sleep(0.5)
+                                
+                                # If processes still exist, force kill
+                                try:
+                                    os.killpg(pgid, 0)  # Check if processes exist
+                                    os.killpg(pgid, signal.SIGKILL)  # Force kill if they do
+                                except OSError:
+                                    pass  # Process group already terminated
+                            else:
+                                # On Windows, we can only terminate the main process
+                                # We'll use taskkill to try killing child processes
+                                current_process.terminate()
+                                time.sleep(0.5)
+                                if current_process.poll() is None:
+                                    current_process.kill()
+                                    # Additionally try to kill child processes on Windows
+                                    subprocess.call(f'taskkill /F /T /PID {process_id}', 
+                                                    shell=True, 
+                                                    stdout=subprocess.DEVNULL, 
+                                                    stderr=subprocess.DEVNULL)
                         except Exception as e:
                             print(f"Error terminating process: {e}")
                     

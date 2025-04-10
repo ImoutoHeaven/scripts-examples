@@ -1,0 +1,24 @@
+[Unit]
+Description=Nginx IP Rate Limiting Monitor
+After=network.target nginx.service
+Requires=nginx.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /home/nginx-deny.py --ip-header=CF-CONNECTING-IP-WORKERS
+Restart=on-failure
+RestartSec=10s
+# 环境设置
+Environment=PYTHONUNBUFFERED=1
+# 资源限制
+CPUQuota=20%
+MemoryLimit=200M
+
+# 日志配置
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

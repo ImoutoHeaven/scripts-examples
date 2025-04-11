@@ -27,6 +27,7 @@ parser.add_argument('--block-duration', type=int, default=1200, help='封禁持�
 parser.add_argument('--warning-duration', type=int, default=120, help='警告封禁持续时间（秒）')
 parser.add_argument('--http-conf', default='/etc/nginx/limit-http.conf', help='HTTP块封禁配置文件路径')
 parser.add_argument('--location-conf', default='/etc/nginx/limit-location.conf', help='Location块封禁配置文件路径')
+parser.add_argument('--stats-interval', type=int, default=60, help='统计信息输出间隔（秒）')
 args = parser.parse_args()
 
 # 配置参数
@@ -43,6 +44,7 @@ CHECK_INTERVAL = 5  # 检查过期封禁的间隔（秒）
 FILTER_PATTERN = args.filter  # 只监控包含此模式的请求
 MIN_RELOAD_INTERVAL = 300  # 最小重载Nginx间隔（秒）
 REAL_IP_HEADER = args.ip_header  # 真实IP的HTTP头
+STATS_INTERVAL = args.stats_interval  # 统计信息输出间隔（秒）
 
 # 封禁类型
 BAN_TYPE_WARNING = "warning"  # 警告级别封禁
@@ -52,6 +54,18 @@ BAN_TYPE_BLOCK = "block"  # 完全封禁
 pending_reload = False  # 是否有待执行的重载
 pending_reload_time = 0  # 预计执行重载的时间
 pending_ban_updates = False  # 标记是否有待更新的封禁
+
+# 新增: 封禁统计相关变量
+ban_statistics = {}  # 用于跟踪已封禁IP的响应统计
+global_statistics = {
+    "total_200_after_ban": 0,   # 封禁后返回200状态码的总次数
+    "total_429_after_ban": 0,   # 封禁后返回429状态码的总次数
+    "reload_count": 0,          # Nginx重载次数
+    "total_warnings": 0,        # 总警告次数
+    "total_blocks": 0,          # 总完全封禁次数
+    "failed_blocks": 0,         # 失败的封禁次数 (有200响应)
+    "effective_blocks": 0       # 有效的封禁次数 (只有429响应)
+}
 
 # 配置日志
 if args.debug:
@@ -217,6 +231,55 @@ class AdaptiveRateLimiter:
         )
         return stats
 
+# 新增: 封禁IP统计跟踪类
+class BanStatistics:
+    def __init__(self, ip, ban_type, expiry):
+        self.ip = ip
+        self.ban_type = ban_type
+        self.expiry = expiry
+        self.first_seen = datetime.now()
+        self.last_seen = datetime.now()
+        self.status_200_count = 0  # 成功状态计数（封禁失效）
+        self.status_429_count = 0  # 限流状态计数（封禁有效）
+        self.other_status_count = 0  # 其他状态码计数
+        self.total_requests = 0  # 封禁期间的总请求数
+    
+    def update(self, status_code, timestamp=None):
+        """更新状态码统计"""
+        if timestamp is None:
+            timestamp = datetime.now()
+        
+        self.last_seen = timestamp
+        self.total_requests += 1
+        
+        if status_code == 200:
+            self.status_200_count += 1
+        elif status_code == 429:
+            self.status_429_count += 1
+        else:
+            self.other_status_count += 1
+    
+    def get_stats(self):
+        """获取统计信息摘要"""
+        effectiveness = "有效" if self.status_200_count == 0 and self.status_429_count > 0 else \
+                        "部分有效" if self.status_200_count > 0 and self.status_429_count > 0 else \
+                        "无效" if self.status_200_count > 0 and self.status_429_count == 0 else "未知"
+        
+        duration = (self.last_seen - self.first_seen).total_seconds()
+        remaining = (self.expiry - datetime.now()).total_seconds()
+        
+        return {
+            "ip": self.ip,
+            "ban_type": self.ban_type,
+            "effectiveness": effectiveness,
+            "status_200": self.status_200_count,
+            "status_429": self.status_429_count,
+            "other_status": self.other_status_count,
+            "total_requests": self.total_requests,
+            "duration_seconds": duration,
+            "remaining_seconds": max(0, remaining)
+        }
+
 # 脚本说明信息
 def print_usage_info():
     logging.info("=== Nginx 自适应IP封禁监控器 ===")
@@ -231,12 +294,17 @@ def print_usage_info():
     logging.info(f"  - 警告封禁时长: {WARNING_DURATION}秒")
     logging.info(f"  - 完全封禁时长: {BLOCK_DURATION}秒")
     logging.info(f"  - Nginx重载冷却时间: {MIN_RELOAD_INTERVAL}秒")
+    logging.info(f"  - 统计信息输出间隔: {STATS_INTERVAL}秒")
     logging.info(f"封禁规则:")
     logging.info(f"  - 短期爆发超限 > {BURST_LIMIT}个请求/{SHORT_WINDOW}秒: 发出警告")
     logging.info(f"  - 连续3次短期爆发超限: 执行完全封禁")
     logging.info(f"  - 长期TPS > {AVG_LIMIT}: 执行完全封禁")
     logging.info(f"  - 规律请求模式 + TPS > {AVG_LIMIT}: 执行完全封禁")
     logging.info(f"  - 规律请求模式但TPS <= {AVG_LIMIT}: 允许通过")
+    logging.info(f"统计功能:")
+    logging.info(f"  - 追踪已封禁IP的状态码统计 (200/429)")
+    logging.info(f"  - IPv4按/32精度统计，IPv6按/64子网统计")
+    logging.info(f"  - 定期输出封禁有效性报告")
     if args.debug:
         logging.info(f"调试模式已启用 - 将显示详细的IP请求统计")
     logging.info("=" * 30)
@@ -439,6 +507,10 @@ def load_ban_list():
                             'expiry': expiry,
                             'type': ban_type
                         }
+                        
+                        # 初始化统计对象
+                        ban_statistics[ip] = BanStatistics(ip, ban_type, expiry)
+                        
                         if args.debug:
                             logging.debug(f"加载已封禁IP: {ip}, 类型: {ban_type}, 到期时间: {expiry_str}")
                 except Exception as e:
@@ -453,7 +525,7 @@ def load_ban_list():
 
 # 重新加载Nginx配置
 def reload_nginx(last_reload_time):
-    global pending_reload, pending_reload_time, pending_ban_updates
+    global pending_reload, pending_reload_time, pending_ban_updates, global_statistics
     current_time = time.time()
     
     # 检查是否符合最小重载间隔
@@ -474,7 +546,12 @@ def reload_nginx(last_reload_time):
         
         # 重载配置
         subprocess.run(["systemctl", "reload", "nginx"], check=True)
-        logging.info("Nginx配置已重新加载")
+        global_statistics["reload_count"] += 1
+        logging.info(f"Nginx配置已重新加载 (总重载次数: {global_statistics['reload_count']})")
+        
+        # 更新全局重载时间
+        last_reload_timestamp = datetime.now()
+        
         # 重置待重载标志
         pending_reload = False
         pending_ban_updates = False
@@ -491,6 +568,11 @@ def update_ban_expiry_times(ban_dict):
         ban_type = ban_dict[ip]['type']
         duration = WARNING_DURATION if ban_type == BAN_TYPE_WARNING else BLOCK_DURATION
         ban_dict[ip]['expiry'] = current_time + timedelta(seconds=duration)
+        
+        # 同时更新统计对象中的过期时间
+        if ip in ban_statistics:
+            ban_statistics[ip].expiry = ban_dict[ip]['expiry']
+            
         if args.debug:
             logging.debug(f"更新IP {ip} 的封禁过期时间: {ban_dict[ip]['expiry'].strftime('%Y-%m-%d %H:%M:%S')}")
     return ban_dict
@@ -501,13 +583,99 @@ def clean_expired_bans(ban_dict, last_reload_time):
     current_time = datetime.now()
     expired_ips = [ip for ip, ban_info in ban_dict.items() if ban_info['expiry'] <= current_time]
     if expired_ips:
+        # 在移除前记录和输出过期IP的统计信息
         for ip in expired_ips:
+            if ip in ban_statistics:
+                stats = ban_statistics[ip].get_stats()
+                logging.info(f"封禁过期统计 - IP: {ip}, 类型: {stats['ban_type']}, "
+                            f"有效性: {stats['effectiveness']}, "
+                            f"429次数: {stats['status_429']}, 200次数: {stats['status_200']}, "
+                            f"总请求: {stats['total_requests']}")
+                del ban_statistics[ip]
             logging.info(f"移除已过期的IP封禁: {ip}")
             del ban_dict[ip]
         if save_ban_list(ban_dict):
             pending_ban_updates = True
             return reload_nginx(last_reload_time)
     return last_reload_time
+
+# 新增：更新封禁IP的响应统计
+def update_ban_response_stats(ip, status_code, timestamp=None):
+    """更新已封禁IP的响应状态码统计"""
+    global global_statistics
+    
+    # 标准化IPv6地址为子网
+    if ':' in ip:  # IPv6地址
+        ip = ipv6_to_subnet(ip)
+    
+    if ip in ban_statistics:
+        ban_statistics[ip].update(status_code, timestamp)
+        
+        # 更新全局统计
+        if status_code == 200:
+            global_statistics["total_200_after_ban"] += 1
+        elif status_code == 429:
+            global_statistics["total_429_after_ban"] += 1
+        
+        # 记录特别的事件 - 封禁后出现200响应
+        if status_code == 200:
+            logging.warning(f"检测到封禁失效! IP {ip} 在封禁期间收到200响应")
+            return True  # 标记发现了封禁失效情况
+    return False
+
+# 新增：打印封禁统计信息
+def print_ban_stats():
+    """输出当前所有封禁IP的统计信息"""
+    if not ban_statistics:
+        logging.info("当前没有活跃的IP封禁")
+        return
+    
+    # 计算有效和无效的封禁数量
+    effective_bans = 0
+    ineffective_bans = 0
+    partial_bans = 0
+    warning_bans = 0
+    block_bans = 0
+    
+    for ip, stats_obj in ban_statistics.items():
+        stats = stats_obj.get_stats()
+        if stats["effectiveness"] == "有效":
+            effective_bans += 1
+        elif stats["effectiveness"] == "无效":
+            ineffective_bans += 1
+        elif stats["effectiveness"] == "部分有效":
+            partial_bans += 1
+            
+        if stats["ban_type"] == BAN_TYPE_WARNING:
+            warning_bans += 1
+        elif stats["ban_type"] == BAN_TYPE_BLOCK:
+            block_bans += 1
+    
+    total_bans = len(ban_statistics)
+    
+    # 更新全局统计
+    global_statistics["effective_blocks"] = effective_bans
+    global_statistics["failed_blocks"] = ineffective_bans + partial_bans
+    
+    logging.info(f"=== IP封禁统计 (总数: {total_bans}) ===")
+    logging.info(f"- 完全有效封禁: {effective_bans} ({effective_bans/total_bans*100:.1f}%)")
+    logging.info(f"- 部分有效封禁: {partial_bans} ({partial_bans/total_bans*100:.1f}%)")
+    logging.info(f"- 无效封禁: {ineffective_bans} ({ineffective_bans/total_bans*100:.1f}%)")
+    logging.info(f"- 警告级别: {warning_bans}, 完全封禁: {block_bans}")
+    logging.info(f"- 总计封禁后200响应: {global_statistics['total_200_after_ban']}")
+    logging.info(f"- 总计封禁后429响应: {global_statistics['total_429_after_ban']}")
+    
+    # 如果有无效或部分有效的封禁，列出详情
+    if ineffective_bans > 0 or partial_bans > 0:
+        logging.info("=== 问题封禁详情 ===")
+        for ip, stats_obj in ban_statistics.items():
+            stats = stats_obj.get_stats()
+            if stats["effectiveness"] in ["无效", "部分有效"]:
+                logging.info(f"IP: {ip}, 类型: {stats['ban_type']}, "
+                            f"状态码 - 200: {stats['status_200']}, 429: {stats['status_429']}, "
+                            f"剩余时间: {stats['remaining_seconds']:.0f}秒")
+    
+    logging.info("=" * 30)
 
 # 打印当前IP统计信息（调试模式）
 def print_ip_stats(rate_limiters):
@@ -538,9 +706,31 @@ def print_ip_stats(rate_limiters):
     
     logging.debug("-----------------------------------")
 
+# 新增：打印全局运行统计信息
+def print_global_stats(stats):
+    """打印全局统计信息摘要"""
+    runtime = (datetime.now() - stats["start_time"]).total_seconds() / 60
+    logging.info(f"=== 全局运行统计 (运行时间: {runtime:.1f}分钟) ===")
+    logging.info(f"- 总请求数: {stats['total_requests']}")
+    logging.info(f"- 过滤的请求数: {stats['filtered_requests']}")
+    logging.info(f"- 总警告次数: {stats['total_warnings']}")
+    logging.info(f"- 总封禁次数: {stats['total_blocks']}")
+    logging.info(f"- Nginx重载次数: {stats['reload_count']}")
+    logging.info(f"- 当前封禁统计: 有效 {global_statistics['effective_blocks']}, "
+                f"失效 {global_statistics['failed_blocks']}")
+    logging.info(f"- 封禁效果: 429响应 {global_statistics['total_429_after_ban']}, "
+                f"200响应 {global_statistics['total_200_after_ban']}")
+    
+    # 计算封禁有效率
+    if stats['total_blocks'] > 0:
+        effective_rate = global_statistics['effective_blocks'] / stats['total_blocks'] * 100
+        logging.info(f"- 封禁有效率: {effective_rate:.1f}%")
+    
+    logging.info("=" * 30)
+
 # 主监控函数
 def monitor_logs():
-    global pending_reload, pending_reload_time, pending_ban_updates
+    global pending_reload, pending_reload_time, pending_ban_updates, global_statistics
     
     # 存储每个IP的速率限制器
     rate_limiters = {}
@@ -558,6 +748,9 @@ def monitor_logs():
     # 上次输出调试统计的时间（调试模式下）
     last_stats_time = time.time()
     
+    # 上次输出封禁统计的时间
+    last_ban_stats_time = time.time()
+    
     # 获取所有日志文件
     log_files = get_log_files(LOG_DIR)
     
@@ -571,6 +764,8 @@ def monitor_logs():
         "banned_ips": 0,
         "warned_ips": 0,
         "regular_pattern_ips": 0,
+        "total_warnings": 0,  # 新增：总警告次数
+        "total_blocks": 0,    # 新增：总封禁次数
         "start_time": datetime.now()
     }
     
@@ -578,6 +773,7 @@ def monitor_logs():
     logging.info(f"短期爆发限制: {BURST_LIMIT}个请求/{SHORT_WINDOW}秒, 长期平均限制: {AVG_LIMIT} TPS")
     logging.info(f"监控 {len(site_names)} 个站点: {', '.join(set(site_names.values()))}")
     logging.info(f"规律模式爬虫处理策略: 只要TPS不超过{AVG_LIMIT}，即使是规律性请求也允许通过")
+    logging.info(f"封禁统计功能已启用，将跟踪封禁IP的200/429响应数")
     if args.debug:
         logging.debug(f"调试模式已启用 - 将显示详细的IP请求统计")
     
@@ -652,13 +848,7 @@ def monitor_logs():
                 for line in new_lines:
                     stats["total_requests"] += 1
                     
-                    # 跳过不匹配过滤模式的请求
-                    if FILTER_PATTERN not in line:
-                        continue
-                    
-                    stats["filtered_requests"] += 1
-                    
-                    # 解析日志条目
+                    # 解析日志条目，即使不匹配过滤模式也需要记录状态码
                     match = re.match(LOG_PATTERN, line)
                     if match:
                         ip_str, time_str, request, status, size, referrer, user_agent = match.groups()
@@ -675,13 +865,35 @@ def monitor_logs():
                         ip_key = ip_str
                         if ':' in ip_str:  # IPv6
                             ip_key = ipv6_to_subnet(ip_str)
-                            if args.debug and ip_key != ip_str:
-                                logging.debug(f"IPv6地址 {ip_str} 转换为子网 {ip_key}")
                         
-                        # 跳过已封禁的IP
+                        # 检查是否为已封禁IP的响应
+                        try:
+                            status_code = int(status)
+                            # 对所有封禁过的IP进行响应跟踪
+                            if ip_key in ban_dict:
+                                ban_failure = update_ban_response_stats(ip_key, status_code, log_time)
+                                # 如果发现封禁失效（200响应），尝试立即重载Nginx
+                                if ban_failure and not pending_reload:
+                                    logging.warning(f"检测到封禁失效，尝试重新加载Nginx配置")
+                                    # 只有在允许的情况下才重载
+                                    if current_time - last_reload_time >= MIN_RELOAD_INTERVAL:
+                                        last_reload_time = reload_nginx(last_reload_time)
+                        except ValueError:
+                            # 状态码不是数字，忽略
+                            pass
+                    
+                    # 跳过不匹配过滤模式的请求
+                    if FILTER_PATTERN not in line:
+                        continue
+                    
+                    stats["filtered_requests"] += 1
+                    
+                    # 完整解析匹配过滤模式的日志条目
+                    if match:                        
+                        # 跳过已封禁的IP的过滤请求（仅限计数，而不进行评估）
                         if ip_key in ban_dict:
                             if args.debug:
-                                logging.debug(f"跳过已封禁的IP: {ip_key}")
+                                logging.debug(f"跳过已封禁的IP过滤请求: {ip_key}")
                             continue
                         
                         # 为该IP创建或获取速率限制器
@@ -706,11 +918,15 @@ def monitor_logs():
                                 ban_type = BAN_TYPE_WARNING
                                 duration = WARNING_DURATION
                                 stats["warned_ips"] += 1
+                                stats["total_warnings"] += 1
+                                global_statistics["total_warnings"] = stats["total_warnings"]
                                 logging.warning(f"警告IP {ip_key} - 请求过于频繁 (持续{duration}秒)")
                             else:  # action == "block"
                                 ban_type = BAN_TYPE_BLOCK
                                 duration = BLOCK_DURATION
                                 stats["banned_ips"] += 1
+                                stats["total_blocks"] += 1
+                                global_statistics["total_blocks"] = stats["total_blocks"]
                                 logging.warning(f"封禁IP {ip_key} - 疑似高频爬虫 (持续{duration}秒)")
                             
                             # 添加到封禁列表
@@ -719,6 +935,9 @@ def monitor_logs():
                                 'expiry': expiry,
                                 'type': ban_type
                             }
+                            
+                            # 创建新的统计对象
+                            ban_statistics[ip_key] = BanStatistics(ip_key, ban_type, expiry)
                             
                             changes_made = True
                             pending_ban_updates = True
@@ -778,6 +997,12 @@ def monitor_logs():
                     # 重置统计时间
                     last_stats_time = current_time
             
+            # 定期输出封禁统计信息
+            if current_time - last_ban_stats_time >= STATS_INTERVAL:
+                print_ban_stats()
+                print_global_stats(stats)
+                last_ban_stats_time = current_time
+            
             # 调试模式下定期打印IP统计
             if args.debug and current_time - last_stats_time >= 5:  # 每5秒打印一次统计
                 print_ip_stats(rate_limiters)
@@ -785,6 +1010,9 @@ def monitor_logs():
                 
     except KeyboardInterrupt:
         logging.info("脚本被用户终止")
+        # 在终止前输出最终统计
+        print_ban_stats()
+        print_global_stats(stats)
         if args.debug:
             print_ip_stats(rate_limiters)
 

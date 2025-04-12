@@ -44,6 +44,9 @@ FILTER_PATTERN = args.filter  # 只监控包含此模式的请求
 MIN_RELOAD_INTERVAL = 300  # 最小重载Nginx间隔（秒）
 REAL_IP_HEADER = args.ip_header  # 真实IP的HTTP头
 
+# 内部网络CIDR - 添加Tailscale内网IP范围
+INTERNAL_NETWORKS = ['100.64.0.0/24']  # Tailscale内网IP范围
+
 # 封禁类型
 BAN_TYPE_WARNING = "warning"  # 警告级别封禁
 BAN_TYPE_BLOCK = "block"  # 完全封禁
@@ -67,6 +70,17 @@ logging.basicConfig(
 
 # Nginx日志解析正则表达式
 LOG_PATTERN = r'^(\d+\.\d+\.\d+\.\d+|[0-9a-fA-F:]+) - - \[([^\]]+)\] "([^"]*)" ([^ ]+) (\d+) "([^"]*)" "([^"]*)"'
+
+# 新增: 检查IP是否在内部网络
+def is_internal_ip(ip_str):
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        for network_cidr in INTERNAL_NETWORKS:
+            if ip in ipaddress.ip_network(network_cidr):
+                return True
+        return False
+    except:
+        return False
 
 # 自适应速率限制器
 class AdaptiveRateLimiter:
@@ -231,6 +245,9 @@ def print_usage_info():
     logging.info(f"  - 警告封禁时长: {WARNING_DURATION}秒")
     logging.info(f"  - 完全封禁时长: {BLOCK_DURATION}秒")
     logging.info(f"  - Nginx重载冷却时间: {MIN_RELOAD_INTERVAL}秒")
+    logging.info(f"内部网络豁免:")
+    for network in INTERNAL_NETWORKS:
+        logging.info(f"  - {network} (不进行监控与封禁)")
     logging.info(f"封禁规则:")
     logging.info(f"  - 短期爆发超限 > {BURST_LIMIT}个请求/{SHORT_WINDOW}秒: 发出警告")
     logging.info(f"  - 连续3次短期爆发超限: 执行完全封禁")
@@ -303,24 +320,20 @@ def save_ban_list(ban_dict):
     try:
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         real_ip_var = header_to_nginx_var(REAL_IP_HEADER)
-
         # 1. 创建HTTP块配置文件（使用map指令）
         http_config = f"""# 自动生成的IP封禁配置（HTTP块） - 请勿手动编辑
 # 最后更新: {current_time}
 # 使用的真实IP头: {REAL_IP_HEADER} (变量: ${real_ip_var})
 # 总封禁IP数: {len(ban_dict)}
-
 # 检查IP头是否存在
 map ${real_ip_var} $has_real_ip {{
     ""      0;  # 头不存在，跳过封禁检查
     default 1;  # 头存在，进行封禁检查
 }}
-
 # IP封禁映射表 - 仅当$has_real_ip=1时有效
 map ${real_ip_var} $ip_is_banned {{
     default 0;
 """
-
         # 将被完全封禁的IP添加到原始封禁映射中(完全封禁才会出现在ip_is_banned中)
         for ip, ban_info in ban_dict.items():
             ban_type = ban_info['type']
@@ -331,13 +344,11 @@ map ${real_ip_var} $ip_is_banned {{
         
         # 关闭第一个map指令
         http_config += "}\n\n"
-
         # 创建一个单独的封禁级别映射（独立的map指令）
         http_config += f"""# IP封禁级别映射表 - 0=不封禁, 1=警告, 2=完全封禁
 map ${real_ip_var} $ip_ban_level {{
     default 0;
 """
-
         # IPv4 和 IPv6 地址添加到级别映射
         for ip, ban_info in sorted(ban_dict.items()):
             expiry = ban_info['expiry'].strftime('%Y-%m-%d %H:%M:%S')
@@ -354,7 +365,6 @@ map ${real_ip_var} $ip_ban_level {{
         
         # 关闭级别映射
         http_config += "}\n"
-
         # 组合两个条件：IP头存在且IP被封禁
         http_config += """
 # 最终封禁决定 - 只有当IP头存在且IP在封禁列表中时才封禁
@@ -362,33 +372,27 @@ map $has_real_ip $is_banned_ip {
     0       0;  # IP头不存在，强制不封禁
     1       $ip_is_banned;  # IP头存在，使用封禁结果
 }
-
 # 最终封禁级别 - 只有当IP头存在时才返回封禁级别
 map $has_real_ip $ban_level {
     0       0;  # IP头不存在，强制不封禁
     1       $ip_ban_level;  # IP头存在，使用封禁级别
 }
 """
-
         # 2. 创建Location块配置文件（使用if条件）
         location_config = f"""# 自动生成的IP封禁配置（Location块） - 请勿手动编辑
 # 最后更新: {current_time}
 # 使用的真实IP头: {REAL_IP_HEADER}
 # 总封禁IP数: {len(ban_dict)}
-
 # 应用封禁规则
 if ($ban_level = 2) {{
     # 完全封禁
     return 429;
 }}
-
 if ($ban_level = 1) {{
-    # 警告级别封禁 - 429状态码但有不同的响应头
-    add_header X-Rate-Limit-Warning "请减缓请求速率，您已接近封禁阈值" always;
+    # 警告级别封禁
     return 429;
 }}
 """
-
         # 写入文件
         with open(HTTP_CONF_FILE, 'w') as f:
             f.write(http_config)
@@ -571,6 +575,8 @@ def monitor_logs():
         "banned_ips": 0,
         "warned_ips": 0,
         "regular_pattern_ips": 0,
+        "skipped_internal_ips": 0,
+        "skipped_429_responses": 0,
         "start_time": datetime.now()
     }
     
@@ -578,6 +584,8 @@ def monitor_logs():
     logging.info(f"短期爆发限制: {BURST_LIMIT}个请求/{SHORT_WINDOW}秒, 长期平均限制: {AVG_LIMIT} TPS")
     logging.info(f"监控 {len(site_names)} 个站点: {', '.join(set(site_names.values()))}")
     logging.info(f"规律模式爬虫处理策略: 只要TPS不超过{AVG_LIMIT}，即使是规律性请求也允许通过")
+    logging.info(f"内部网络豁免: {', '.join(INTERNAL_NETWORKS)}")
+    logging.info(f"429响应处理: 不计入TPS计算，因为这些请求已被拦截")
     if args.debug:
         logging.debug(f"调试模式已启用 - 将显示详细的IP请求统计")
     
@@ -662,6 +670,20 @@ def monitor_logs():
                     match = re.match(LOG_PATTERN, line)
                     if match:
                         ip_str, time_str, request, status, size, referrer, user_agent = match.groups()
+                        
+                        # 新增：跳过内部IP
+                        if is_internal_ip(ip_str):
+                            stats["skipped_internal_ips"] += 1
+                            if args.debug:
+                                logging.debug(f"跳过内部IP: {ip_str}")
+                            continue
+                        
+                        # 新增：跳过429响应（已被拦截的请求）
+                        if status == "429":
+                            stats["skipped_429_responses"] += 1
+                            if args.debug:
+                                logging.debug(f"跳过已被拦截的请求 (429): IP {ip_str}")
+                            continue
                         
                         # 解析日志中的时间戳
                         try:
@@ -764,6 +786,8 @@ def monitor_logs():
                     logging.debug(f"运行时间: {runtime:.1f} 分钟")
                     logging.debug(f"总请求数: {stats['total_requests']}")
                     logging.debug(f"过滤的请求数: {stats['filtered_requests']}")
+                    logging.debug(f"跳过的内部IP请求: {stats['skipped_internal_ips']}")
+                    logging.debug(f"跳过的429响应: {stats['skipped_429_responses']}")
                     logging.debug(f"警告的IP数: {stats['warned_ips']}")
                     logging.debug(f"封禁的IP数: {stats['banned_ips']}")
                     logging.debug(f"规律模式但允许的IP数: {regular_pattern_count}")

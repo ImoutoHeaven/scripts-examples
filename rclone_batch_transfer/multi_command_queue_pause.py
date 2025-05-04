@@ -11,12 +11,12 @@ import platform
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import datetime
 
-# 命令状态常量
+# 命令状态常量 - 更新为要求的状态名称
 class CommandStatus:
-    PENDING = "PENDING"
+    INQUEUE = "INQUEUE"   # 改为 INQUEUE (原 PENDING)
     RUNNING = "RUNNING"
     PAUSED = "PAUSED"
-    SUCCEEDED = "SUCCEEDED"
+    COMPLETED = "COMPLETED"   # 改为 COMPLETED (原 SUCCEEDED)
     FAILED = "FAILED"
 
 # 全局状态
@@ -62,31 +62,47 @@ def format_command_list(commands):
     return formatted
 
 def format_command_status():
-    """格式化命令状态显示"""
+    """格式化命令状态显示 - 修改为显示所有命令，包括已完成的"""
     with command_lock:
         if not command_states:
             return "\n--- 没有正在运行的命令 ---\n"
         
         now = datetime.datetime.now()
         formatted = "\n--- 命令状态 ---\n"
-        for cmd_id, state in sorted(command_states.items()):
-            status = state["status"]
-            command = state["command"]
-            # 显示完整命令
-            
-            # 计算持续时间
-            duration = ""
-            if state["start_time"]:
-                end_time = state["end_time"] if state["end_time"] else now
-                duration_sec = (end_time - state["start_time"]).total_seconds()
-                minutes, seconds = divmod(int(duration_sec), 60)
-                hours, minutes = divmod(minutes, 60)
-                duration = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-            
-            retry_info = f" (重试: {state['retry_count']})" if state["retry_count"] > 0 else ""
-            formatted += f"ID {cmd_id+1}: [{status}]{retry_info} [{duration}] {command}\n"
         
-        formatted += "---------------------\n"
+        # 按照状态对命令进行分组显示
+        status_groups = {
+            CommandStatus.RUNNING: [],
+            CommandStatus.INQUEUE: [],
+            CommandStatus.PAUSED: [],
+            CommandStatus.COMPLETED: [],
+            CommandStatus.FAILED: []
+        }
+        
+        # 分组所有命令
+        for cmd_id, state in sorted(command_states.items()):
+            status_groups[state["status"]].append((cmd_id, state))
+        
+        # 输出每组命令
+        for status, group in status_groups.items():
+            if group:  # 只有在组内有命令时才显示组标题
+                formatted += f"\n--- {status} 命令 ({len(group)}) ---\n"
+                for cmd_id, state in group:
+                    command = state["command"]
+                    
+                    # 计算持续时间
+                    duration = ""
+                    if state["start_time"]:
+                        end_time = state["end_time"] if state["end_time"] else now
+                        duration_sec = (end_time - state["start_time"]).total_seconds()
+                        minutes, seconds = divmod(int(duration_sec), 60)
+                        hours, minutes = divmod(minutes, 60)
+                        duration = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+                    
+                    retry_info = f" (重试: {state['retry_count']})" if state["retry_count"] > 0 else ""
+                    formatted += f"ID {cmd_id+1}: [{duration}]{retry_info} {command}\n"
+        
+        formatted += "\n---------------------\n"
         return formatted
 
 def input_listener():
@@ -140,7 +156,7 @@ def resume_command(cmd_id):
     """恢复特定命令"""
     with command_lock:
         if cmd_id in command_states and command_states[cmd_id]["status"] == CommandStatus.PAUSED:
-            command_states[cmd_id]["status"] = CommandStatus.PENDING  # 将被重新执行
+            command_states[cmd_id]["status"] = CommandStatus.INQUEUE  # 将被重新执行 (原PENDING)
             print(f"\n[命令 {cmd_id+1} 已排队等待重启]")
         else:
             print(f"\n[命令 {cmd_id+1} 未被暂停或不存在]")
@@ -163,7 +179,7 @@ def resume_all_commands():
         resumed_count = 0
         for cmd_id, state in command_states.items():
             if state["status"] == CommandStatus.PAUSED:
-                state["status"] = CommandStatus.PENDING  # 将被重新执行
+                state["status"] = CommandStatus.INQUEUE  # 将被重新执行 (原PENDING)
                 resumed_count += 1
         print(f"\n[已恢复 {resumed_count} 个已暂停的命令]")
 
@@ -224,7 +240,7 @@ def execute_command(cmd_id, cmd, total_retries):
         if cmd_id not in command_states:
             command_states[cmd_id] = {
                 "command": cmd,
-                "status": CommandStatus.PENDING,
+                "status": CommandStatus.INQUEUE,  # 更新为INQUEUE (原PENDING)
                 "process": None,
                 "retry_count": 0,
                 "start_time": None,
@@ -232,7 +248,7 @@ def execute_command(cmd_id, cmd, total_retries):
             }
         else:
             # 为重试重置状态
-            command_states[cmd_id]["status"] = CommandStatus.PENDING
+            command_states[cmd_id]["status"] = CommandStatus.INQUEUE  # 更新为INQUEUE (原PENDING)
             command_states[cmd_id]["process"] = None
     
     retry_count = 0
@@ -328,7 +344,7 @@ def execute_command(cmd_id, cmd, total_retries):
                 
                 if return_code == 0:
                     print(f"{cmd_prefix}执行成功，退出代码: 0")
-                    command_states[cmd_id]["status"] = CommandStatus.SUCCEEDED
+                    command_states[cmd_id]["status"] = CommandStatus.COMPLETED  # 更新为COMPLETED (原SUCCEEDED)
                     command_states[cmd_id]["end_time"] = datetime.datetime.now()
                     return True
                 else:
@@ -338,7 +354,7 @@ def execute_command(cmd_id, cmd, total_retries):
                     if retry_count > total_retries:
                         command_states[cmd_id]["status"] = CommandStatus.FAILED
                         command_states[cmd_id]["end_time"] = datetime.datetime.now()
-                    # else: 下一次迭代时将回到PENDING/RUNNING状态
+                    # else: 下一次迭代时将回到INQUEUE/RUNNING状态
         except Exception as e:
             print(f"{cmd_prefix}执行错误: {e}")
             with command_lock:
@@ -371,6 +387,17 @@ def main():
         print("  'resume': 恢复所有已暂停的命令")
         print("  'resume <id>': 按ID恢复特定命令")
         print("  'exit': 终止所有命令并退出程序\n")
+        
+        # 初始化命令状态字典，确保所有命令都有一个初始状态
+        for i, cmd in enumerate(commands):
+            command_states[i] = {
+                "command": cmd,
+                "status": CommandStatus.INQUEUE,  # 使用INQUEUE状态(原PENDING)
+                "process": None,
+                "retry_count": 0,
+                "start_time": None,
+                "end_time": None
+            }
         
         # 启动输入监听线程
         input_thread = threading.Thread(target=input_listener, daemon=True)
@@ -416,7 +443,7 @@ def main():
                 # 统计成功和失败
                 with command_lock:
                     success_count = sum(1 for state in command_states.values() 
-                                     if state["status"] == CommandStatus.SUCCEEDED)
+                                     if state["status"] == CommandStatus.COMPLETED)  # 使用COMPLETED状态(原SUCCEEDED)
                     failure_count = sum(1 for state in command_states.values() 
                                      if state["status"] == CommandStatus.FAILED)
                 

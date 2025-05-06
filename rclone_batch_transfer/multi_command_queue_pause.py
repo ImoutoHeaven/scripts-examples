@@ -10,6 +10,7 @@ import signal
 import platform
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import datetime
+import psutil  # 新增：用于进程检测
 
 # 命令状态常量 - 更新为要求的状态名称
 class CommandStatus:
@@ -23,10 +24,11 @@ class CommandStatus:
 input_queue = queue.Queue()
 command_lock = threading.Lock()  # 用于命令状态的线程安全操作
 stop_event = threading.Event()   # 信号所有线程停止
+debug_mode = False  # 调试模式标志
 
 # 保存命令状态的字典
 # 格式: {command_id: {"command": cmd_str, "status": CommandStatus, "process": subprocess_obj, 
-#                    "retry_count": int, "start_time": datetime, "end_time": datetime}}
+#                    "retry_count": int, "start_time": datetime, "end_time": datetime, "pid": int}}
 command_states = {}
 
 def parse_args():
@@ -34,6 +36,7 @@ def parse_args():
     parser.add_argument('--total-retries', type=int, default=3, help='失败命令的重试次数。0表示不重试。')
     parser.add_argument('--max-concurrent', type=int, default=5, help='最大并发命令数。')
     parser.add_argument('--status-interval', type=int, default=10, help='状态更新打印间隔（秒）。')
+    parser.add_argument('--debug', action='store_true', help='启用调试模式，显示更多信息。')
     return parser.parse_args()
 
 def get_commands():
@@ -100,7 +103,8 @@ def format_command_status():
                         duration = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
                     
                     retry_info = f" (重试: {state['retry_count']})" if state["retry_count"] > 0 else ""
-                    formatted += f"ID {cmd_id+1}: [{duration}]{retry_info} {command}\n"
+                    pid_info = f" [PID: {state.get('pid', 'N/A')}]" if debug_mode and state.get('pid') else ""
+                    formatted += f"ID {cmd_id+1}: [{duration}]{retry_info}{pid_info} {command}\n"
         
         formatted += "\n---------------------\n"
         return formatted
@@ -136,6 +140,10 @@ def input_listener():
                         pause_all_commands()
                     elif cmd == "resume":
                         resume_all_commands()
+            elif user_input == "debug":
+                global debug_mode
+                debug_mode = not debug_mode
+                print(f"\n[调试模式: {'已启用' if debug_mode else '已禁用'}]")
         except EOFError:
             break
         except Exception as e:
@@ -147,7 +155,7 @@ def pause_command(cmd_id):
         if cmd_id in command_states and command_states[cmd_id]["status"] == CommandStatus.RUNNING:
             command_states[cmd_id]["status"] = CommandStatus.PAUSED
             if command_states[cmd_id]["process"]:
-                terminate_process(command_states[cmd_id]["process"])
+                terminate_process(command_states[cmd_id]["process"], cmd_states=command_states[cmd_id])
             print(f"\n[命令 {cmd_id+1} 已暂停]")
         else:
             print(f"\n[命令 {cmd_id+1} 未在运行或不存在]")
@@ -169,7 +177,7 @@ def pause_all_commands():
             if state["status"] == CommandStatus.RUNNING:
                 state["status"] = CommandStatus.PAUSED
                 if state["process"]:
-                    terminate_process(state["process"])
+                    terminate_process(state["process"], cmd_states=state)
                 paused_count += 1
         print(f"\n[已暂停 {paused_count} 个运行中的命令]")
 
@@ -183,48 +191,220 @@ def resume_all_commands():
                 resumed_count += 1
         print(f"\n[已恢复 {resumed_count} 个已暂停的命令]")
 
-def terminate_process(process):
+def is_process_running(pid):
+    """检查进程是否仍在运行"""
+    try:
+        # 使用psutil检查进程状态
+        return psutil.pid_exists(pid) and psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+    except:
+        return False
+
+def find_child_processes(parent_pid):
+    """查找给定父进程的所有子进程"""
+    try:
+        child_pids = []
+        for proc in psutil.process_iter(['pid', 'ppid']):
+            if proc.info['ppid'] == parent_pid:
+                child_pids.append(proc.info['pid'])
+        return child_pids
+    except:
+        return []
+
+def terminate_process_with_children(pid):
     """终止进程及其所有子进程"""
+    try:
+        # 查找所有子进程
+        children = find_child_processes(pid)
+        
+        if debug_mode:
+            print(f"尝试终止进程 {pid} 及其子进程 {children}")
+        
+        # 终止子进程
+        for child_pid in children:
+            try:
+                if is_process_running(child_pid):
+                    if platform.system() == "Windows":
+                        # Windows上使用taskkill
+                        subprocess.run(f'taskkill /F /PID {child_pid}', shell=True, timeout=3)
+                    else:
+                        # Unix上使用信号
+                        os.kill(child_pid, signal.SIGKILL)
+            except Exception as e:
+                if debug_mode:
+                    print(f"终止子进程 {child_pid} 时出错: {e}")
+        
+        # 终止父进程
+        if is_process_running(pid):
+            if platform.system() == "Windows":
+                subprocess.run(f'taskkill /F /PID {pid}', shell=True, timeout=3)
+            else:
+                os.kill(pid, signal.SIGKILL)
+        
+        # 验证进程是否已终止
+        time.sleep(0.5)
+        if is_process_running(pid):
+            if debug_mode:
+                print(f"警告: 进程 {pid} 未能终止！")
+            return False
+        
+        return True
+    except Exception as e:
+        if debug_mode:
+            print(f"终止进程 {pid} 时出错: {e}")
+        return False
+
+def terminate_process(process, cmd_states=None):
+    """终止进程及其所有子进程 - 改进版"""
     if process is None:
         return
     
     process_id = process.pid
+    command_info = ""
+    is_rclone = False
+    
+    # 保存PID到命令状态中
+    if cmd_states is not None:
+        cmd_states['pid'] = process_id
+        if 'command' in cmd_states:
+            command_info = f" ({cmd_states['command']})"
+            is_rclone = "rclone" in cmd_states['command'].lower()
+    
+    # 首先，记录将要终止的进程
+    if debug_mode:
+        print(f"[DEBUG] 尝试终止进程 PID: {process_id}{command_info}")
     
     try:
         # 在类Unix系统上杀死整个进程组
         if platform.system() != "Windows":
             # 向进程组发送SIGTERM信号
-            pgid = os.getpgid(process_id)
-            os.killpg(pgid, signal.SIGTERM)
-            time.sleep(0.5)
-            
-            # 如果进程仍然存在，强制杀死
             try:
-                os.killpg(pgid, 0)  # 检查进程是否存在
-                os.killpg(pgid, signal.SIGKILL)  # 如果存在，强制杀死
-            except OSError:
-                pass  # 进程组已终止
+                pgid = os.getpgid(process_id)
+                os.killpg(pgid, signal.SIGTERM)
+                time.sleep(0.5)
+                
+                # 检查进程组是否存在，如果存在则强制杀死
+                try:
+                    os.killpg(pgid, 0)  # 检查进程是否存在
+                    os.killpg(pgid, signal.SIGKILL)  # 如果存在，强制杀死
+                except OSError:
+                    pass  # 进程组已终止
+            except OSError as e:
+                if debug_mode:
+                    print(f"[DEBUG] 终止进程组失败: {e}, 尝试直接终止进程")
+                try:
+                    os.kill(process_id, signal.SIGTERM)
+                    time.sleep(0.5)
+                    if is_process_running(process_id):
+                        os.kill(process_id, signal.SIGKILL)
+                except OSError:
+                    pass
         else:
-            # 在Windows上，我们只能终止主进程
-            # 使用taskkill尝试杀死子进程
-            process.terminate()
-            time.sleep(0.5)
-            if process.poll() is None:
-                process.kill()
-                # 额外尝试在Windows上杀死子进程
-                subprocess.call(f'taskkill /F /T /PID {process_id}', 
-                                shell=True, 
-                                stdout=subprocess.DEVNULL, 
-                                stderr=subprocess.DEVNULL)
+            # Windows上的进程终止 - 改进版本
+            try:
+                # 首先，尝试使用进程对象的方法
+                process.terminate()
+                time.sleep(0.5)
+                
+                # 检查进程是否仍在运行
+                if process.poll() is None:
+                    process.kill()
+                    time.sleep(0.5)
+                    
+                    # 如果进程仍未终止，使用taskkill
+                    if process.poll() is None:
+                        if debug_mode:
+                            print(f"[DEBUG] 进程仍在运行，尝试使用taskkill: {process_id}")
+                        
+                        # 使用/T参数终止进程树
+                        subprocess.run(
+                            f'taskkill /F /T /PID {process_id}', 
+                            shell=True,
+                            timeout=5,
+                            capture_output=not debug_mode  # 在调试模式下显示输出
+                        )
+                
+                # 确认进程已终止
+                time.sleep(1.0)  # 给系统足够时间清理进程
+                if process.poll() is None or is_process_running(process_id):
+                    if debug_mode:
+                        print(f"[DEBUG] 使用taskkill后进程仍在运行: {process_id}")
+                    
+                    # 使用psutil直接终止进程及其子进程
+                    terminate_process_with_children(process_id)
+                
+                # 特殊处理rclone进程
+                if is_rclone:
+                    # 查找所有rclone进程并终止
+                    if debug_mode:
+                        print("[DEBUG] 检查遗留的rclone进程")
+                    
+                    check_process = subprocess.run(
+                        'tasklist /FI "IMAGENAME eq rclone.exe" /NH', 
+                        shell=True, 
+                        capture_output=True,
+                        text=True
+                    )
+                    
+                    if "rclone.exe" in check_process.stdout:
+                        print("[警告] 检测到遗留的rclone进程，尝试终止所有rclone实例")
+                        subprocess.run(
+                            'taskkill /F /IM rclone.exe /T', 
+                            shell=True,
+                            capture_output=not debug_mode
+                        )
+                        
+                        # 验证所有rclone进程是否已终止
+                        time.sleep(1.0)
+                        check_again = subprocess.run(
+                            'tasklist /FI "IMAGENAME eq rclone.exe" /NH', 
+                            shell=True, 
+                            capture_output=True,
+                            text=True
+                        )
+                        
+                        if "rclone.exe" in check_again.stdout:
+                            print("[错误] 无法终止所有rclone进程！可能需要手动终止。")
+                        else:
+                            print("[成功] 所有rclone进程已终止")
+            
+            except Exception as e:
+                print(f"[错误] 终止进程时出错: {e}")
+                # 尽最大努力终止进程
+                try:
+                    if is_rclone:
+                        subprocess.run('taskkill /F /IM rclone.exe /T', shell=True)
+                except:
+                    pass
     except Exception as e:
-        print(f"终止进程时出错: {e}")
+        print(f"[错误] 终止进程操作失败: {e}")
 
 def terminate_all_processes():
     """终止所有运行中的进程"""
+    print("\n[正在终止所有进程...]")
+    terminated_count = 0
+    
     with command_lock:
         for cmd_id, state in command_states.items():
             if state["status"] == CommandStatus.RUNNING and state["process"]:
-                terminate_process(state["process"])
+                terminate_process(state["process"], cmd_states=state)
+                terminated_count += 1
+    
+    if terminated_count > 0:
+        # 再次检查是否有rclone进程残留
+        if platform.system() == "Windows":
+            time.sleep(1.0)  # 给系统足够的时间清理进程
+            check_process = subprocess.run(
+                'tasklist /FI "IMAGENAME eq rclone.exe" /NH', 
+                shell=True, 
+                capture_output=True,
+                text=True
+            )
+            
+            if "rclone.exe" in check_process.stdout:
+                print("[警告] 仍有rclone进程在运行，尝试强制终止所有rclone实例")
+                subprocess.run('taskkill /F /IM rclone.exe /T', shell=True)
+    
+    print(f"[已终止 {terminated_count} 个进程]")
 
 def status_updater(interval):
     """定期打印状态更新的线程"""
@@ -235,6 +415,9 @@ def status_updater(interval):
 
 def execute_command(cmd_id, cmd, total_retries):
     """执行命令，支持重试和暂停/恢复"""
+    # 检测是否是rclone命令
+    is_rclone_command = "rclone" in cmd.lower()
+    
     with command_lock:
         # 初始化或更新命令状态
         if cmd_id not in command_states:
@@ -244,12 +427,14 @@ def execute_command(cmd_id, cmd, total_retries):
                 "process": None,
                 "retry_count": 0,
                 "start_time": None,
-                "end_time": None
+                "end_time": None,
+                "pid": None
             }
         else:
             # 为重试重置状态
             command_states[cmd_id]["status"] = CommandStatus.INQUEUE  # 更新为INQUEUE (原PENDING)
             command_states[cmd_id]["process"] = None
+            command_states[cmd_id]["pid"] = None
     
     retry_count = 0
     cmd_prefix = f"[CMD-{cmd_id+1}] "
@@ -289,6 +474,13 @@ def execute_command(cmd_id, cmd, total_retries):
             # 在类Unix系统上创建新的进程组
             if platform.system() != "Windows":
                 popen_kwargs['preexec_fn'] = os.setsid
+            else:
+                # Windows特别处理
+                if is_rclone_command:
+                    if debug_mode:
+                        print(f"{cmd_prefix}[DEBUG] 检测到rclone命令，使用特殊处理")
+                    # 在Windows上，给rclone命令增加特殊处理
+                    popen_kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
             
             # 使用subprocess.Popen实时捕获输出
             process = subprocess.Popen(cmd, **popen_kwargs)
@@ -296,6 +488,9 @@ def execute_command(cmd_id, cmd, total_retries):
             # 在命令状态中存储进程
             with command_lock:
                 command_states[cmd_id]["process"] = process
+                command_states[cmd_id]["pid"] = process.pid
+                if debug_mode:
+                    print(f"{cmd_prefix}[DEBUG] 进程已启动，PID: {process.pid}")
             
             # 实时处理输出
             while not stop_event.is_set():
@@ -368,6 +563,17 @@ def execute_command(cmd_id, cmd, total_retries):
 def main():
     try:
         args = parse_args()
+        global debug_mode
+        debug_mode = args.debug
+        
+        # 检查psutil是否可用
+        try:
+            import psutil
+        except ImportError:
+            print("警告: psutil模块未安装，某些进程管理功能将受限。")
+            print("建议安装psutil: pip install psutil")
+            time.sleep(2)
+        
         commands = get_commands()
         
         if not commands:
@@ -386,6 +592,7 @@ def main():
         print("  'pause <id>': 按ID暂停特定命令")
         print("  'resume': 恢复所有已暂停的命令")
         print("  'resume <id>': 按ID恢复特定命令")
+        print("  'debug': 切换调试模式")
         print("  'exit': 终止所有命令并退出程序\n")
         
         # 初始化命令状态字典，确保所有命令都有一个初始状态
@@ -396,7 +603,8 @@ def main():
                 "process": None,
                 "retry_count": 0,
                 "start_time": None,
-                "end_time": None
+                "end_time": None,
+                "pid": None
             }
         
         # 启动输入监听线程

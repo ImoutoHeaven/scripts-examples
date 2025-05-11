@@ -4,175 +4,169 @@ import time
 import sys
 import os
 import locale
+import argparse
 from datetime import datetime
 from threading import Thread
 from queue import Queue, Empty
 import signal
 import ctypes
 from ctypes import wintypes
-import msvcrt
 
-# Windows API 常量和函数定义
-PROCESS_TERMINATE = 0x0001
-CTRL_C_EVENT = 0
-CTRL_BREAK_EVENT = 1
-JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+# Set console to UTF-8 on Windows
+def set_windows_utf8():
+    if os.name == 'nt':
+        try:
+            # Code page 65001 is UTF-8
+            subprocess.run(['chcp', '65001'], shell=True, check=True, 
+                          stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+            # Enable virtual terminal processing for ANSI colors in Windows 10
+            kernel32 = ctypes.WinDLL('kernel32')
+            STD_OUTPUT_HANDLE = -11
+            handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+            mode = wintypes.DWORD()
+            kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+            # ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+            print("Console set to UTF-8 mode", flush=True)
+        except Exception as e:
+            print(f"Warning: Failed to set console to UTF-8 mode: {e}", flush=True)
 
-# 加载Windows API
-kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+# Windows-specific process termination
+def terminate_process(process):
+    if os.name == 'nt':
+        # Windows process termination
+        try:
+            process.terminate()
+            # Give some time for graceful termination
+            time.sleep(1)
+            if process.poll() is None:
+                # Force kill if still running
+                subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)], 
+                              shell=True, check=False, 
+                              stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+        except Exception as e:
+            print(f"Error terminating process: {e}", flush=True)
+    else:
+        # Unix-based process termination
+        try:
+            if hasattr(os, 'killpg'):
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            else:
+                process.terminate()
+        except Exception:
+            process.terminate()
 
-# 定义Windows Job对象相关结构和函数
-class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
-    _fields_ = [
-        ('PerProcessUserTimeLimit', ctypes.c_int64),
-        ('PerJobUserTimeLimit', ctypes.c_int64),
-        ('LimitFlags', ctypes.c_uint32),
-        ('MinimumWorkingSetSize', ctypes.c_size_t),
-        ('MaximumWorkingSetSize', ctypes.c_size_t),
-        ('ActiveProcessLimit', ctypes.c_uint32),
-        ('Affinity', ctypes.c_size_t),
-        ('PriorityClass', ctypes.c_uint32),
-        ('SchedulingClass', ctypes.c_uint32)
-    ]
-
-class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
-    _fields_ = [
-        ('BasicLimitInformation', JOBOBJECT_BASIC_LIMIT_INFORMATION),
-        ('IoInfo', ctypes.c_uint64 * 2),
-        ('ProcessMemoryLimit', ctypes.c_size_t),
-        ('JobMemoryLimit', ctypes.c_size_t),
-        ('PeakProcessMemoryUsed', ctypes.c_size_t),
-        ('PeakJobMemoryUsed', ctypes.c_size_t)
-    ]
-
-# 设置Windows API函数参数类型
-kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
-kernel32.CreateJobObjectW.restype = wintypes.HANDLE
-kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
-kernel32.SetInformationJobObject.restype = wintypes.BOOL
-kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
-kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
-
-def create_job_object():
-    """创建Windows Job对象用于进程管理"""
-    job = kernel32.CreateJobObjectW(None, None)
-    if job == 0:
-        return None
-    
-    job_info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-    job_info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-    
-    length = ctypes.sizeof(job_info)
-    kernel32.SetInformationJobObject(job, 9, ctypes.byref(job_info), length)
-    
-    return job
-
-# 编码尝试顺序
-UTF8_ENCODINGS = [
-    'utf-8-sig',    # 带BOM的UTF-8
-    'utf-8',        # UTF-8
-]
-
-CHINESE_ENCODINGS = [
-    'cp936',        # Windows 默认中文编码
-    'gb18030',      # GB18030 超集
-    'gbk',          # GBK编码
-]
-
-OTHER_ENCODINGS = [
-    'big5',         # 繁体中文
-    'shift-jis',    # 日文
-    'euc-jp',       # 日文
-    'euc-kr',       # 韩文
-    'iso-8859-1'    # 西欧
+# 尝试的编码列表，优化顺序和组合
+ENCODINGS = [
+    'utf-8',
+    ('utf-8', 'ignore'),  # Windows默认使用ignore模式
+    'utf-8-sig',  # 处理带BOM的UTF-8
+    'cp936',      # Windows中文系统常用
+    'gb18030',    # 超集，包含GBK、GB2312
+    'gbk',
+    'big5',
+    'shift-jis',
+    'euc-jp',
+    'euc-kr',
+    'iso-8859-1',
+    'cp1252'      # Windows西欧编码
 ]
 
 def is_http_403_error(line):
-    """判断是否为真正的HTTP 403错误"""
+    """
+    判断是否为真正的HTTP 403错误
+    
+    判断标准：
+    1. 包含 "Error 403:" 或 "403" + 以下关键词之一：
+       - quota
+       - limit
+       - exceeded
+       - rate
+       - forbidden
+    2. 403不能作为数字的一部分出现（如文件大小）
+    
+    返回：bool
+    """
+    # 直接匹配 Google API 的 403 错误格式
     if "Error 403:" in line:
         return True
-    
+        
+    # 确保 403 不是文件大小的一部分
+    # 使用正则表达式检查 403 的前后字符
+    # 检查是否包含常见的 403 错误关键词组合
     error_patterns = [
-        r'(?<!\d)403(?!\d).*(?:quota|limit|exceed|rate|forbidden)',
-        r'(?:quota|limit|exceed|rate|forbidden).*(?<!\d)403(?!\d)',
-        r'HTTP.*(?<!\d)403(?!\d)',
-        r'(?<!\d)403(?!\d).*Forbidden',
+        r'(?<!\d)403(?!\d).*(?:quota|limit|exceed|rate|forbidden)',  # 403后跟错误关键词
+        r'(?:quota|limit|exceed|rate|forbidden).*(?<!\d)403(?!\d)',  # 403前有错误关键词
+        r'HTTP.*(?<!\d)403(?!\d)',  # HTTP相关的403
+        r'(?<!\d)403(?!\d).*Forbidden',  # 403 Forbidden
     ]
     
+    # 任一模式匹配即认为是 HTTP 403 错误
     return any(re.search(pattern, line, re.IGNORECASE) for pattern in error_patterns)
 
 def normalize_encoding(text):
     """标准化文本编码，处理特殊字符和组合字符"""
     import unicodedata
     try:
+        # 将文本转换为NFC标准形式
         normalized = unicodedata.normalize('NFC', text)
-        normalized = normalized.replace('\ufffd', '?')
+        # 尝试替换一些常见的问题字符
+        normalized = normalized.replace('\ufffd', '?')  # 替换替换字符
         return normalized
     except Exception:
         return text
 
 def try_decode(byte_string):
-    """尝试使用多种编码解码字节串，按优先级尝试不同编码"""
+    """尝试使用多种编码解码字节串，Windows下默认使用ignore处理解码错误"""
     if not isinstance(byte_string, bytes):
         return byte_string
 
-    def decode_quality(text):
-        """评估解码质量，返回替换字符的数量"""
-        return text.count('\ufffd')
-
-    def try_encoding(byte_data, encoding, errors='strict'):
-        """尝试特定编码并评估质量"""
-        try:
-            result = byte_data.decode(encoding, errors=errors)
-            return result, decode_quality(result)
-        except UnicodeDecodeError:
-            return None, float('inf')
-
-    # 1. 优先尝试 UTF-8 编码
-    for encoding in UTF8_ENCODINGS:
-        result, quality = try_encoding(byte_string, encoding)
-        if quality == 0:  # UTF-8 完美解码
-            return normalize_encoding(result)
-
-    # 2. 尝试常见中文编码
-    best_result = None
-    best_quality = float('inf')
-    
-    for encoding in CHINESE_ENCODINGS:
-        result, quality = try_encoding(byte_string, encoding)
-        if quality == 0:  # 完美解码
-            return normalize_encoding(result)
-        if quality < best_quality:
-            best_quality = quality
-            best_result = result
-
-    # 如果中文编码得到了较好的结果（替换字符少于5%）
-    if best_result and best_quality < len(best_result) * 0.05:
-        return normalize_encoding(best_result)
-
-    # 3. 尝试其他编码
-    for encoding in OTHER_ENCODINGS:
-        result, quality = try_encoding(byte_string, encoding)
-        if quality == 0:  # 完美解码
-            return normalize_encoding(result)
-        if quality < best_quality:
-            best_quality = quality
-            best_result = result
-
-    # 4. 如果之前的尝试得到了还可以的结果（替换字符少于10%）
-    if best_result and best_quality < len(best_result) * 0.1:
-        return normalize_encoding(best_result)
-
-    # 5. 最后兜底：使用系统默认编码
+    # 检测是否可能是纯ASCII
     try:
-        result = byte_string.decode(locale.getpreferredencoding(), errors='replace')
-        if decode_quality(result) < len(result) * 0.2:  # 允许最多20%的替换字符
-            return normalize_encoding(result)
-    except:
+        result = byte_string.decode('ascii')
+        return result
+    except UnicodeDecodeError:
         pass
 
-    # 6. 最终兜底：使用 UTF-8 + replace
-    return normalize_encoding(byte_string.decode('utf-8', errors='replace'))
+    # Windows优先使用带ignore的UTF-8解码
+    if os.name == 'nt':
+        try:
+            result = byte_string.decode('utf-8', errors='ignore')
+            return normalize_encoding(result)
+        except Exception:
+            pass
+
+    # 首先尝试系统默认编码
+    try:
+        system_encoding = locale.getpreferredencoding()
+        result = byte_string.decode(system_encoding, errors='ignore' if os.name == 'nt' else 'strict')
+        if not result.startswith('\ufffd'):  # 检查是否以替换字符开始
+            return normalize_encoding(result)
+    except UnicodeDecodeError:
+        pass
+
+    # 然后尝试其他编码
+    for encoding in ENCODINGS:
+        try:
+            if isinstance(encoding, tuple):
+                # 处理带错误处理方式的编码
+                result = byte_string.decode(encoding[0], errors=encoding[1])
+            else:
+                # Windows下默认使用ignore作为错误处理模式
+                error_mode = 'ignore' if os.name == 'nt' else 'strict'
+                result = byte_string.decode(encoding, errors=error_mode)
+            
+            # 检查解码结果的质量
+            if '\ufffd' not in result:  # 如果没有替换字符，可能是正确的编码
+                return normalize_encoding(result)
+            elif not result.startswith('\ufffd'):  # 如果开头没有替换字符，可能是部分正确
+                return normalize_encoding(result)
+        except UnicodeDecodeError:
+            continue
+    
+    # 如果所有尝试都失败了，使用 UTF-8 with 'ignore'
+    result = byte_string.decode('utf-8', errors='ignore')
+    return normalize_encoding(result)
 
 def clean_ansi(text):
     """清除ANSI转义序列"""
@@ -183,7 +177,7 @@ def enqueue_output(out, queue):
     """将输出流放入队列中"""
     try:
         for line in iter(out.readline, b''):
-            if line.strip():
+            if line.strip():  # 忽略空行
                 decoded_line = try_decode(line)
                 if decoded_line:
                     queue.put(decoded_line)
@@ -195,17 +189,18 @@ def enqueue_output(out, queue):
         except:
             pass
 
-def terminate_process_tree(pid):
-    """终止进程树"""
-    try:
-        # 使用taskkill命令终止进程树
-        subprocess.run(['taskkill', '/F', '/T', '/PID', str(pid)], 
-                      stdout=subprocess.PIPE, 
-                      stderr=subprocess.PIPE,
-                      check=True)
-        return True
-    except subprocess.CalledProcessError:
-        return False
+def setup_signal_handlers():
+    """设置信号处理器，Windows兼容"""
+    def signal_handler(signum, frame):
+        print("\n程序被用户中断", flush=True)
+        sys.exit(130)  # 标准的SIGINT错误代码
+    
+    # Windows和POSIX平台通用的信号
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    # 仅在POSIX平台上设置SIGTERM
+    if hasattr(signal, 'SIGTERM'):
+        signal.signal(signal.SIGTERM, signal_handler)
 
 def parse_transferred_count(line):
     """解析已传输文件数量，排除包含容量单位的行"""
@@ -217,47 +212,67 @@ def parse_transferred_count(line):
         return int(match.group(1))
     return None
 
-def monitor_gclone():
-    print("请输入要执行的指令:", flush=True)
-    cmd = input().strip()
-    input()  # 等待第二次回车
+def parse_args():
+    """解析命令行参数"""
+    parser = argparse.ArgumentParser(description='监控并执行gclone/rclone/fclone命令，处理HTTP 403错误')
+    parser.add_argument('-shell', type=str, help='非交互式执行的命令')
+    return parser.parse_args()
+
+def monitor_gclone(cmd=None):
+    """监控gclone命令执行，处理HTTP 403错误并在必要时重试
+    
+    参数:
+        cmd: 可选，直接指定要执行的命令
+        
+    返回:
+        int: 命令执行的退出代码
+    """
+    if cmd is None:
+        # 交互式模式
+        print("请输入要执行的指令:", flush=True)
+        cmd = input().strip()
+        try:
+            input()  # 等待第二次回车
+        except EOFError:
+            pass  # 如果在管道中运行，可能没有第二个输入
     
     if not cmd:
         print("指令不能为空", flush=True)
-        return
+        return 1  # 返回错误代码
 
     # 确保命令中包含 -P 参数
     if '-P' not in cmd:
         cmd += ' -P'
 
-    # 创建Job对象
-    job = create_job_object()
-    if not job:
-        print("无法创建Job对象，进程管理可能受限", flush=True)
+    last_exit_code = 0  # 初始化为0，表示成功
 
     while True:
         print(f"\n[{datetime.now()}] 执行命令: {cmd}", flush=True)
         
         try:
-            # 创建进程
+            # Windows兼容的进程启动
+            startupinfo = None
+            if os.name == 'nt':
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+            
             process = subprocess.Popen(
                 cmd,
                 shell=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 stdin=subprocess.PIPE,
-                bufsize=0,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
-                encoding=None
+                bufsize=0,  # 无缓冲
+                # 移除preexec_fn以支持Windows
+                encoding=None,  # 不指定编码，使用bytes
+                startupinfo=startupinfo  # Windows特有
             )
-
-            # 将进程加入Job对象
-            if job:
-                kernel32.AssignProcessToJobObject(job, int(process._handle))
         except Exception as e:
             print(f"启动进程失败: {e}", flush=True)
-            return
+            return 1  # 返回错误代码
 
+        # 创建输出队列和线程
         stdout_queue = Queue()
         stderr_queue = Queue()
         stdout_thread = Thread(target=enqueue_output, args=(process.stdout, stdout_queue))
@@ -267,29 +282,37 @@ def monitor_gclone():
         stdout_thread.start()
         stderr_thread.start()
 
-        error_count_403 = 0
+        # 仅对HTTP 403错误进行计数
+        error_count_403 = 0  
         last_transferred = 0
         consecutive_same_transfer = 0
         in_transferring_section = False
+
+        # 用于标记"脚本主动杀死进程，准备重试"
         need_retry = False
 
         while process.poll() is None:
             try:
+                # 读取并处理 stdout
                 while True:
                     try:
                         line = stdout_queue.get_nowait()
+                        
                         clean_line = clean_ansi(line)
                         print(clean_line, end='', flush=True)
                         
+                        # 是否进入或离开 Transferring 部分
                         if 'Transferring:' in clean_line:
                             in_transferring_section = True
                         elif clean_line.strip() and not clean_line.startswith(' '):
                             in_transferring_section = False
                         
+                        # 检测HTTP 403错误
                         if "ERROR" in clean_line and is_http_403_error(clean_line):
                             error_count_403 += 1
                             print(f"[DEBUG] 403 Error count: {error_count_403}", flush=True)
 
+                        # 解析传输数量
                         transferred = parse_transferred_count(clean_line)
                         if transferred is not None:
                             if transferred == last_transferred:
@@ -299,10 +322,12 @@ def monitor_gclone():
                                 consecutive_same_transfer = 0
                                 last_transferred = transferred
 
+                        # 当检测到 403 错误累计 >=5 且传输停滞次数 >=5 时，执行休眠 8 小时
                         if error_count_403 >= 5 and consecutive_same_transfer >= 5:
                             print(f"\n[{datetime.now()}] 检测到HTTP 403错误且传输停滞，暂停8小时后重试", flush=True)
-                            terminate_process_tree(process.pid)
-                            time.sleep(8 * 3600)
+                            terminate_process(process)
+                            time.sleep(8 * 3600)  # 休眠8小时
+                            # 重置计数
                             error_count_403 = 0
                             consecutive_same_transfer = 0
                             need_retry = True
@@ -314,6 +339,7 @@ def monitor_gclone():
                 if need_retry:
                     break
 
+                # 读取并处理 stderr
                 while True:
                     try:
                         err = stderr_queue.get_nowait()
@@ -325,12 +351,14 @@ def monitor_gclone():
                 time.sleep(0.1)
 
             except KeyboardInterrupt:
-                print("\n正在终止进程...", flush=True)
-                terminate_process_tree(process.pid)
-                return
+                terminate_process(process)
+                print("\n程序被用户中断", flush=True)
+                return 130  # 标准的SIGINT错误代码
 
         exit_code = process.poll()
+        last_exit_code = exit_code  # 保存最后一次的退出代码
 
+        # 输出可能残留在队列中的内容
         for queue in [stdout_queue, stderr_queue]:
             while True:
                 try:
@@ -344,6 +372,7 @@ def monitor_gclone():
             need_retry = False
             continue
 
+        # 根据 exit_code 判断退出
         if exit_code == 0:
             print(f"\n[{datetime.now()}] 命令执行完成", flush=True)
             break
@@ -351,12 +380,31 @@ def monitor_gclone():
             print(f"\n[{datetime.now()}] 命令执行失败，退出码: {exit_code}", flush=True)
             break
 
-if __name__ == "__main__":
+    return last_exit_code  # 返回最后一次的退出代码
+
+def main():
     try:
-        monitor_gclone()
+        # 在Windows上设置UTF-8编码
+        set_windows_utf8()
+        
+        args = parse_args()
+        setup_signal_handlers()
+        
+        if args.shell:
+            # 非交互式模式
+            exit_code = monitor_gclone(args.shell)
+        else:
+            # 交互式模式
+            exit_code = monitor_gclone()
+        
+        sys.exit(exit_code)  # 使用gclone命令的退出代码作为脚本的退出代码
+            
     except KeyboardInterrupt:
         print("\n程序被用户中断", flush=True)
+        sys.exit(130)  # 标准的SIGINT错误代码
     except Exception as e:
         print(f"发生错误: {e}", flush=True)
-    finally:
-        sys.exit(0)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

@@ -25,11 +25,24 @@ input_queue = queue.Queue()
 command_lock = threading.Lock()  # 用于命令状态的线程安全操作
 stop_event = threading.Event()   # 信号所有线程停止
 debug_mode = False  # 调试模式标志
+keyboard_interrupt_flag = threading.Event()  # 新增：标记键盘中断
 
 # 保存命令状态的字典
 # 格式: {command_id: {"command": cmd_str, "status": CommandStatus, "process": subprocess_obj, 
 #                    "retry_count": int, "start_time": datetime, "end_time": datetime, "pid": int}}
 command_states = {}
+
+def signal_handler(signum, frame):
+    """处理Ctrl+C信号"""
+    print("\n\n[接收到中断信号 (Ctrl+C)，正在停止所有命令并退出...]")
+    keyboard_interrupt_flag.set()
+    stop_event.set()
+    terminate_all_processes()
+
+# 注册信号处理器
+signal.signal(signal.SIGINT, signal_handler)
+if platform.system() == "Windows":
+    signal.signal(signal.SIGBREAK, signal_handler)
 
 def parse_args():
     parser = argparse.ArgumentParser(description='并发执行命令并支持重试。')
@@ -50,6 +63,7 @@ def get_commands():
             commands.append(cmd)
         except KeyboardInterrupt:
             print("\n输入被中断。停止命令收集。")
+            keyboard_interrupt_flag.set()
             break
         except EOFError:
             print("\n到达输入末尾。")
@@ -111,7 +125,7 @@ def format_command_status():
 
 def input_listener():
     """监听用户命令的线程函数"""
-    while not stop_event.is_set():
+    while not stop_event.is_set() and not keyboard_interrupt_flag.is_set():
         try:
             user_input = input().strip().lower()
             input_queue.put(user_input)
@@ -146,8 +160,14 @@ def input_listener():
                 print(f"\n[调试模式: {'已启用' if debug_mode else '已禁用'}]")
         except EOFError:
             break
+        except KeyboardInterrupt:
+            # 在输入监听器中也处理Ctrl+C
+            keyboard_interrupt_flag.set()
+            stop_event.set()
+            break
         except Exception as e:
-            print(f"输入监听器错误: {e}")
+            if not keyboard_interrupt_flag.is_set():
+                print(f"输入监听器错误: {e}")
 
 def pause_command(cmd_id):
     """暂停特定命令"""
@@ -260,14 +280,12 @@ def terminate_process(process, cmd_states=None):
     
     process_id = process.pid
     command_info = ""
-    is_rclone = False
     
     # 保存PID到命令状态中
     if cmd_states is not None:
         cmd_states['pid'] = process_id
         if 'command' in cmd_states:
             command_info = f" ({cmd_states['command']})"
-            is_rclone = "rclone" in cmd_states['command'].lower()
     
     # 首先，记录将要终止的进程
     if debug_mode:
@@ -313,15 +331,19 @@ def terminate_process(process, cmd_states=None):
                     # 如果进程仍未终止，使用taskkill
                     if process.poll() is None:
                         if debug_mode:
-                            print(f"[DEBUG] 进程仍在运行，尝试使用taskkill: {process_id}")
+                            print(f"[DEBUG] 进程仍在运行，尝试使用taskkill终止进程树: {process_id}")
                         
-                        # 使用/T参数终止进程树
-                        subprocess.run(
+                        # 使用/T参数终止整个进程树（包括所有子进程）
+                        result = subprocess.run(
                             f'taskkill /F /T /PID {process_id}', 
                             shell=True,
                             timeout=5,
-                            capture_output=not debug_mode  # 在调试模式下显示输出
+                            capture_output=True,
+                            text=True
                         )
+                        
+                        if debug_mode and result.returncode != 0:
+                            print(f"[DEBUG] taskkill返回错误: {result.stderr}")
                 
                 # 确认进程已终止
                 time.sleep(1.0)  # 给系统足够时间清理进程
@@ -331,50 +353,9 @@ def terminate_process(process, cmd_states=None):
                     
                     # 使用psutil直接终止进程及其子进程
                     terminate_process_with_children(process_id)
-                
-                # 特殊处理rclone进程
-                if is_rclone:
-                    # 查找所有rclone进程并终止
-                    if debug_mode:
-                        print("[DEBUG] 检查遗留的rclone进程")
-                    
-                    check_process = subprocess.run(
-                        'tasklist /FI "IMAGENAME eq rclone.exe" /NH', 
-                        shell=True, 
-                        capture_output=True,
-                        text=True
-                    )
-                    
-                    if "rclone.exe" in check_process.stdout:
-                        print("[警告] 检测到遗留的rclone进程，尝试终止所有rclone实例")
-                        subprocess.run(
-                            'taskkill /F /IM rclone.exe /T', 
-                            shell=True,
-                            capture_output=not debug_mode
-                        )
-                        
-                        # 验证所有rclone进程是否已终止
-                        time.sleep(1.0)
-                        check_again = subprocess.run(
-                            'tasklist /FI "IMAGENAME eq rclone.exe" /NH', 
-                            shell=True, 
-                            capture_output=True,
-                            text=True
-                        )
-                        
-                        if "rclone.exe" in check_again.stdout:
-                            print("[错误] 无法终止所有rclone进程！可能需要手动终止。")
-                        else:
-                            print("[成功] 所有rclone进程已终止")
             
             except Exception as e:
                 print(f"[错误] 终止进程时出错: {e}")
-                # 尽最大努力终止进程
-                try:
-                    if is_rclone:
-                        subprocess.run('taskkill /F /IM rclone.exe /T', shell=True)
-                except:
-                    pass
     except Exception as e:
         print(f"[错误] 终止进程操作失败: {e}")
 
@@ -389,35 +370,17 @@ def terminate_all_processes():
                 terminate_process(state["process"], cmd_states=state)
                 terminated_count += 1
     
-    if terminated_count > 0:
-        # 再次检查是否有rclone进程残留
-        if platform.system() == "Windows":
-            time.sleep(1.0)  # 给系统足够的时间清理进程
-            check_process = subprocess.run(
-                'tasklist /FI "IMAGENAME eq rclone.exe" /NH', 
-                shell=True, 
-                capture_output=True,
-                text=True
-            )
-            
-            if "rclone.exe" in check_process.stdout:
-                print("[警告] 仍有rclone进程在运行，尝试强制终止所有rclone实例")
-                subprocess.run('taskkill /F /IM rclone.exe /T', shell=True)
-    
     print(f"[已终止 {terminated_count} 个进程]")
 
 def status_updater(interval):
     """定期打印状态更新的线程"""
-    while not stop_event.is_set():
+    while not stop_event.is_set() and not keyboard_interrupt_flag.is_set():
         time.sleep(interval)
-        if not stop_event.is_set():  # 睡眠后再次检查
+        if not stop_event.is_set() and not keyboard_interrupt_flag.is_set():  # 睡眠后再次检查
             print(format_command_status())
 
 def execute_command(cmd_id, cmd, total_retries):
     """执行命令，支持重试和暂停/恢复"""
-    # 检测是否是rclone命令
-    is_rclone_command = "rclone" in cmd.lower()
-    
     with command_lock:
         # 初始化或更新命令状态
         if cmd_id not in command_states:
@@ -439,7 +402,7 @@ def execute_command(cmd_id, cmd, total_retries):
     retry_count = 0
     cmd_prefix = f"[CMD-{cmd_id+1}] "
     
-    while retry_count <= total_retries and not stop_event.is_set():
+    while retry_count <= total_retries and not stop_event.is_set() and not keyboard_interrupt_flag.is_set():
         # 检查命令是否已暂停
         with command_lock:
             if command_states[cmd_id]["status"] == CommandStatus.PAUSED:
@@ -476,11 +439,8 @@ def execute_command(cmd_id, cmd, total_retries):
                 popen_kwargs['preexec_fn'] = os.setsid
             else:
                 # Windows特别处理
-                if is_rclone_command:
-                    if debug_mode:
-                        print(f"{cmd_prefix}[DEBUG] 检测到rclone命令，使用特殊处理")
-                    # 在Windows上，给rclone命令增加特殊处理
-                    popen_kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
+                # 创建新进程组，但不从控制台分离
+                popen_kwargs['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP
             
             # 使用subprocess.Popen实时捕获输出
             process = subprocess.Popen(cmd, **popen_kwargs)
@@ -493,7 +453,7 @@ def execute_command(cmd_id, cmd, total_retries):
                     print(f"{cmd_prefix}[DEBUG] 进程已启动，PID: {process.pid}")
             
             # 实时处理输出
-            while not stop_event.is_set():
+            while not stop_event.is_set() and not keyboard_interrupt_flag.is_set():
                 # 检查命令是否被暂停
                 with command_lock:
                     if command_states[cmd_id]["status"] == CommandStatus.PAUSED:
@@ -517,6 +477,15 @@ def execute_command(cmd_id, cmd, total_retries):
                 else:
                     # 没有输出但进程仍在运行，给一个小的暂停
                     time.sleep(0.1)
+            
+            # 如果由于键盘中断而停止，不进行重试
+            if keyboard_interrupt_flag.is_set():
+                with command_lock:
+                    command_states[cmd_id]["status"] = CommandStatus.FAILED
+                    command_states[cmd_id]["end_time"] = datetime.datetime.now()
+                    if command_states[cmd_id]["process"]:
+                        terminate_process(command_states[cmd_id]["process"], cmd_states=command_states[cmd_id])
+                return False
             
             # 如果由于暂停而中断，继续下一次迭代
             with command_lock:
@@ -543,13 +512,29 @@ def execute_command(cmd_id, cmd, total_retries):
                     command_states[cmd_id]["end_time"] = datetime.datetime.now()
                     return True
                 else:
-                    print(f"{cmd_prefix}执行失败，退出代码: {return_code}")
-                    retry_count += 1
-                    
-                    if retry_count > total_retries:
+                    # 检查是否是由于Ctrl+C导致的退出（Windows上通常是-1073741510）
+                    if platform.system() == "Windows" and return_code in [-1073741510, -2147483638, 3221225786]:
+                        print(f"{cmd_prefix}进程被用户中断 (Ctrl+C)")
                         command_states[cmd_id]["status"] = CommandStatus.FAILED
                         command_states[cmd_id]["end_time"] = datetime.datetime.now()
-                    # else: 下一次迭代时将回到INQUEUE/RUNNING状态
+                        return False  # 不进行重试
+                    else:
+                        print(f"{cmd_prefix}执行失败，退出代码: {return_code}")
+                        retry_count += 1
+                        
+                        if retry_count > total_retries:
+                            command_states[cmd_id]["status"] = CommandStatus.FAILED
+                            command_states[cmd_id]["end_time"] = datetime.datetime.now()
+                        # else: 下一次迭代时将回到INQUEUE/RUNNING状态
+        except KeyboardInterrupt:
+            # 捕获键盘中断
+            print(f"{cmd_prefix}执行被用户中断")
+            with command_lock:
+                command_states[cmd_id]["status"] = CommandStatus.FAILED
+                command_states[cmd_id]["end_time"] = datetime.datetime.now()
+                if 'process' in locals() and process:
+                    terminate_process(process, cmd_states=command_states[cmd_id])
+            return False
         except Exception as e:
             print(f"{cmd_prefix}执行错误: {e}")
             with command_lock:
@@ -574,6 +559,11 @@ def main():
             print("建议安装psutil: pip install psutil")
             time.sleep(2)
         
+        # 检查是否已经设置了键盘中断标志（在get_commands期间可能已设置）
+        if keyboard_interrupt_flag.is_set():
+            print("\n程序启动时检测到中断信号，退出。")
+            sys.exit(1)
+        
         commands = get_commands()
         
         if not commands:
@@ -593,7 +583,8 @@ def main():
         print("  'resume': 恢复所有已暂停的命令")
         print("  'resume <id>': 按ID恢复特定命令")
         print("  'debug': 切换调试模式")
-        print("  'exit': 终止所有命令并退出程序\n")
+        print("  'exit': 终止所有命令并退出程序")
+        print("  Ctrl+C: 立即停止所有命令并退出\n")
         
         # 初始化命令状态字典，确保所有命令都有一个初始状态
         for i, cmd in enumerate(commands):
@@ -628,7 +619,7 @@ def main():
             }
             
             # 等待所有命令完成或停止事件
-            while futures and not stop_event.is_set():
+            while futures and not stop_event.is_set() and not keyboard_interrupt_flag.is_set():
                 # 处理任何已完成的future
                 done, not_done = wait(
                     futures, 
@@ -643,6 +634,13 @@ def main():
                 while not input_queue.empty():
                     # 只获取输入，它将由input_listener线程处理
                     input_queue.get()
+            
+            # 如果是键盘中断，确保所有进程都被终止
+            if keyboard_interrupt_flag.is_set():
+                print("\n[检测到Ctrl+C，正在清理...]")
+                executor.shutdown(wait=False)
+                terminate_all_processes()
+                sys.exit(1)
             
             # 最终状态更新
             if not stop_event.is_set():
@@ -659,7 +657,8 @@ def main():
                       f"{failure_count}/{len(commands)} 条命令失败。")
     
     except KeyboardInterrupt:
-        print("\n用户中断执行。退出。")
+        print("\n\n[用户中断执行 (Ctrl+C)。正在退出...]")
+        keyboard_interrupt_flag.set()
         stop_event.set()
         terminate_all_processes()
         sys.exit(1)

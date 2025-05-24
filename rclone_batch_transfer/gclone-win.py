@@ -11,6 +11,7 @@ from queue import Queue, Empty
 import signal
 import ctypes
 from ctypes import wintypes
+import psutil  # 需要安装: pip install psutil
 
 # Set console to UTF-8 on Windows
 def set_windows_utf8():
@@ -31,21 +32,85 @@ def set_windows_utf8():
         except Exception as e:
             print(f"Warning: Failed to set console to UTF-8 mode: {e}", flush=True)
 
-# Windows-specific process termination
+# Windows-specific process termination - 改进版本
 def terminate_process(process):
+    """终止进程及其所有子进程"""
     if os.name == 'nt':
-        # Windows process termination
         try:
-            process.terminate()
-            # Give some time for graceful termination
-            time.sleep(1)
-            if process.poll() is None:
-                # Force kill if still running
-                subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)], 
-                              shell=True, check=False, 
-                              stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+            # 使用psutil来获取进程树并终止所有相关进程
+            try:
+                import psutil
+                parent = psutil.Process(process.pid)
+                children = parent.children(recursive=True)
+                
+                # 先终止所有子进程
+                for child in children:
+                    try:
+                        print(f"[DEBUG] Terminating child process: PID={child.pid}, Name={child.name()}", flush=True)
+                        child.terminate()
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+                
+                # 等待子进程终止
+                gone, alive = psutil.wait_procs(children, timeout=3)
+                
+                # 强制杀死仍然存活的子进程
+                for p in alive:
+                    try:
+                        print(f"[DEBUG] Force killing child process: PID={p.pid}", flush=True)
+                        p.kill()
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        pass
+                
+                # 最后终止父进程
+                try:
+                    parent.terminate()
+                    parent.wait(timeout=3)
+                except psutil.TimeoutExpired:
+                    print(f"[DEBUG] Force killing parent process: PID={parent.pid}", flush=True)
+                    parent.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+                    
+            except ImportError:
+                # 如果没有psutil，使用原有方法但更激进
+                print("[WARNING] psutil not installed, using fallback method", flush=True)
+                
+                # 先尝试正常终止
+                process.terminate()
+                time.sleep(0.5)
+                
+                # 使用taskkill强制终止整个进程树
+                if process.poll() is None:
+                    # 使用/F强制，/T终止进程树
+                    result = subprocess.run(
+                        ['taskkill', '/F', '/T', '/PID', str(process.pid)], 
+                        shell=False,  # 不使用shell以避免额外的cmd进程
+                        capture_output=True,
+                        text=True
+                    )
+                    if result.returncode != 0:
+                        print(f"[ERROR] taskkill failed: {result.stderr}", flush=True)
+                        # 尝试使用wmic作为后备方案
+                        try:
+                            subprocess.run(
+                                f'wmic process where "ParentProcessId={process.pid}" delete',
+                                shell=True, check=False, capture_output=True
+                            )
+                            subprocess.run(
+                                f'wmic process where "ProcessId={process.pid}" delete',
+                                shell=True, check=False, capture_output=True
+                            )
+                        except:
+                            pass
+                            
         except Exception as e:
-            print(f"Error terminating process: {e}", flush=True)
+            print(f"[ERROR] Failed to terminate process: {e}", flush=True)
+            # 最后的尝试
+            try:
+                os.kill(process.pid, signal.SIGTERM)
+            except:
+                pass
     else:
         # Unix-based process termination
         try:
@@ -218,6 +283,16 @@ def parse_args():
     parser.add_argument('-shell', type=str, help='非交互式执行的命令')
     return parser.parse_args()
 
+def check_psutil_availability():
+    """检查psutil是否可用，如果不可用则给出警告"""
+    try:
+        import psutil
+        return True
+    except ImportError:
+        print("[WARNING] psutil module not found. Process termination may not work properly.", flush=True)
+        print("[WARNING] Install it using: pip install psutil", flush=True)
+        return False
+
 def monitor_gclone(cmd=None):
     """监控gclone命令执行，处理HTTP 403错误并在必要时重试
     
@@ -227,6 +302,9 @@ def monitor_gclone(cmd=None):
     返回:
         int: 命令执行的退出代码
     """
+    # 检查psutil可用性
+    has_psutil = check_psutil_availability()
+    
     if cmd is None:
         # 交互式模式
         print("请输入要执行的指令:", flush=True)
@@ -252,10 +330,15 @@ def monitor_gclone(cmd=None):
         try:
             # Windows兼容的进程启动
             startupinfo = None
+            creationflags = 0
+            
             if os.name == 'nt':
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 startupinfo.wShowWindow = subprocess.SW_HIDE
+                
+                # 创建新的进程组，便于终止整个进程树
+                creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
             
             process = subprocess.Popen(
                 cmd,
@@ -264,10 +347,13 @@ def monitor_gclone(cmd=None):
                 stderr=subprocess.PIPE,
                 stdin=subprocess.PIPE,
                 bufsize=0,  # 无缓冲
-                # 移除preexec_fn以支持Windows
                 encoding=None,  # 不指定编码，使用bytes
-                startupinfo=startupinfo  # Windows特有
+                startupinfo=startupinfo,  # Windows特有
+                creationflags=creationflags  # Windows进程创建标志
             )
+            
+            print(f"[DEBUG] Process started with PID: {process.pid}", flush=True)
+            
         except Exception as e:
             print(f"启动进程失败: {e}", flush=True)
             return 1  # 返回错误代码
@@ -324,9 +410,30 @@ def monitor_gclone(cmd=None):
 
                         # 当检测到 403 错误累计 >=5 且传输停滞次数 >=5 时，执行休眠 8 小时
                         if error_count_403 >= 5 and consecutive_same_transfer >= 5:
-                            print(f"\n[{datetime.now()}] 检测到HTTP 403错误且传输停滞，暂停8小时后重试", flush=True)
+                            print(f"\n[{datetime.now()}] 检测到HTTP 403错误且传输停滞，准备终止进程并暂停8小时", flush=True)
+                            
+                            # 终止进程
+                            print("[DEBUG] Terminating process...", flush=True)
                             terminate_process(process)
+                            
+                            # 确保进程已经终止
+                            try:
+                                process.wait(timeout=10)
+                                print("[DEBUG] Process terminated successfully", flush=True)
+                            except subprocess.TimeoutExpired:
+                                print("[ERROR] Process did not terminate in time, forcing kill", flush=True)
+                                # 再次尝试强制终止
+                                if os.name == 'nt':
+                                    subprocess.run(f'taskkill /F /T /PID {process.pid}', shell=True, capture_output=True)
+                                else:
+                                    os.kill(process.pid, signal.SIGKILL)
+                            
+                            # 等待一下确保进程完全终止
+                            time.sleep(2)
+                            
+                            print(f"[{datetime.now()}] 开始暂停8小时...", flush=True)
                             time.sleep(8 * 3600)  # 休眠8小时
+                            
                             # 重置计数
                             error_count_403 = 0
                             consecutive_same_transfer = 0
@@ -351,6 +458,7 @@ def monitor_gclone(cmd=None):
                 time.sleep(0.1)
 
             except KeyboardInterrupt:
+                print("\n[DEBUG] Keyboard interrupt detected, terminating process...", flush=True)
                 terminate_process(process)
                 print("\n程序被用户中断", flush=True)
                 return 130  # 标准的SIGINT错误代码

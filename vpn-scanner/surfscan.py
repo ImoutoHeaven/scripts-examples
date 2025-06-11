@@ -2,7 +2,7 @@
 """
 SurfShark Server Checker - Cross-platform script for Windows 10 and Debian 12
 Checks SurfShark servers for HTTP 407 responses and sorts by ping latency
-Version 2.1 - Added real proxy latency testing
+Version 2.2 - Added CN accessibility check
 """
 
 import argparse
@@ -30,13 +30,14 @@ except ImportError:
     HTTPProxyAuth = None
 
 class ServerChecker:
-    def __init__(self, addr_prefix: str, start: int, end: int, username: str = "xxxxxx", password: str = "yyyyyy", real_ping: bool = False):
+    def __init__(self, addr_prefix: str, start: int, end: int, username: str = "xxxxxx", password: str = "yyyyyy", real_ping: bool = False, cn_check: bool = False):
         self.addr_prefix = addr_prefix
         self.start = start
         self.end = end
         self.username = username
         self.password = password
         self.real_ping = real_ping
+        self.cn_check = cn_check
         self.found_407_servers = []
         self.timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.log_file = f"avail-urls-{self.timestamp}.log"
@@ -185,8 +186,53 @@ class ServerChecker:
         server = host.replace(".prod.surfshark.com", "")
         return server
     
-    def test_real_proxy_latency(self, hostname: str) -> Optional[float]:
-        """Test real proxy connection latency by connecting through the proxy"""
+    def test_cn_accessibility(self, hostname: str) -> bool:
+        """Test if proxy can access CN resources by checking Aliyun OSS"""
+        try:
+            # Extract hostname from URL if needed
+            if hostname.startswith('http'):
+                hostname = hostname.replace("https://", "").replace("http://", "").split('/')[0]
+            
+            # Setup proxy
+            proxy_url = f"https://{self.username}:{self.password}@{hostname}:443"
+            proxies = {
+                'http': proxy_url,
+                'https': proxy_url
+            }
+            
+            # Test URL - Aliyun OSS
+            test_url = 'https://fhnfile.oss-cn-shenzhen.aliyuncs.com'
+            
+            # Make request through proxy
+            response = requests.get(
+                test_url,
+                proxies=proxies,
+                timeout=10,
+                verify=False,  # Skip SSL verification for proxy
+                allow_redirects=False
+            )
+            
+            # Check if we got 403 Forbidden (expected response from Aliyun OSS)
+            if response.status_code == 403:
+                return True
+            else:
+                # Any other status code means the proxy doesn't work properly for CN
+                return False
+                
+        except requests.exceptions.Timeout:
+            # Timeout - proxy can't reach CN resources
+            return False
+        except requests.exceptions.ConnectionError:
+            # TCP RST or connection error
+            return False
+        except Exception as e:
+            # Any other error
+            # Debug: uncomment to see errors
+            # print(f"\nCN check error for {hostname}: {type(e).__name__}: {e}")
+            return False
+    
+    def test_real_proxy_latency(self, hostname: str) -> Tuple[Optional[float], Optional[bool]]:
+        """Test real proxy connection latency and optionally CN accessibility"""
         try:
             # Extract hostname from URL if needed
             if hostname.startswith('http'):
@@ -219,22 +265,28 @@ class ServerChecker:
             # Check if we got the expected response
             if response.status_code == 204:
                 latency = (end_time - start_time) * 1000  # Convert to milliseconds
-                return latency
+                
+                # Check CN accessibility if requested
+                cn_accessible = None
+                if self.cn_check:
+                    cn_accessible = self.test_cn_accessibility(hostname)
+                
+                return latency, cn_accessible
             else:
                 # Unexpected status code
-                return None
+                return None, None
                 
         except requests.exceptions.ProxyError:
             # Proxy connection failed
-            return None
+            return None, None
         except requests.exceptions.Timeout:
             # Request timed out
-            return None
+            return None, None
         except Exception as e:
             # Other errors
             # Debug: uncomment to see errors
             # print(f"\nReal proxy test error for {hostname}: {type(e).__name__}: {e}")
-            return None
+            return None, None
     
     def run(self):
         """Main execution function"""
@@ -244,6 +296,8 @@ class ServerChecker:
         print(f"系统编码: {self.system_encoding}")
         if self.real_ping:
             print(f"真实代理测试: 已启用")
+            if self.cn_check:
+                print(f"大陆可达性检查: 已启用")
         print("=" * 60)
         
         # Check all URLs
@@ -294,7 +348,7 @@ class ServerChecker:
                     if latency is None:
                         failed_pings += 1
                     
-                    server_info.append((url, ip, latency, None))  # Added None for real_latency
+                    server_info.append((url, ip, latency, None, None))  # Added None for real_latency and cn_accessible
                     
                     # Show progress with more detail
                     status = f"✓ {latency:.1f}ms" if latency else "✗ N/A"
@@ -302,7 +356,7 @@ class ServerChecker:
                           end='', flush=True)
                     
                 except Exception as e:
-                    server_info.append((url, None, None, None))
+                    server_info.append((url, None, None, None, None))
                     failed_pings += 1
                     print(f"\r已测试: {completed}/{len(self.found_407_servers)} - 错误: {url.split('/')[-1].split('.')[0]}", 
                           end='', flush=True)
@@ -316,6 +370,8 @@ class ServerChecker:
         if self.real_ping and self.username != "xxxxxx" and self.password != "yyyyyy":
             print("\n" + "=" * 60)
             print("开始真实代理延迟测试...")
+            if self.cn_check:
+                print("同时进行大陆可达性检查...")
             
             # Take top 20 servers based on ping latency
             top_servers = [s for s in server_info if s[2] is not None][:20]
@@ -336,7 +392,7 @@ class ServerChecker:
                     
                     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
                         futures = {}
-                        for url, ip, ping_latency, _ in group:
+                        for url, ip, ping_latency, _, _ in group:
                             hostname = url.replace("https://", "").replace("http://", "").split('/')[0]
                             future = executor.submit(self.test_real_proxy_latency, hostname)
                             futures[future] = (url, ip, ping_latency)
@@ -344,18 +400,22 @@ class ServerChecker:
                         for future in concurrent.futures.as_completed(futures):
                             url, ip, ping_latency = futures[future]
                             try:
-                                real_latency = future.result()
+                                real_latency, cn_accessible = future.result()
                                 
-                                # Update server_info with real latency
-                                for j, (s_url, s_ip, s_ping, _) in enumerate(server_info):
+                                # Update server_info with real latency and cn accessibility
+                                for j, (s_url, s_ip, s_ping, _, _) in enumerate(server_info):
                                     if s_url == url:
-                                        server_info[j] = (s_url, s_ip, s_ping, real_latency)
+                                        server_info[j] = (s_url, s_ip, s_ping, real_latency, cn_accessible)
                                         break
                                 
                                 # Show result
                                 server_name = self.extract_server_name(url)
                                 if real_latency:
-                                    print(f"  {server_name}: Ping={ping_latency:.1f}ms, 真实延迟={real_latency:.1f}ms ✓")
+                                    status = f"Ping={ping_latency:.1f}ms, 真实延迟={real_latency:.1f}ms"
+                                    if self.cn_check:
+                                        cn_status = "大陆可达 ✓" if cn_accessible else "大陆不可达 ✗"
+                                        status += f", {cn_status}"
+                                    print(f"  {server_name}: {status}")
                                 else:
                                     print(f"  {server_name}: Ping={ping_latency:.1f}ms, 真实延迟=失败 ✗")
                                     
@@ -365,6 +425,15 @@ class ServerChecker:
                     # Small delay between groups
                     if i + 3 < len(top_servers):
                         time.sleep(1)
+                
+                # Filter servers based on CN accessibility if cn_check is enabled
+                if self.cn_check:
+                    original_count = len(server_info)
+                    # Keep servers that either weren't tested (not in top 20) or passed CN check
+                    server_info = [s for s in server_info if s[4] is None or s[4] is True]
+                    filtered_count = original_count - len(server_info)
+                    if filtered_count > 0:
+                        print(f"\n已过滤掉 {filtered_count} 个大陆不可达的服务器")
                 
                 # Re-sort by real latency if available, otherwise by ping latency
                 server_info.sort(key=lambda x: (
@@ -389,6 +458,11 @@ class ServerChecker:
                 print(f"  成功测试: {len(real_latencies)} 个服务器")
                 print(f"  延迟范围: {min(real_latencies):.1f}ms - {max(real_latencies):.1f}ms")
                 print(f"  平均延迟: {sum(real_latencies)/len(real_latencies):.1f}ms")
+                
+                if self.cn_check:
+                    cn_accessible_count = len([s for s in server_info if s[4] is True])
+                    print(f"\n大陆可达性统计:")
+                    print(f"  大陆可达服务器: {cn_accessible_count} 个")
         
         # Write to log file
         self.write_log(server_info)
@@ -400,19 +474,22 @@ class ServerChecker:
         if self.real_ping and any(s[3] is not None for s in server_info):
             print("\n真实延迟最低的前 5 个服务器:")
             count = 0
-            for url, ip, ping_latency, real_latency in server_info:
+            for url, ip, ping_latency, real_latency, cn_accessible in server_info:
                 if real_latency is not None and count < 5:
                     count += 1
                     server_name = self.extract_server_name(url)
-                    print(f"  {count}. {server_name} - Ping: {ping_latency:.1f}ms, 真实: {real_latency:.1f}ms")
+                    status = f"Ping: {ping_latency:.1f}ms, 真实: {real_latency:.1f}ms"
+                    if self.cn_check and cn_accessible is not None:
+                        status += f", {'大陆可达' if cn_accessible else '大陆不可达'}"
+                    print(f"  {count}. {server_name} - {status}")
         elif successful_pings > 0:
             print("\nPing 延迟最低的前 5 个服务器:")
-            for i, (url, ip, latency, _) in enumerate(server_info[:5]):
+            for i, (url, ip, latency, _, _) in enumerate(server_info[:5]):
                 if latency is not None:
                     server_name = self.extract_server_name(url)
                     print(f"  {i+1}. {server_name} - {latency:.1f}ms")
     
-    def write_log(self, server_info: List[Tuple[str, Optional[str], Optional[float], Optional[float]]]):
+    def write_log(self, server_info: List[Tuple[str, Optional[str], Optional[float], Optional[float], Optional[bool]]]):
         """Write results to log file"""
         with open(self.log_file, 'w', encoding='utf-8') as f:
             # Header
@@ -422,6 +499,8 @@ class ServerChecker:
             f.write(f"# 系统编码: {self.system_encoding}\n")
             if self.real_ping:
                 f.write(f"# 真实代理测试: 已启用\n")
+                if self.cn_check:
+                    f.write(f"# 大陆可达性检查: 已启用\n")
             f.write(f"# 返回 HTTP 407 的 URL 列表（按延迟排序）：\n")
             f.write("#\n")
             
@@ -445,25 +524,31 @@ class ServerChecker:
                         f.write(f"#   最低延迟: {min(real_latencies):.1f}ms\n")
                         f.write(f"#   最高延迟: {max(real_latencies):.1f}ms\n")
                         f.write(f"#   平均延迟: {sum(real_latencies)/len(real_latencies):.1f}ms\n")
+                        
+                        if self.cn_check:
+                            cn_accessible = [s for s in server_info if s[4] is True]
+                            f.write(f"#\n")
+                            f.write(f"# 大陆可达性统计:\n")
+                            f.write(f"#   测试服务器数: {len([s for s in server_info if s[4] is not None])}\n")
+                            f.write(f"#   大陆可达: {len(cn_accessible)}\n")
                 
                 f.write("#\n")
             
             # URL list with ping info
             f.write("# URL 列表（含 IP 和延迟信息）：\n")
-            for item in server_info:
-                if len(item) == 4:
-                    url, ip, ping_latency, real_latency = item
-                else:
-                    url, ip, ping_latency = item
-                    real_latency = None
-                    
+            for url, ip, ping_latency, real_latency, cn_accessible in server_info:
                 ip_str = ip if ip else "N/A"
                 ping_str = f"{ping_latency:.1f}ms" if ping_latency else "N/A"
                 
+                info_line = f"# {url} - IP: {ip_str} - Ping: {ping_str}"
+                
                 if self.real_ping and real_latency is not None:
-                    f.write(f"# {url} - IP: {ip_str} - Ping: {ping_str} - 真实延迟: {real_latency:.1f}ms\n")
-                else:
-                    f.write(f"# {url} - IP: {ip_str} - Ping: {ping_str}\n")
+                    info_line += f" - 真实延迟: {real_latency:.1f}ms"
+                
+                if self.cn_check and cn_accessible is not None:
+                    info_line += f" - 大陆可达: {'是' if cn_accessible else '否'}"
+                
+                f.write(info_line + "\n")
             
             f.write("\n")
             
@@ -471,13 +556,7 @@ class ServerChecker:
             f.write("# Proxies 配置（YAML格式）：\n")
             f.write("proxies:\n")
             
-            for item in server_info:
-                if len(item) == 4:
-                    url, ip, ping_latency, real_latency = item
-                else:
-                    url, ip, ping_latency = item
-                    real_latency = None
-                
+            for url, ip, ping_latency, real_latency, cn_accessible in server_info:
                 # Extract server name
                 server_name = self.extract_server_name(url)
                 country_code = self.extract_country_code(server_name)
@@ -488,7 +567,10 @@ class ServerChecker:
                 
                 # Add latency info to name if available
                 if self.real_ping and real_latency is not None:
-                    display_name = f"{display_name} (真实:{real_latency:.0f}ms)"
+                    display_name = f"{display_name} (真实:{real_latency:.0f}ms"
+                    if self.cn_check and cn_accessible is not None:
+                        display_name += f",{'CN' if cn_accessible else 'NC'}"
+                    display_name += ")"
                 elif ping_latency is not None:
                     display_name = f"{display_name} ({ping_latency:.0f}ms)"
                 
@@ -506,13 +588,14 @@ def parse_arguments():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
         description='SurfShark Server Checker - 检查 SurfShark 服务器并按 Ping 延迟排序',
-        usage='%(prog)s -addr <地址前缀> -r <起始数字>-<结束数字> [--user <用户名>] [--pass <密码>] [--real-ping]',
+        usage='%(prog)s -addr <地址前缀> -r <起始数字>-<结束数字> [--user <用户名>] [--pass <密码>] [--real-ping] [--cn-check]',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
   %(prog)s -addr hk-hkg -r 001-120
   %(prog)s -addr us-nyc -r 100-200 --user myuser --pass mypass
   %(prog)s -addr fr-par -r 001-100 --user myuser --pass mypass --real-ping
+  %(prog)s -addr sg-sng -r 001-100 --user myuser --pass mypass --real-ping --cn-check
   
 支持的功能:
   - 自动检测返回 HTTP 407 的服务器
@@ -521,6 +604,7 @@ def parse_arguments():
   - 生成 YAML 格式的代理配置
   - 支持中文和英文 Windows 系统
   - 真实代理连接延迟测试（需要有效的用户名和密码）
+  - 大陆可达性检查（--cn-check，仅在 --real-ping 时有效）
         """
     )
     
@@ -534,6 +618,8 @@ def parse_arguments():
                        help='代理密码 (默认: yyyyyy)')
     parser.add_argument('--real-ping', action='store_true',
                        help='启用真实代理连接测试（需要有效的用户名和密码）')
+    parser.add_argument('--cn-check', action='store_true',
+                       help='检查代理服务器的大陆可达性（仅在 --real-ping 时有效）')
     
     args = parser.parse_args()
     
@@ -541,6 +627,12 @@ def parse_arguments():
     if args.real_ping and (args.user == 'xxxxxx' or args.password == 'yyyyyy'):
         print("错误: --real-ping 需要提供有效的用户名和密码")
         print("请使用 --user 和 --pass 参数提供您的 SurfShark 凭据")
+        sys.exit(1)
+    
+    # Validate cn-check requirements
+    if args.cn_check and not args.real_ping:
+        print("错误: --cn-check 仅在指定 --real-ping 时有效")
+        print("请同时使用 --real-ping 和 --cn-check")
         sys.exit(1)
     
     # Parse range with better error handling
@@ -561,6 +653,8 @@ def parse_arguments():
             print(f"警告: 范围较大 ({end - start + 1} 个服务器)，测试可能需要较长时间")
             if args.real_ping:
                 print("注意: 启用了真实代理测试，将额外增加测试时间")
+                if args.cn_check:
+                    print("注意: 启用了大陆可达性检查，将进一步增加测试时间")
             response = input("是否继续? (y/n): ")
             if response.lower() != 'y':
                 print("操作已取消")
@@ -571,7 +665,7 @@ def parse_arguments():
         print("正确格式示例: 001-120")
         sys.exit(1)
     
-    return args.addr, start, end, args.user, args.password, args.real_ping
+    return args.addr, start, end, args.user, args.password, args.real_ping, args.cn_check
 
 def main():
     """Main entry point"""
@@ -591,17 +685,19 @@ def main():
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     
     try:
-        # Parse all arguments including username, password, and real_ping
-        addr_prefix, start, end, username, password, real_ping = parse_arguments()
+        # Parse all arguments including username, password, real_ping, and cn_check
+        addr_prefix, start, end, username, password, real_ping, cn_check = parse_arguments()
         
-        print(f"\nSurfShark Server Checker v2.1")
+        print(f"\nSurfShark Server Checker v2.2")
         print(f"Python {sys.version.split()[0]} on {platform.system()} {platform.release()}")
         if real_ping:
             print("模式: 真实代理延迟测试")
+            if cn_check:
+                print("大陆可达性检查: 已启用")
         print()
         
         # Create and run checker
-        checker = ServerChecker(addr_prefix, start, end, username, password, real_ping)
+        checker = ServerChecker(addr_prefix, start, end, username, password, real_ping, cn_check)
         checker.run()
         
     except KeyboardInterrupt:

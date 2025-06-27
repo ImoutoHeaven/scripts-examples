@@ -4,6 +4,9 @@ import argparse
 import re
 import subprocess
 import sys
+import time
+import signal
+import os
 from typing import List, Tuple
 
 def parse_line(line: str) -> Tuple[str, str, int]:
@@ -35,37 +38,110 @@ def parse_line(line: str) -> Tuple[str, str, int]:
 
 def pin_cid(cid: str, retries: int) -> bool:
     """
-    使用 'aleph file pin' 命令固定CID
-    如果命令失败，会重试指定的次数
+    使用 'aleph file pin --debug' 命令固定CID
+    监控输出中的 "DEBUG:aleph_client.commands.files:Upload finished"
+    看到此消息后等待2秒然后终止进程
     
     如果命令成功返回True，否则返回False
     """
-    command = f"aleph file pin {cid}"
+    command = f"aleph file pin --debug {cid}"
     
     for attempt in range(retries + 1):
         print(f"尝试 {attempt + 1}/{retries + 1}: 运行命令: {command}")
         
         try:
-            # 使用shell=True来处理aleph可能是别名的情况
-            result = subprocess.run(command, shell=True, check=False, 
-                                   capture_output=True, text=True)
+            # 使用Popen来实时监控输出
+            process = subprocess.Popen(
+                command,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True
+            )
             
-            if result.returncode == 0:
-                print(f"命令成功，输出:")
-                if result.stdout:
-                    print(result.stdout)
+            upload_finished = False
+            all_output = []
+            
+            # 实时读取输出
+            while True:
+                # 检查进程是否已经结束
+                if process.poll() is not None:
+                    # 进程已经结束，读取剩余输出
+                    remaining_output = process.stdout.read()
+                    if remaining_output:
+                        all_output.append(remaining_output)
+                        if "DEBUG:aleph_client.commands.files:Upload finished" in remaining_output:
+                            upload_finished = True
+                    break
+                
+                # 读取一行输出
+                line = process.stdout.readline()
+                if line:
+                    all_output.append(line)
+                    print(line.rstrip())  # 实时显示输出
+                    
+                    # 检查是否包含Upload finished消息
+                    if "DEBUG:aleph_client.commands.files:Upload finished" in line:
+                        upload_finished = True
+                        print("检测到Upload finished消息，等待2秒后终止进程...")
+                        
+                        # 等待2秒，期间检查进程状态
+                        start_time = time.time()
+                        while time.time() - start_time < 2:
+                            if process.poll() is not None:
+                                print("进程在等待期间自然退出")
+                                break
+                            time.sleep(0.1)
+                        
+                        # 如果进程还在运行，终止它
+                        if process.poll() is None:
+                            print("终止进程...")
+                            try:
+                                if os.name == 'nt':  # Windows
+                                    process.terminate()
+                                else:  # Unix/Linux/macOS
+                                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                                
+                                # 等待进程终止
+                                try:
+                                    process.wait(timeout=5)
+                                except subprocess.TimeoutExpired:
+                                    print("进程未能在5秒内终止，强制杀死...")
+                                    if os.name == 'nt':
+                                        process.kill()
+                                    else:
+                                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                                        process.wait()
+                            except Exception as e:
+                                print(f"终止进程时出错: {e}")
+                        break
+                else:
+                    # 没有更多输出，进程可能卡住了
+                    time.sleep(0.1)
+            
+            # 检查结果
+            return_code = process.returncode
+            
+            if upload_finished:
                 print(f"成功固定 {cid}")
                 return True
-            else:
-                print(f"命令失败，退出码 {result.returncode}")
-                if result.stderr:
-                    print(f"标准错误: {result.stderr}")
-                if result.stdout:
-                    print(f"标准输出: {result.stdout}")
+            elif return_code is not None and return_code != 0:
+                print(f"命令失败，退出码 {return_code}")
+                full_output = ''.join(all_output)
+                print(f"完整输出:\n{full_output}")
                 
                 if attempt == retries:
                     print(f"在 {retries + 1} 次尝试后无法固定 {cid}")
                     return False
+            else:
+                print(f"未检测到Upload finished消息，认为失败")
+                
+                if attempt == retries:
+                    print(f"在 {retries + 1} 次尝试后无法固定 {cid}")
+                    return False
+                    
         except Exception as e:
             print(f"发生异常: {str(e)}")
             

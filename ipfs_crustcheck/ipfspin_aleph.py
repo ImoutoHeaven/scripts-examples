@@ -5,8 +5,6 @@ import re
 import subprocess
 import sys
 import time
-import signal
-import os
 from typing import List, Tuple
 
 def parse_line(line: str) -> Tuple[str, str, int]:
@@ -99,21 +97,18 @@ def pin_cid(cid: str, retries: int) -> bool:
                         if process.poll() is None:
                             print("终止进程...")
                             try:
-                                if os.name == 'nt':  # Windows
-                                    process.terminate()
-                                else:  # Unix/Linux/macOS
-                                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                                # 只终止子进程，不影响父进程
+                                process.terminate()
                                 
                                 # 等待进程终止
                                 try:
                                     process.wait(timeout=5)
+                                    print("进程已成功终止")
                                 except subprocess.TimeoutExpired:
                                     print("进程未能在5秒内终止，强制杀死...")
-                                    if os.name == 'nt':
-                                        process.kill()
-                                    else:
-                                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-                                        process.wait()
+                                    process.kill()
+                                    process.wait()
+                                    print("进程已被强制终止")
                             except Exception as e:
                                 print(f"终止进程时出错: {e}")
                         break

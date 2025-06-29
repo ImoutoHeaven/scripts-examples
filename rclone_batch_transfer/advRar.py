@@ -12,6 +12,7 @@ import atexit
 import socket
 import tempfile
 import re
+import glob
 
 # 全局锁文件路径
 if platform.system() == 'Windows':
@@ -306,6 +307,121 @@ def build_rar_switches(profile, password, delete_files=False):
     
     return switches
 
+def find_multipart_files(base_path, base_name):
+    """
+    查找分卷压缩文件
+    支持多种分卷命名格式：.part1.rar, .part01.rar, .part001.rar 等
+    
+    Args:
+        base_path: 文件所在目录
+        base_name: 基础文件名（不含扩展名）
+        
+    Returns:
+        list: 找到的分卷文件列表，按分卷序号排序
+    """
+    multipart_files = []
+    
+    # 定义可能的分卷文件模式
+    patterns = [
+        f"{base_name}.part*.rar",     # .part1.rar, .part2.rar, ...
+        f"{base_name}.*.rar"          # 其他可能的格式
+    ]
+    
+    for pattern in patterns:
+        full_pattern = os.path.join(base_path, pattern)
+        files = glob.glob(full_pattern)
+        
+        # 过滤并验证找到的文件
+        for file in files:
+            filename = os.path.basename(file)
+            # 检查是否匹配分卷文件格式
+            if re.match(rf'^{re.escape(base_name)}\.part\d+\.rar$', filename):
+                multipart_files.append(file)
+    
+    # 按分卷号排序
+    def get_part_number(filename):
+        match = re.search(r'\.part(\d+)\.rar$', filename)
+        if match:
+            return int(match.group(1))
+        return 0
+    
+    multipart_files.sort(key=get_part_number)
+    
+    return multipart_files
+
+def generate_temp_filename(prefix="temp_archive"):
+    """生成带时间戳的临时文件名"""
+    timestamp = int(time.time() * 1000)  # 毫秒级时间戳
+    return f"{prefix}_{timestamp}"
+
+def move_archive_files(temp_base_path, temp_base_name, final_path, final_name, is_multipart, debug=False):
+    """
+    移动压缩文件（智能处理单文件和分卷）
+    
+    当指定分卷参数但文件小于分卷大小时，RAR会生成单个文件而非分卷
+    
+    Args:
+        temp_base_path: 临时文件所在目录
+        temp_base_name: 临时文件基础名（不含扩展名）
+        final_path: 最终文件所在目录
+        final_name: 最终文件基础名（不含扩展名）
+        is_multipart: 是否指定了分卷压缩参数
+        debug: 是否显示调试信息
+    
+    Returns:
+        bool: 是否成功移动所有文件
+    """
+    # 首先检查是否存在单个RAR文件（即使指定了分卷，但文件可能小于分卷大小）
+    single_temp_file = os.path.join(temp_base_path, f"{temp_base_name}.rar")
+    
+    if os.path.exists(single_temp_file):
+        # 存在单个文件，按单文件处理
+        if debug:
+            print(f"找到单个RAR文件（文件大小未超过分卷限制）: {os.path.basename(single_temp_file)}")
+        
+        final_file = os.path.join(final_path, f"{final_name}.rar")
+        
+        # 如果目标文件已存在，先删除
+        if os.path.exists(final_file):
+            try:
+                os.remove(final_file)
+                if debug:
+                    print(f"已删除已存在的RAR文件: {final_file}")
+            except Exception as e:
+                print(f"删除已存在的RAR文件失败: {e}")
+                return False
+        
+        # 移动文件
+        try:
+            shutil.move(single_temp_file, final_file)
+            print(f"已将临时RAR文件移动到最终位置: {final_file}")
+            return True
+        except Exception as e:
+            print(f"移动临时RAR文件时出错: {e}")
+            return False
+    
+    # 如果不存在单个文件，检查是否有分卷文件
+    elif is_multipart:
+        # 查找所有分卷文件
+        multipart_files = find_multipart_files(temp_base_path, temp_base_name)
+        
+        if not multipart_files:
+            print(f"错误：既未找到单个RAR文件，也未找到分卷文件")
+            print(f"  预期的单文件: {single_temp_file}")
+            print(f"  预期的分卷文件: {temp_base_name}.part*.rar")
+            return False
+        
+        if debug:
+            print(f"找到 {len(multipart_files)} 个分卷文件:")
+            for f in multipart_files:
+                print(f"  - {os.path.basename(f)}")
+        
+        # 移动每个分卷文件
+        for temp_file in multipart_files:
+            # 获取分卷号
+            temp_filename = os.path.basename(temp_file)
+            match = re.search(r'\.part(\d+)\.rar
+
 def process_file(file_path, args):
     """处理单个文件的压缩操作"""
     # 获取文件名（不含扩展名）
@@ -313,12 +429,13 @@ def process_file(file_path, args):
     file_name = os.path.basename(file_path)
     name_without_ext = os.path.splitext(file_name)[0]
     
-    # 构建RAR文件路径（在同一目录中）
-    final_rar_file = os.path.join(file_dir, f"{name_without_ext}.rar")
-    
-    # 临时文件名
-    temp_rar_name = f"temp_{name_without_ext}.rar"
+    # 生成带时间戳的临时文件名
+    temp_base_name = generate_temp_filename(f"temp_{name_without_ext}")
+    temp_rar_name = f"{temp_base_name}.rar"
     temp_rar_path = os.path.join(file_dir, temp_rar_name)
+    
+    # 检查是否为分卷压缩
+    is_multipart = args.profile.startswith('parted-')
     
     # 保存当前工作目录
     original_cwd = os.getcwd()
@@ -355,8 +472,9 @@ def process_file(file_path, args):
             print("调试信息 (文件):")
             print(f"- 原始文件路径: {file_path}")
             print(f"- 文件名: {file_name}")
+            print(f"- 临时文件基础名: {temp_base_name}")
             print(f"- 临时RAR文件: {temp_rar_name}")
-            print(f"- 最终目标RAR文件: {final_rar_file}")
+            print(f"- 是否分卷: {is_multipart}")
             print(f"- 当前工作目录: {os.getcwd()}")
             print(f"- 命令列表: {rar_cmd}")
             print("=" * 50)
@@ -387,30 +505,16 @@ def process_file(file_path, args):
             
             # 检查命令执行结果
             if result.returncode == 0:
-                print(f"成功创建临时RAR文件: {temp_rar_path}")
+                print(f"成功创建临时RAR文件")
                 
                 # 切换回原始工作目录
                 os.chdir(original_cwd)
                 
-                # 如果存在同名文件，先删除
-                if os.path.exists(final_rar_file) and temp_rar_path != final_rar_file:
-                    try:
-                        os.remove(final_rar_file)
-                        if args.debug:
-                            print(f"已删除已存在的RAR文件: {final_rar_file}")
-                    except Exception as e:
-                        print(f"删除已存在的RAR文件失败: {e}")
-                        return
-                
-                # 重命名临时RAR文件到最终位置
-                try:
-                    shutil.move(temp_rar_path, final_rar_file)
-                    print(f"已将临时RAR文件移动到最终位置: {final_rar_file}")
-                except Exception as e:
-                    print(f"移动临时RAR文件时出错: {e}")
-                    if args.debug:
-                        import traceback
-                        traceback.print_exc()
+                # 移动文件
+                if move_archive_files(file_dir, temp_base_name, file_dir, name_without_ext, is_multipart, args.debug):
+                    print(f"成功处理文件: {file_path}")
+                else:
+                    print(f"移动文件失败: {file_path}")
             else:
                 print(f"创建RAR文件失败，返回码: {result.returncode}")
                 print(f"错误输出: {result.stderr}")
@@ -432,12 +536,13 @@ def process_folder(folder_path, args):
     folder_name = os.path.basename(folder_path)
     parent_dir = os.path.dirname(folder_path)
     
-    # 构建RAR文件路径（在父目录中）
-    final_rar_file = os.path.join(parent_dir, f"{folder_name}.rar")
-    
-    # 临时文件名，直接放在上级目录
-    temp_rar_name = "temp_archive.rar"
+    # 生成带时间戳的临时文件名
+    temp_base_name = generate_temp_filename()
+    temp_rar_name = f"{temp_base_name}.rar"
     temp_rar_path = os.path.join(parent_dir, temp_rar_name)
+    
+    # 检查是否为分卷压缩
+    is_multipart = args.profile.startswith('parted-')
     
     # 保存当前工作目录
     original_cwd = os.getcwd()
@@ -471,8 +576,9 @@ def process_folder(folder_path, args):
             print("=" * 50)
             print("调试信息 (文件夹):")
             print(f"- 原始文件夹路径: {folder_path}")
+            print(f"- 临时文件基础名: {temp_base_name}")
             print(f"- 临时RAR文件: {temp_rar_path}")
-            print(f"- 最终目标RAR文件: {final_rar_file}")
+            print(f"- 是否分卷: {is_multipart}")
             print(f"- 当前工作目录: {os.getcwd()}")
             print(f"- 命令列表: {rar_cmd}")
             print("=" * 50)
@@ -503,54 +609,14 @@ def process_folder(folder_path, args):
             
             # 检查命令执行结果
             if result.returncode == 0:
-                print(f"成功创建临时RAR文件: {temp_rar_path}")
+                print(f"成功创建临时RAR文件")
                 
                 # 切换回原始工作目录
                 os.chdir(original_cwd)
                 
-                # 如果存在同名文件，先删除
-                if os.path.exists(final_rar_file) and temp_rar_path != final_rar_file:
-                    try:
-                        os.remove(final_rar_file)
-                        if args.debug:
-                            print(f"已删除已存在的RAR文件: {final_rar_file}")
-                    except Exception as e:
-                        print(f"删除已存在的RAR文件失败: {e}")
-                        return
-                
-                # 重命名临时RAR文件到最终位置
-                try:
-                    # 对于Windows长路径，使用特殊的移动方法
-                    if is_windows() and (len(final_rar_file) > 250 or len(temp_rar_path) > 250):
-                        import ctypes
-                        from ctypes import wintypes
-                        
-                        # 定义必要的函数和常量
-                        MOVEFILE_REPLACE_EXISTING = 0x1
-                        MoveFileExW = windll.kernel32.MoveFileExW
-                        MoveFileExW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
-                        MoveFileExW.restype = wintypes.BOOL
-                        
-                        # 准备完整路径（使用\\?\前缀）
-                        src_path = f"\\\\?\\{os.path.abspath(temp_rar_path)}"
-                        dst_path = f"\\\\?\\{os.path.abspath(final_rar_file)}"
-                        
-                        if args.debug:
-                            print(f"使用Windows API移动文件:")
-                            print(f"- 源路径: {src_path}")
-                            print(f"- 目标路径: {dst_path}")
-                        
-                        # 调用Windows API移动文件
-                        result = MoveFileExW(src_path, dst_path, MOVEFILE_REPLACE_EXISTING)
-                        if not result:
-                            error_code = ctypes.GetLastError()
-                            print(f"移动文件失败，错误码: {error_code}")
-                            return
-                    else:
-                        # 对于正常长度的路径，使用标准方法
-                        shutil.move(temp_rar_path, final_rar_file)
-                    
-                    print(f"已将临时RAR文件移动到最终位置: {final_rar_file}")
+                # 移动文件
+                if move_archive_files(parent_dir, temp_base_name, parent_dir, folder_name, is_multipart, args.debug):
+                    print(f"成功处理文件夹: {folder_path}")
                     
                     # 如果指定了删除选项，则尝试删除可能剩余的空文件夹
                     # 由于文件已经由RAR的-df选项删除，这里只需尝试删除文件夹结构
@@ -563,11 +629,348 @@ def process_folder(folder_path, args):
                             print(f"无法删除原始文件夹（可能不为空）: {folder_path}")
                             if args.debug:
                                 print(f"删除错误: {e}")
+                else:
+                    print(f"移动文件失败: {folder_path}")
+            else:
+                print(f"创建RAR文件失败，返回码: {result.returncode}")
+                print(f"错误输出: {result.stderr}")
+        except Exception as e:
+            print(f"执行RAR命令时出错: {e}")
+            if args.debug:
+                import traceback
+                traceback.print_exc()
+    finally:
+        # 确保无论如何都会切换回原始工作目录
+        try:
+            os.chdir(original_cwd)
+        except Exception as e:
+            print(f"切换回原始工作目录时出错: {e}")
+
+def main():
+    """主函数"""
+    args = parse_arguments()
+    
+    # 验证目标路径
+    if not os.path.exists(args.folder_path):
+        print(f"错误: 路径不存在 - {args.folder_path}")
+        sys.exit(1)
+    
+    if not os.path.isdir(args.folder_path):
+        print(f"错误: 不是一个目录 - {args.folder_path}")
+        sys.exit(1)
+    
+    # 尝试获取全局锁（除非指定了--no-lock选项）
+    if not args.no_lock:
+        if not acquire_lock(max_attempts=args.lock_timeout):
+            print("无法获取全局锁，退出程序")
+            sys.exit(2)
+        print(f"成功获取全局锁: {LOCK_FILE}")
+    
+    try:
+        # 在Windows系统上启用长路径支持
+        if is_windows():
+            # 尝试启用Windows长路径支持
+            try:
+                import ctypes
+                # 使用UTF-8模式以更好地支持非英文字符
+                if hasattr(ctypes.windll.kernel32, 'SetConsoleCP'):
+                    ctypes.windll.kernel32.SetConsoleCP(65001)
+                    ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+                # 设置处理文件API的行为，启用长路径支持
+                if hasattr(ctypes.windll.kernel32, 'SetProcessAffinityMask'):
+                    ctypes.windll.kernel32.SetProcessAffinityMask(
+                        ctypes.windll.kernel32.GetCurrentProcess(),
+                        0x00400000  # PROCESS_LONG_PATH_AWARE
+                    )
+                if args.debug:
+                    print("已尝试启用Windows长路径支持")
+            except Exception as e:
+                if args.debug:
+                    print(f"启用Windows长路径支持时出错: {e}")
+        
+        # 获取指定深度的文件和文件夹列表
+        items = get_items_at_depth(args.folder_path, args.depth)
+        
+        if args.debug:
+            print(f"找到以下符合深度 {args.depth} 的项目:")
+            print(f"文件数量: {len(items['files'])}")
+            print(f"文件夹数量: {len(items['folders'])}")
+            if len(items['files']) > 0:
+                print("文件列表（前10个）:")
+                for path in items['files'][:10]:
+                    print(f"- {path}")
+                if len(items['files']) > 10:
+                    print(f"... 还有 {len(items['files']) - 10} 个文件")
+            if len(items['folders']) > 0:
+                print("文件夹列表（前10个）:")
+                for path in items['folders'][:10]:
+                    print(f"- {path}")
+                if len(items['folders']) > 10:
+                    print(f"... 还有 {len(items['folders']) - 10} 个文件夹")
+        
+        total_items = len(items['files']) + len(items['folders'])
+        if total_items == 0:
+            print(f"警告: 在深度 {args.depth} 没有找到任何文件或文件夹")
+            sys.exit(0)
+        
+        print(f"准备处理 {total_items} 个项目（{len(items['files'])} 个文件，{len(items['folders'])} 个文件夹）")
+        
+        # 处理每个找到的文件
+        for i, file_path in enumerate(items['files'], 1):
+            print(f"\n[{i}/{len(items['files'])}] 处理文件: {file_path}")
+            process_file(file_path, args)
+        
+        # 处理每个找到的文件夹
+        for i, folder_path in enumerate(items['folders'], 1):
+            print(f"\n[{i}/{len(items['folders'])}] 处理文件夹: {folder_path}")
+            process_folder(folder_path, args)
+            
+    finally:
+        # 确保释放锁（如果已获取）
+        if not args.no_lock:
+            release_lock()
+            print("\n已释放全局锁")
+
+if __name__ == "__main__":
+    main(), temp_filename)
+            if match:
+                part_num = match.group(1)
+                final_file = os.path.join(final_path, f"{final_name}.part{part_num}.rar")
+                
+                # 如果目标文件已存在，先删除
+                if os.path.exists(final_file):
+                    try:
+                        os.remove(final_file)
+                        if debug:
+                            print(f"已删除已存在的分卷文件: {final_file}")
+                    except Exception as e:
+                        print(f"删除已存在的分卷文件失败: {e}")
+                        return False
+                
+                # 移动文件
+                try:
+                    shutil.move(temp_file, final_file)
+                    print(f"已移动分卷文件: {os.path.basename(temp_file)} -> {os.path.basename(final_file)}")
                 except Exception as e:
-                    print(f"移动临时RAR文件时出错: {e}")
-                    if args.debug:
-                        import traceback
-                        traceback.print_exc()
+                    print(f"移动分卷文件失败: {e}")
+                    return False
+        
+        return True
+    
+    else:
+        # 非分卷模式，但找不到单个文件
+        print(f"错误：临时文件不存在: {single_temp_file}")
+        return False
+
+def process_file(file_path, args):
+    """处理单个文件的压缩操作"""
+    # 获取文件名（不含扩展名）
+    file_dir = os.path.dirname(file_path)
+    file_name = os.path.basename(file_path)
+    name_without_ext = os.path.splitext(file_name)[0]
+    
+    # 生成带时间戳的临时文件名
+    temp_base_name = generate_temp_filename(f"temp_{name_without_ext}")
+    temp_rar_name = f"{temp_base_name}.rar"
+    temp_rar_path = os.path.join(file_dir, temp_rar_name)
+    
+    # 检查是否为分卷压缩
+    is_multipart = args.profile.startswith('parted-')
+    
+    # 保存当前工作目录
+    original_cwd = os.getcwd()
+    
+    try:
+        # 切换到文件所在目录
+        os.chdir(file_dir)
+        
+        # 获取RAR命令开关
+        rar_switches = build_rar_switches(args.profile, args.password, args.delete)
+        
+        # 构建RAR命令
+        rar_cmd = [get_rar_command(), 'a']
+        rar_cmd.extend(rar_switches)
+        
+        # 添加输出路径（当前目录的临时文件）
+        if ' ' in temp_rar_name or any(c in temp_rar_name for c in '*?[]()^!'):
+            rar_cmd.append(f'"{temp_rar_name}"')
+        else:
+            rar_cmd.append(temp_rar_name)
+        
+        # 添加输入文件（只使用文件名，不包含路径）
+        if ' ' in file_name or any(c in file_name for c in '*?[]()^!'):
+            rar_cmd.append(f'"{file_name}"')
+        else:
+            rar_cmd.append(file_name)
+        
+        # 将命令列表转换为字符串用于打印
+        cmd_str = ' '.join(rar_cmd)
+        
+        # 调试输出
+        if args.debug:
+            print("=" * 50)
+            print("调试信息 (文件):")
+            print(f"- 原始文件路径: {file_path}")
+            print(f"- 文件名: {file_name}")
+            print(f"- 临时文件基础名: {temp_base_name}")
+            print(f"- 临时RAR文件: {temp_rar_name}")
+            print(f"- 是否分卷: {is_multipart}")
+            print(f"- 当前工作目录: {os.getcwd()}")
+            print(f"- 命令列表: {rar_cmd}")
+            print("=" * 50)
+        
+        if args.dry_run:
+            print(f"[DRY-RUN] 将执行: {cmd_str}")
+            return
+        
+        print(f"执行: {cmd_str}")
+        
+        # 执行RAR命令
+        try:
+            use_shell = is_windows()
+            
+            if use_shell:
+                result = subprocess.run(cmd_str, shell=True, check=False, capture_output=True, text=True)
+            else:
+                # 对于非Windows系统，移除命令中的引号
+                cleaned_cmd = [arg.strip('"\'') for arg in rar_cmd]
+                result = subprocess.run(cleaned_cmd, shell=False, check=False, capture_output=True, text=True)
+            
+            # 输出详细的执行结果（如果开启了调试模式）
+            if args.debug:
+                print("命令执行结果:")
+                print(f"- 返回码: {result.returncode}")
+                print(f"- 标准输出: {result.stdout}")
+                print(f"- 错误输出: {result.stderr}")
+            
+            # 检查命令执行结果
+            if result.returncode == 0:
+                print(f"成功创建临时RAR文件")
+                
+                # 切换回原始工作目录
+                os.chdir(original_cwd)
+                
+                # 移动文件
+                if move_archive_files(file_dir, temp_base_name, file_dir, name_without_ext, is_multipart, args.debug):
+                    print(f"成功处理文件: {file_path}")
+                else:
+                    print(f"移动文件失败: {file_path}")
+            else:
+                print(f"创建RAR文件失败，返回码: {result.returncode}")
+                print(f"错误输出: {result.stderr}")
+        except Exception as e:
+            print(f"执行RAR命令时出错: {e}")
+            if args.debug:
+                import traceback
+                traceback.print_exc()
+    finally:
+        # 确保无论如何都会切换回原始工作目录
+        try:
+            os.chdir(original_cwd)
+        except Exception as e:
+            print(f"切换回原始工作目录时出错: {e}")
+
+def process_folder(folder_path, args):
+    """处理单个文件夹的压缩操作"""
+    # 获取文件夹名称
+    folder_name = os.path.basename(folder_path)
+    parent_dir = os.path.dirname(folder_path)
+    
+    # 生成带时间戳的临时文件名
+    temp_base_name = generate_temp_filename()
+    temp_rar_name = f"{temp_base_name}.rar"
+    temp_rar_path = os.path.join(parent_dir, temp_rar_name)
+    
+    # 检查是否为分卷压缩
+    is_multipart = args.profile.startswith('parted-')
+    
+    # 保存当前工作目录
+    original_cwd = os.getcwd()
+    
+    try:
+        # 切换到目标文件夹
+        os.chdir(folder_path)
+        
+        # 获取RAR命令开关，对于文件夹需要添加-r选项
+        rar_switches = build_rar_switches(args.profile, args.password, args.delete)
+        rar_switches.insert(0, '-r')  # 在开头添加递归选项
+        
+        # 构建RAR命令
+        rar_cmd = [get_rar_command(), 'a']
+        rar_cmd.extend(rar_switches)
+        
+        # 添加输出路径（上级目录中的临时文件）
+        if ' ' in temp_rar_name or any(c in temp_rar_name for c in '*?[]()^!'):
+            rar_cmd.append(f'"../{temp_rar_name}"')
+        else:
+            rar_cmd.append(f"../{temp_rar_name}")
+        
+        # 添加输入通配符，表示当前目录下的所有文件
+        rar_cmd.append('*')
+        
+        # 将命令列表转换为字符串用于打印
+        cmd_str = ' '.join(rar_cmd)
+        
+        # 调试输出
+        if args.debug:
+            print("=" * 50)
+            print("调试信息 (文件夹):")
+            print(f"- 原始文件夹路径: {folder_path}")
+            print(f"- 临时文件基础名: {temp_base_name}")
+            print(f"- 临时RAR文件: {temp_rar_path}")
+            print(f"- 是否分卷: {is_multipart}")
+            print(f"- 当前工作目录: {os.getcwd()}")
+            print(f"- 命令列表: {rar_cmd}")
+            print("=" * 50)
+        
+        if args.dry_run:
+            print(f"[DRY-RUN] 将执行: {cmd_str}")
+            return
+        
+        print(f"执行: {cmd_str}")
+        
+        # 执行RAR命令
+        try:
+            use_shell = is_windows()
+            
+            if use_shell:
+                result = subprocess.run(cmd_str, shell=True, check=False, capture_output=True, text=True)
+            else:
+                # 对于非Windows系统，移除命令中的引号
+                cleaned_cmd = [arg.strip('"\'') for arg in rar_cmd]
+                result = subprocess.run(cleaned_cmd, shell=False, check=False, capture_output=True, text=True)
+            
+            # 输出详细的执行结果（如果开启了调试模式）
+            if args.debug:
+                print("命令执行结果:")
+                print(f"- 返回码: {result.returncode}")
+                print(f"- 标准输出: {result.stdout}")
+                print(f"- 错误输出: {result.stderr}")
+            
+            # 检查命令执行结果
+            if result.returncode == 0:
+                print(f"成功创建临时RAR文件")
+                
+                # 切换回原始工作目录
+                os.chdir(original_cwd)
+                
+                # 移动文件
+                if move_archive_files(parent_dir, temp_base_name, parent_dir, folder_name, is_multipart, args.debug):
+                    print(f"成功处理文件夹: {folder_path}")
+                    
+                    # 如果指定了删除选项，则尝试删除可能剩余的空文件夹
+                    # 由于文件已经由RAR的-df选项删除，这里只需尝试删除文件夹结构
+                    if args.delete:
+                        try:
+                            # 尝试删除文件夹（应该只剩下空结构）
+                            os.rmdir(folder_path)
+                            print(f"已删除原始文件夹: {folder_path}")
+                        except Exception as e:
+                            print(f"无法删除原始文件夹（可能不为空）: {folder_path}")
+                            if args.debug:
+                                print(f"删除错误: {e}")
+                else:
+                    print(f"移动文件失败: {folder_path}")
             else:
                 print(f"创建RAR文件失败，返回码: {result.returncode}")
                 print(f"错误输出: {result.stderr}")

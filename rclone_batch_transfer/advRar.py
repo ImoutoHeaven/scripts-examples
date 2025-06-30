@@ -307,148 +307,119 @@ def build_rar_switches(profile, password, delete_files=False):
     
     return switches
 
-def find_multipart_files(base_path, base_name):
+def find_and_rename_rar_files(temp_name_prefix, target_name_prefix, search_dir, debug=False):
     """
-    查找分卷压缩文件
-    支持多种分卷命名格式：.part1.rar, .part01.rar, .part001.rar 等
+    查找并重命名RAR文件（支持分卷）
     
     Args:
-        base_path: 文件所在目录
-        base_name: 基础文件名（不含扩展名）
+        temp_name_prefix: 临时文件名前缀（如 "temp_archive"）
+        target_name_prefix: 目标文件名前缀（如 "folder_name"）
+        search_dir: 搜索目录
+        debug: 是否输出调试信息
         
     Returns:
-        list: 找到的分卷文件列表，按分卷序号排序
+        tuple: (success, moved_files) - 是否成功，移动的文件列表
     """
-    multipart_files = []
+    moved_files = []
     
-    # 定义可能的分卷文件模式
-    patterns = [
-        f"{base_name}.part*.rar",     # .part1.rar, .part2.rar, ...
-        f"{base_name}.*.rar"          # 其他可能的格式
+    # 首先查找单个RAR文件
+    single_rar = os.path.join(search_dir, f"{temp_name_prefix}.rar")
+    
+    if os.path.exists(single_rar):
+        # 找到单个RAR文件
+        target_file = os.path.join(search_dir, f"{target_name_prefix}.rar")
+        
+        if debug:
+            print(f"找到单个RAR文件: {single_rar}")
+            print(f"目标文件: {target_file}")
+        
+        try:
+            # 如果目标文件已存在，先删除
+            if os.path.exists(target_file):
+                os.remove(target_file)
+                if debug:
+                    print(f"已删除已存在的目标文件: {target_file}")
+            
+            # 移动文件
+            shutil.move(single_rar, target_file)
+            moved_files.append(target_file)
+            if debug:
+                print(f"成功移动文件: {single_rar} -> {target_file}")
+            
+            return True, moved_files
+            
+        except Exception as e:
+            print(f"移动单个RAR文件时出错: {e}")
+            return False, []
+    
+    # 如果没有找到单个RAR文件，查找分卷文件
+    # 支持多种分卷命名格式：
+    # temp_archive.part1.rar, temp_archive.part01.rar, temp_archive.part001.rar
+    part_patterns = [
+        f"{temp_name_prefix}.part*.rar",
+        f"{temp_name_prefix}.part*.RAR"  # 也支持大写扩展名
     ]
     
-    for pattern in patterns:
-        full_pattern = os.path.join(base_path, pattern)
-        files = glob.glob(full_pattern)
-        
-        # 过滤并验证找到的文件
-        for file in files:
-            filename = os.path.basename(file)
-            # 检查是否匹配分卷文件格式
-            if re.match(rf'^{re.escape(base_name)}\.part\d+\.rar$', filename):
-                multipart_files.append(file)
+    part_files = []
+    for pattern in part_patterns:
+        search_pattern = os.path.join(search_dir, pattern)
+        found_files = glob.glob(search_pattern)
+        part_files.extend(found_files)
     
-    # 按分卷号排序
-    def get_part_number(filename):
-        match = re.search(r'\.part(\d+)\.rar$', filename)
-        if match:
-            return int(match.group(1))
-        return 0
+    # 去重并排序
+    part_files = sorted(list(set(part_files)))
     
-    multipart_files.sort(key=get_part_number)
+    if debug:
+        print(f"搜索分卷文件模式: {part_patterns}")
+        print(f"找到的分卷文件: {part_files}")
     
-    return multipart_files
-
-def generate_temp_filename(prefix="temp_archive"):
-    """生成带时间戳的临时文件名"""
-    timestamp = int(time.time() * 1000)  # 毫秒级时间戳
-    return f"{prefix}_{timestamp}"
-
-def move_archive_files(temp_base_path, temp_base_name, final_path, final_name, is_multipart, debug=False):
-    """
-    移动压缩文件（智能处理单文件和分卷）
+    if not part_files:
+        print(f"错误: 没有找到RAR文件 {temp_name_prefix}.rar 或分卷文件 {temp_name_prefix}.part*.rar")
+        return False, []
     
-    当指定分卷参数但文件小于分卷大小时，RAR会生成单个文件而非分卷
+    # 处理分卷文件
+    print(f"找到 {len(part_files)} 个分卷文件，开始重命名...")
     
-    Args:
-        temp_base_path: 临时文件所在目录
-        temp_base_name: 临时文件基础名（不含扩展名）
-        final_path: 最终文件所在目录
-        final_name: 最终文件基础名（不含扩展名）
-        is_multipart: 是否指定了分卷压缩参数
-        debug: 是否显示调试信息
-    
-    Returns:
-        bool: 是否成功移动所有文件
-    """
-    # 首先检查是否存在单个RAR文件（即使指定了分卷，但文件可能小于分卷大小）
-    single_temp_file = os.path.join(temp_base_path, f"{temp_base_name}.rar")
-    
-    if os.path.exists(single_temp_file):
-        # 存在单个文件，按单文件处理
-        if debug:
-            print(f"找到单个RAR文件（文件大小未超过分卷限制）: {os.path.basename(single_temp_file)}")
-        
-        final_file = os.path.join(final_path, f"{final_name}.rar")
-        
-        # 如果目标文件已存在，先删除
-        if os.path.exists(final_file):
-            try:
-                os.remove(final_file)
-                if debug:
-                    print(f"已删除已存在的RAR文件: {final_file}")
-            except Exception as e:
-                print(f"删除已存在的RAR文件失败: {e}")
-                return False
-        
-        # 移动文件
-        try:
-            shutil.move(single_temp_file, final_file)
-            print(f"已将临时RAR文件移动到最终位置: {final_file}")
-            return True
-        except Exception as e:
-            print(f"移动临时RAR文件时出错: {e}")
-            return False
-    
-    # 如果不存在单个文件，检查是否有分卷文件
-    elif is_multipart:
-        # 查找所有分卷文件
-        multipart_files = find_multipart_files(temp_base_path, temp_base_name)
-        
-        if not multipart_files:
-            print(f"错误：既未找到单个RAR文件，也未找到分卷文件")
-            print(f"  预期的单文件: {single_temp_file}")
-            print(f"  预期的分卷文件: {temp_base_name}.part*.rar")
-            return False
-        
-        if debug:
-            print(f"找到 {len(multipart_files)} 个分卷文件:")
-            for f in multipart_files:
-                print(f"  - {os.path.basename(f)}")
-        
-        # 移动每个分卷文件
-        for temp_file in multipart_files:
-            # 获取分卷号
-            temp_filename = os.path.basename(temp_file)
-            match = re.search(r'\.part(\d+)\.rar$', temp_filename)
+    try:
+        for part_file in part_files:
+            # 从文件名中提取part信息
+            filename = os.path.basename(part_file)
+            
+            # 使用正则表达式提取part部分
+            # 支持格式：temp_archive.part1.rar, temp_archive.part01.rar等
+            pattern = rf'^{re.escape(temp_name_prefix)}\.(.+)\.rar$'
+            match = re.match(pattern, filename, re.IGNORECASE)
+            
             if match:
-                part_num = match.group(1)
-                final_file = os.path.join(final_path, f"{final_name}.part{part_num}.rar")
+                part_suffix = match.group(1)  # 例如 "part1", "part01", "part001"
+                target_filename = f"{target_name_prefix}.{part_suffix}.rar"
+                target_file = os.path.join(search_dir, target_filename)
+                
+                if debug:
+                    print(f"重命名分卷: {part_file} -> {target_file}")
                 
                 # 如果目标文件已存在，先删除
-                if os.path.exists(final_file):
-                    try:
-                        os.remove(final_file)
-                        if debug:
-                            print(f"已删除已存在的分卷文件: {final_file}")
-                    except Exception as e:
-                        print(f"删除已存在的分卷文件失败: {e}")
-                        return False
+                if os.path.exists(target_file):
+                    os.remove(target_file)
+                    if debug:
+                        print(f"已删除已存在的目标文件: {target_file}")
                 
                 # 移动文件
-                try:
-                    shutil.move(temp_file, final_file)
-                    print(f"已移动分卷文件: {os.path.basename(temp_file)} -> {os.path.basename(final_file)}")
-                except Exception as e:
-                    print(f"移动分卷文件失败: {e}")
-                    return False
+                shutil.move(part_file, target_file)
+                moved_files.append(target_file)
+                
+            else:
+                print(f"警告: 无法解析分卷文件名格式: {filename}")
         
-        return True
-    
-    else:
-        # 非分卷模式，但找不到单个文件
-        print(f"错误：临时文件不存在: {single_temp_file}")
-        return False
+        print(f"成功处理 {len(moved_files)} 个分卷文件")
+        return True, moved_files
+        
+    except Exception as e:
+        print(f"处理分卷文件时出错: {e}")
+        if debug:
+            import traceback
+            traceback.print_exc()
+        return False, moved_files
 
 def process_file(file_path, args):
     """处理单个文件的压缩操作"""
@@ -457,13 +428,9 @@ def process_file(file_path, args):
     file_name = os.path.basename(file_path)
     name_without_ext = os.path.splitext(file_name)[0]
     
-    # 生成带时间戳的临时文件名
-    temp_base_name = generate_temp_filename(f"temp_{name_without_ext}")
-    temp_rar_name = f"{temp_base_name}.rar"
-    temp_rar_path = os.path.join(file_dir, temp_rar_name)
-    
-    # 检查是否为分卷压缩
-    is_multipart = args.profile.startswith('parted-')
+    # 临时文件名前缀
+    temp_name_prefix = f"temp_{name_without_ext}"
+    temp_rar_name = f"{temp_name_prefix}.rar"
     
     # 保存当前工作目录
     original_cwd = os.getcwd()
@@ -500,9 +467,7 @@ def process_file(file_path, args):
             print("调试信息 (文件):")
             print(f"- 原始文件路径: {file_path}")
             print(f"- 文件名: {file_name}")
-            print(f"- 临时文件基础名: {temp_base_name}")
-            print(f"- 临时RAR文件: {temp_rar_name}")
-            print(f"- 是否分卷: {is_multipart}")
+            print(f"- 临时RAR文件前缀: {temp_name_prefix}")
             print(f"- 当前工作目录: {os.getcwd()}")
             print(f"- 命令列表: {rar_cmd}")
             print("=" * 50)
@@ -533,16 +498,30 @@ def process_file(file_path, args):
             
             # 检查命令执行结果
             if result.returncode == 0:
-                print(f"成功创建临时RAR文件")
+                print(f"成功创建RAR文件")
                 
                 # 切换回原始工作目录
                 os.chdir(original_cwd)
                 
-                # 移动文件
-                if move_archive_files(file_dir, temp_base_name, file_dir, name_without_ext, is_multipart, args.debug):
-                    print(f"成功处理文件: {file_path}")
+                # 查找并重命名RAR文件（支持分卷）
+                success, moved_files = find_and_rename_rar_files(
+                    temp_name_prefix, 
+                    name_without_ext, 
+                    file_dir, 
+                    args.debug
+                )
+                
+                if success:
+                    if len(moved_files) == 1:
+                        print(f"成功创建RAR文件: {moved_files[0]}")
+                    else:
+                        print(f"成功创建RAR分卷文件: {len(moved_files)} 个文件")
+                        if args.debug:
+                            for f in moved_files:
+                                print(f"  - {f}")
                 else:
-                    print(f"移动文件失败: {file_path}")
+                    print("重命名RAR文件失败")
+                    
             else:
                 print(f"创建RAR文件失败，返回码: {result.returncode}")
                 print(f"错误输出: {result.stderr}")
@@ -564,13 +543,9 @@ def process_folder(folder_path, args):
     folder_name = os.path.basename(folder_path)
     parent_dir = os.path.dirname(folder_path)
     
-    # 生成带时间戳的临时文件名
-    temp_base_name = generate_temp_filename()
-    temp_rar_name = f"{temp_base_name}.rar"
-    temp_rar_path = os.path.join(parent_dir, temp_rar_name)
-    
-    # 检查是否为分卷压缩
-    is_multipart = args.profile.startswith('parted-')
+    # 临时文件名前缀，直接放在上级目录
+    temp_name_prefix = "temp_archive"
+    temp_rar_name = f"{temp_name_prefix}.rar"
     
     # 保存当前工作目录
     original_cwd = os.getcwd()
@@ -604,9 +579,7 @@ def process_folder(folder_path, args):
             print("=" * 50)
             print("调试信息 (文件夹):")
             print(f"- 原始文件夹路径: {folder_path}")
-            print(f"- 临时文件基础名: {temp_base_name}")
-            print(f"- 临时RAR文件: {temp_rar_path}")
-            print(f"- 是否分卷: {is_multipart}")
+            print(f"- 临时RAR文件前缀: {temp_name_prefix}")
             print(f"- 当前工作目录: {os.getcwd()}")
             print(f"- 命令列表: {rar_cmd}")
             print("=" * 50)
@@ -637,14 +610,27 @@ def process_folder(folder_path, args):
             
             # 检查命令执行结果
             if result.returncode == 0:
-                print(f"成功创建临时RAR文件")
+                print(f"成功创建RAR文件")
                 
                 # 切换回原始工作目录
                 os.chdir(original_cwd)
                 
-                # 移动文件
-                if move_archive_files(parent_dir, temp_base_name, parent_dir, folder_name, is_multipart, args.debug):
-                    print(f"成功处理文件夹: {folder_path}")
+                # 查找并重命名RAR文件（支持分卷）
+                success, moved_files = find_and_rename_rar_files(
+                    temp_name_prefix, 
+                    folder_name, 
+                    parent_dir, 
+                    args.debug
+                )
+                
+                if success:
+                    if len(moved_files) == 1:
+                        print(f"成功创建RAR文件: {moved_files[0]}")
+                    else:
+                        print(f"成功创建RAR分卷文件: {len(moved_files)} 个文件")
+                        if args.debug:
+                            for f in moved_files:
+                                print(f"  - {f}")
                     
                     # 如果指定了删除选项，则尝试删除可能剩余的空文件夹
                     # 由于文件已经由RAR的-df选项删除，这里只需尝试删除文件夹结构
@@ -658,7 +644,8 @@ def process_folder(folder_path, args):
                             if args.debug:
                                 print(f"删除错误: {e}")
                 else:
-                    print(f"移动文件失败: {folder_path}")
+                    print("重命名RAR文件失败")
+                    
             else:
                 print(f"创建RAR文件失败，返回码: {result.returncode}")
                 print(f"错误输出: {result.stderr}")

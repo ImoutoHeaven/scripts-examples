@@ -186,6 +186,7 @@ def parse_arguments():
     parser.add_argument('--debug', action='store_true', help='显示调试信息')
     parser.add_argument('--no-lock', action='store_true', help='不使用全局锁（谨慎使用）')
     parser.add_argument('--lock-timeout', type=int, default=30, help='锁定超时时间（最大重试次数）')
+    parser.add_argument('--out', help='指定压缩后文件的输出目录路径')
     
     return parser.parse_args()
 
@@ -421,12 +422,48 @@ def find_and_rename_rar_files(temp_name_prefix, target_name_prefix, search_dir, 
             traceback.print_exc()
         return False, moved_files
 
-def process_file(file_path, args):
+def get_relative_path(item_path, base_path):
+    """计算项目相对于基础路径的相对路径"""
+    # 获取绝对路径
+    item_abs = os.path.abspath(item_path)
+    base_abs = os.path.abspath(base_path)
+    
+    # 计算相对路径
+    rel_path = os.path.relpath(item_abs, base_abs)
+    
+    # 如果是当前目录，返回基础路径的名称
+    if rel_path == '.':
+        return os.path.basename(base_abs)
+    
+    return rel_path
+
+def process_file(file_path, args, base_path):
     """处理单个文件的压缩操作"""
     # 获取文件名（不含扩展名）
     file_dir = os.path.dirname(file_path)
     file_name = os.path.basename(file_path)
     name_without_ext = os.path.splitext(file_name)[0]
+    
+    # 计算相对路径，用于确定输出文件名
+    rel_path = get_relative_path(file_path, base_path)
+    rel_name_without_ext = os.path.splitext(rel_path)[0]
+    
+    # 如果指定了输出目录，使用输出目录；否则使用文件所在目录
+    if args.out:
+        # 确保输出目录存在
+        output_dir = os.path.abspath(args.out)
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 计算相对路径的目录部分
+        rel_dir = os.path.dirname(rel_path)
+        if rel_dir and rel_dir != '.':
+            # 如果相对路径有目录部分，在输出目录下创建对应的目录结构
+            final_output_dir = os.path.join(output_dir, rel_dir)
+            os.makedirs(final_output_dir, exist_ok=True)
+        else:
+            final_output_dir = output_dir
+    else:
+        final_output_dir = file_dir
     
     # 临时文件名前缀
     temp_name_prefix = f"temp_{name_without_ext}"
@@ -446,11 +483,18 @@ def process_file(file_path, args):
         rar_cmd = [get_rar_command(), 'a']
         rar_cmd.extend(rar_switches)
         
-        # 添加输出路径（当前目录的临时文件）
-        if ' ' in temp_rar_name or any(c in temp_rar_name for c in '*?[]()^!'):
-            rar_cmd.append(f'"{temp_rar_name}"')
+        # 计算输出文件的完整路径
+        if args.out:
+            # 使用相对路径作为基础文件名
+            output_rar_path = os.path.join(final_output_dir, f"{temp_name_prefix}.rar")
         else:
-            rar_cmd.append(temp_rar_name)
+            output_rar_path = temp_rar_name
+        
+        # 添加输出路径
+        if ' ' in output_rar_path or any(c in output_rar_path for c in '*?[]()^!'):
+            rar_cmd.append(f'"{output_rar_path}"')
+        else:
+            rar_cmd.append(output_rar_path)
         
         # 添加输入文件（只使用文件名，不包含路径）
         if ' ' in file_name or any(c in file_name for c in '*?[]()^!'):
@@ -466,8 +510,12 @@ def process_file(file_path, args):
             print("=" * 50)
             print("调试信息 (文件):")
             print(f"- 原始文件路径: {file_path}")
+            print(f"- 基础路径: {base_path}")
+            print(f"- 相对路径: {rel_path}")
             print(f"- 文件名: {file_name}")
             print(f"- 临时RAR文件前缀: {temp_name_prefix}")
+            print(f"- 输出目录: {final_output_dir}")
+            print(f"- 输出RAR路径: {output_rar_path}")
             print(f"- 当前工作目录: {os.getcwd()}")
             print(f"- 命令列表: {rar_cmd}")
             print("=" * 50)
@@ -504,10 +552,12 @@ def process_file(file_path, args):
                 os.chdir(original_cwd)
                 
                 # 查找并重命名RAR文件（支持分卷）
+                # 使用相对路径的基础名作为最终文件名
+                final_name = os.path.splitext(os.path.basename(rel_path))[0]
                 success, moved_files = find_and_rename_rar_files(
                     temp_name_prefix, 
-                    name_without_ext, 
-                    file_dir, 
+                    final_name, 
+                    final_output_dir, 
                     args.debug
                 )
                 
@@ -537,13 +587,32 @@ def process_file(file_path, args):
         except Exception as e:
             print(f"切换回原始工作目录时出错: {e}")
 
-def process_folder(folder_path, args):
+def process_folder(folder_path, args, base_path):
     """处理单个文件夹的压缩操作"""
     # 获取文件夹名称
     folder_name = os.path.basename(folder_path)
-    parent_dir = os.path.dirname(folder_path)
     
-    # 临时文件名前缀，直接放在上级目录
+    # 计算相对路径
+    rel_path = get_relative_path(folder_path, base_path)
+    
+    # 如果指定了输出目录，使用输出目录；否则使用文件夹的上级目录
+    if args.out:
+        # 确保输出目录存在
+        output_dir = os.path.abspath(args.out)
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # 计算相对路径的目录部分
+        rel_dir = os.path.dirname(rel_path)
+        if rel_dir and rel_dir != '.':
+            # 如果相对路径有目录部分，在输出目录下创建对应的目录结构
+            final_output_dir = os.path.join(output_dir, rel_dir)
+            os.makedirs(final_output_dir, exist_ok=True)
+        else:
+            final_output_dir = output_dir
+    else:
+        final_output_dir = os.path.dirname(folder_path)
+    
+    # 临时文件名前缀
     temp_name_prefix = "temp_archive"
     temp_rar_name = f"{temp_name_prefix}.rar"
     
@@ -562,11 +631,17 @@ def process_folder(folder_path, args):
         rar_cmd = [get_rar_command(), 'a']
         rar_cmd.extend(rar_switches)
         
-        # 添加输出路径（上级目录中的临时文件）
-        if ' ' in temp_rar_name or any(c in temp_rar_name for c in '*?[]()^!'):
-            rar_cmd.append(f'"../{temp_rar_name}"')
+        # 计算输出文件的完整路径
+        if args.out:
+            output_rar_path = os.path.join(final_output_dir, temp_rar_name)
         else:
-            rar_cmd.append(f"../{temp_rar_name}")
+            output_rar_path = os.path.join('..', temp_rar_name)
+        
+        # 添加输出路径
+        if ' ' in output_rar_path or any(c in output_rar_path for c in '*?[]()^!'):
+            rar_cmd.append(f'"{output_rar_path}"')
+        else:
+            rar_cmd.append(output_rar_path)
         
         # 添加输入通配符，表示当前目录下的所有文件
         rar_cmd.append('*')
@@ -579,7 +654,12 @@ def process_folder(folder_path, args):
             print("=" * 50)
             print("调试信息 (文件夹):")
             print(f"- 原始文件夹路径: {folder_path}")
+            print(f"- 基础路径: {base_path}")
+            print(f"- 相对路径: {rel_path}")
+            print(f"- 文件夹名: {folder_name}")
             print(f"- 临时RAR文件前缀: {temp_name_prefix}")
+            print(f"- 输出目录: {final_output_dir}")
+            print(f"- 输出RAR路径: {output_rar_path}")
             print(f"- 当前工作目录: {os.getcwd()}")
             print(f"- 命令列表: {rar_cmd}")
             print("=" * 50)
@@ -616,10 +696,12 @@ def process_folder(folder_path, args):
                 os.chdir(original_cwd)
                 
                 # 查找并重命名RAR文件（支持分卷）
+                # 使用相对路径的基础名作为最终文件名
+                final_name = os.path.basename(rel_path)
                 success, moved_files = find_and_rename_rar_files(
                     temp_name_prefix, 
-                    folder_name, 
-                    parent_dir, 
+                    final_name, 
+                    final_output_dir, 
                     args.debug
                 )
                 
@@ -673,6 +755,16 @@ def main():
     if not os.path.isdir(args.folder_path):
         print(f"错误: 不是一个目录 - {args.folder_path}")
         sys.exit(1)
+    
+    # 验证输出路径（如果指定了）
+    if args.out:
+        # 如果输出路径不存在，尝试创建
+        try:
+            os.makedirs(args.out, exist_ok=True)
+            print(f"输出目录: {os.path.abspath(args.out)}")
+        except Exception as e:
+            print(f"错误: 无法创建输出目录 {args.out}: {e}")
+            sys.exit(1)
     
     # 尝试获取全局锁（除非指定了--no-lock选项）
     if not args.no_lock:
@@ -730,15 +822,18 @@ def main():
         
         print(f"准备处理 {total_items} 个项目（{len(items['files'])} 个文件，{len(items['folders'])} 个文件夹）")
         
+        # 获取基础路径（用于计算相对路径）
+        base_path = os.path.abspath(args.folder_path)
+        
         # 处理每个找到的文件
         for i, file_path in enumerate(items['files'], 1):
             print(f"\n[{i}/{len(items['files'])}] 处理文件: {file_path}")
-            process_file(file_path, args)
+            process_file(file_path, args, base_path)
         
         # 处理每个找到的文件夹
         for i, folder_path in enumerate(items['folders'], 1):
             print(f"\n[{i}/{len(items['folders'])}] 处理文件夹: {folder_path}")
-            process_folder(folder_path, args)
+            process_folder(folder_path, args, base_path)
             
     finally:
         # 确保释放锁（如果已获取）

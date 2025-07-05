@@ -15,8 +15,19 @@ import re
 import glob
 import signal
 
-# 全局锁文件路径 - 统一使用临时目录
-LOCK_FILE = os.path.join(tempfile.gettempdir(), 'rar_comp_lock')
+# 全局锁文件路径 - 确保路径一致性
+def get_lock_file_path():
+    """获取一致的锁文件路径"""
+    if platform.system() == 'Windows':
+        # Windows: 使用Windows临时目录
+        temp_dir = os.environ.get('TEMP', os.environ.get('TMP', 'C:\\Windows\\Temp'))
+    else:
+        # Unix/Linux: 使用标准临时目录
+        temp_dir = '/tmp'
+    
+    return os.path.join(temp_dir, 'rar_comp_lock')
+
+LOCK_FILE = get_lock_file_path()
 
 # 全局变量保存锁文件句柄
 lock_handle = None

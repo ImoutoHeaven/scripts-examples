@@ -13,12 +13,10 @@ import socket
 import tempfile
 import re
 import glob
+import signal
 
-# 全局锁文件路径
-if platform.system() == 'Windows':
-    LOCK_FILE = os.path.join(os.environ.get('PROGRAMDATA', 'C:\\ProgramData'), 'rar_compress_lock')
-else:
-    LOCK_FILE = '/var/lock/rar_compress_lock'
+# 全局锁文件路径 - 统一使用临时目录
+LOCK_FILE = os.path.join(tempfile.gettempdir(), 'rar_comp_lock')
 
 # 全局变量保存锁文件句柄
 lock_handle = None
@@ -26,7 +24,7 @@ lock_handle = None
 def acquire_lock(max_attempts=30, min_wait=2, max_wait=10):
     """
     尝试获取全局锁，如果锁被占用则重试。
-    此函数现在为Windows使用msvcrt，为Linux/Unix使用fcntl，以实现可靠的跨进程锁定。
+    使用文件存在性作为锁机制：文件存在=有锁，文件不存在=无锁。
     
     Args:
         max_attempts: 最大尝试次数
@@ -39,71 +37,40 @@ def acquire_lock(max_attempts=30, min_wait=2, max_wait=10):
     global lock_handle
     global LOCK_FILE
     
-    # 确保锁文件目录存在
-    lock_dir = os.path.dirname(LOCK_FILE)
-    if lock_dir and not os.path.exists(lock_dir):
-        try:
-            os.makedirs(lock_dir, exist_ok=True)
-        except PermissionError:
-            # 如果无法创建指定目录，使用临时目录
-            temp_dir = tempfile.gettempdir()
-            LOCK_FILE = os.path.join(temp_dir, 'rar_compress_lock')
-    
     attempt = 0
     
     while attempt < max_attempts:
         try:
-            if platform.system() == 'Windows':
-                import msvcrt
-                # Windows实现 (修正版，使用msvcrt)
-                try:
-                    # 以写模式打开文件，如果不存在则创建
-                    lock_handle = open(LOCK_FILE, 'w')
-                    # 尝试以非阻塞方式获取文件锁
-                    # 如果文件已被其他进程锁定，这将引发IOError
-                    msvcrt.locking(lock_handle.fileno(), msvcrt.LK_NBLCK, 1)
-                    
-                    # 成功获取锁，写入进程信息
-                    hostname = socket.gethostname()
-                    pid = os.getpid()
-                    lock_info = f"{hostname}:{pid}:{time.time()}"
-                    lock_handle.write(lock_info)
-                    lock_handle.flush()
-                    
-                    # 注册退出时的清理函数
-                    atexit.register(release_lock)
-                    return True
-                except IOError:
-                    # 文件已被锁定，关闭句柄并继续重试
-                    if lock_handle:
-                        lock_handle.close()
-                        lock_handle = None
-                    pass
+            # 检查锁文件是否存在
+            if os.path.exists(LOCK_FILE):
+                # 锁文件存在，说明有其他进程正在使用
+                pass
             else:
-                # Linux/Unix实现 (原始实现是正确的)
-                import fcntl
-                
+                # 锁文件不存在，尝试创建锁文件
                 try:
-                    # 尝试打开文件
-                    lock_handle = open(LOCK_FILE, 'w+')
+                    # 使用 'x' 模式：只有当文件不存在时才创建，如果文件已存在会抛出异常
+                    lock_handle = open(LOCK_FILE, 'x')
                     
-                    # 尝试获取排他锁（非阻塞）
-                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    
-                    # 写入进程信息
+                    # 成功创建锁文件，写入进程信息
                     hostname = socket.gethostname()
                     pid = os.getpid()
                     lock_info = f"{hostname}:{pid}:{time.time()}"
                     lock_handle.write(lock_info)
                     lock_handle.flush()
+                    lock_handle.close()  # 关闭文件句柄，但保留锁文件
+                    lock_handle = None
                     
                     # 注册退出时的清理函数
                     atexit.register(release_lock)
                     return True
-                except (IOError, BlockingIOError):
-                    # 文件已被锁定
+                    
+                except FileExistsError:
+                    # 文件已存在，其他进程在我们检查后创建了锁文件
                     if lock_handle:
-                        lock_handle.close()
+                        try:
+                            lock_handle.close()
+                        except:
+                            pass
                         lock_handle = None
         
         except Exception as e:
@@ -126,33 +93,39 @@ def acquire_lock(max_attempts=30, min_wait=2, max_wait=10):
     return False
 
 def release_lock():
-    """释放全局锁"""
+    """释放全局锁，带重试机制"""
     global lock_handle
     
+    # 关闭文件句柄（如果还打开着）
     if lock_handle:
         try:
-            if platform.system() == 'Windows':
-                import msvcrt
-                # 在Windows上，先解锁文件
-                msvcrt.locking(lock_handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                # Linux系统需要先解除fcntl锁
-                import fcntl
-                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
-            
-            # 关闭并删除锁文件
             lock_handle.close()
-            
-            # 尝试删除锁文件
-            try:
-                if os.path.exists(LOCK_FILE):
-                    os.unlink(LOCK_FILE)
-            except:
-                pass
+        except:
+            pass
+        lock_handle = None
+    
+    # 尝试删除锁文件，最多重试5次
+    max_retries = 5
+    retry_delay = 5  # 每次重试间隔5秒
+    
+    for attempt in range(max_retries):
+        try:
+            if os.path.exists(LOCK_FILE):
+                os.unlink(LOCK_FILE)
+                print(f"成功删除锁文件: {LOCK_FILE}")
+                return
+            else:
+                # 文件不存在，说明已经被删除了
+                return
+                
         except Exception as e:
-            print(f"释放锁时出错: {e}")
-        finally:
-            lock_handle = None
+            print(f"删除锁文件失败 (尝试 {attempt+1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:  # 不是最后一次尝试
+                print(f"将在 {retry_delay} 秒后重试...")
+                time.sleep(retry_delay)
+            else:
+                print(f"删除锁文件失败，已达到最大重试次数 ({max_retries})")
+                print(f"请手动删除锁文件: {LOCK_FILE}")
 
 def profile_type(value):
     """用于argparse的自定义类型，以验证profile参数"""
@@ -743,6 +716,12 @@ def process_folder(folder_path, args, base_path):
         except Exception as e:
             print(f"切换回原始工作目录时出错: {e}")
 
+def signal_handler(signum, frame):
+    """信号处理器，用于在程序被中断时清理锁文件"""
+    print(f"\n收到信号 {signum}，正在清理...")
+    release_lock()
+    sys.exit(1)
+
 def main():
     """主函数"""
     args = parse_arguments()
@@ -772,6 +751,12 @@ def main():
             print("无法获取全局锁，退出程序")
             sys.exit(2)
         print(f"成功获取全局锁: {LOCK_FILE}")
+        
+        # 设置信号处理器，确保异常退出时能清理锁文件
+        signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
+        signal.signal(signal.SIGTERM, signal_handler)  # 终止信号
+        if hasattr(signal, 'SIGBREAK'):  # Windows
+            signal.signal(signal.SIGBREAK, signal_handler)
     
     try:
         # 在Windows系统上启用长路径支持
@@ -842,4 +827,13 @@ def main():
             print("\n已释放全局锁")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n程序被用户中断")
+        release_lock()
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n程序异常退出: {e}")
+        release_lock()
+        sys.exit(1)

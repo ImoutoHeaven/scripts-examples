@@ -174,7 +174,29 @@ def parse_arguments():
     parser.add_argument('--lock-timeout', type=int, default=30, help='锁定超时时间（最大重试次数）')
     parser.add_argument('--out', help='指定压缩后文件的输出目录路径')
     
-    return parser.parse_args()
+    # 新增的过滤参数
+    parser.add_argument('--skip-files', action='store_true', help='跳过文件，仅处理文件夹')
+    parser.add_argument('--skip-folders', action='store_true', help='跳过文件夹，仅处理文件')
+    
+    args, unknown = parser.parse_known_args()
+    
+    # 处理 --skip-ext 类型的参数
+    skip_extensions = []
+    for arg in unknown:
+        if arg.startswith('--skip-'):
+            ext = arg[7:]  # 移除 '--skip-' 前缀
+            if ext:  # 确保扩展名不为空
+                skip_extensions.append(ext.lower())  # 转为小写以便不区分大小写比较
+            else:
+                print(f"警告: 忽略无效的跳过参数: {arg}")
+        else:
+            print(f"错误: 未知参数: {arg}")
+            sys.exit(1)
+    
+    # 将跳过的扩展名添加到args对象中
+    args.skip_extensions = skip_extensions
+    
+    return args
 
 def is_windows():
     """检查当前操作系统是否为Windows"""
@@ -212,6 +234,36 @@ def get_rar_command():
     # 如果都不可用，使用默认的rar命令，如果不存在会在执行时报错
     return 'rar'
 
+def is_folder_empty(folder_path):
+    """检查文件夹是否为空（递归检查）"""
+    try:
+        for root, dirs, files in os.walk(folder_path):
+            # 如果找到任何文件，则不为空
+            if files:
+                return False
+            # 如果找到任何非空子目录，则不为空
+            for dir_name in dirs:
+                sub_path = os.path.join(root, dir_name)
+                if not is_folder_empty(sub_path):
+                    return False
+        return True
+    except Exception:
+        # 如果无法访问文件夹，假设不为空（安全起见）
+        return False
+
+def should_skip_file(file_path, skip_extensions):
+    """检查文件是否应该被跳过"""
+    if not skip_extensions:
+        return False
+    
+    # 获取文件扩展名（去掉点号，转为小写）
+    _, ext = os.path.splitext(file_path)
+    if ext.startswith('.'):
+        ext = ext[1:]  # 移除点号
+    ext = ext.lower()
+    
+    return ext in skip_extensions
+
 def remove_directory(path, dry_run=False):
     """递归删除目录及其内容"""
     if dry_run:
@@ -225,13 +277,19 @@ def remove_directory(path, dry_run=False):
         print(f"删除目录失败 {path}: {e}")
         return False
 
-def get_items_at_depth(base_folder, target_depth):
-    """获取指定深度的文件和文件夹列表"""
+def get_items_at_depth(base_folder, target_depth, args):
+    """获取指定深度的文件和文件夹列表，应用过滤规则"""
     items = {'files': [], 'folders': []}
     
     if target_depth == 0:
         # 深度0特殊处理：直接返回基础文件夹
-        items['folders'].append(os.path.abspath(base_folder))
+        if not args.skip_folders:
+            folder_path = os.path.abspath(base_folder)
+            # 检查文件夹是否为空
+            if not is_folder_empty(folder_path):
+                items['folders'].append(folder_path)
+            elif args.debug:
+                print(f"跳过空文件夹: {folder_path}")
         return items
     
     # 对深度>0的情况，遍历文件系统
@@ -242,15 +300,33 @@ def get_items_at_depth(base_folder, target_depth):
         
         # 如果当前深度正好是目标深度-1，则其子项（文件和文件夹）就是目标深度的项
         if current_depth == target_depth - 1:
-            # 收集当前层级的所有文件
-            for file_name in files:
-                full_path = os.path.join(root, file_name)
-                items['files'].append(os.path.abspath(full_path))
+            # 收集当前层级的所有文件（如果不跳过文件）
+            if not args.skip_files:
+                for file_name in files:
+                    full_path = os.path.join(root, file_name)
+                    abs_path = os.path.abspath(full_path)
+                    
+                    # 检查是否应该跳过此文件（基于扩展名）
+                    if should_skip_file(abs_path, args.skip_extensions):
+                        if args.debug:
+                            print(f"跳过文件（扩展名过滤）: {abs_path}")
+                        continue
+                    
+                    items['files'].append(abs_path)
             
-            # 收集当前层级的所有文件夹
-            for dir_name in dirs:
-                full_path = os.path.join(root, dir_name)
-                items['folders'].append(os.path.abspath(full_path))
+            # 收集当前层级的所有文件夹（如果不跳过文件夹）
+            if not args.skip_folders:
+                for dir_name in dirs:
+                    full_path = os.path.join(root, dir_name)
+                    abs_path = os.path.abspath(full_path)
+                    
+                    # 检查文件夹是否为空
+                    if is_folder_empty(abs_path):
+                        if args.debug:
+                            print(f"跳过空文件夹: {abs_path}")
+                        continue
+                    
+                    items['folders'].append(abs_path)
     
     return items
 
@@ -782,6 +858,11 @@ def main():
     """主函数"""
     args = parse_arguments()
     
+    # 验证参数组合
+    if args.skip_files and args.skip_folders:
+        print("错误: 不能同时指定 --skip-files 和 --skip-folders，这样不会有任何需要处理的项目")
+        sys.exit(1)
+    
     # 验证目标路径
     if not os.path.exists(args.folder_path):
         print(f"错误: 路径不存在 - {args.folder_path}")
@@ -829,11 +910,18 @@ def main():
                 if args.debug:
                     print(f"设置Windows控制台编码时出错: {e}")
         
-        # 获取指定深度的文件和文件夹列表
-        items = get_items_at_depth(args.folder_path, args.depth)
+        # 显示过滤信息（如果开启了调试模式）
+        if args.debug:
+            print("过滤设置:")
+            print(f"- 跳过文件: {args.skip_files}")
+            print(f"- 跳过文件夹: {args.skip_folders}")
+            print(f"- 跳过扩展名: {args.skip_extensions}")
+        
+        # 获取指定深度的文件和文件夹列表（应用过滤规则）
+        items = get_items_at_depth(args.folder_path, args.depth, args)
         
         if args.debug:
-            print(f"找到以下符合深度 {args.depth} 的项目:")
+            print(f"找到以下符合深度 {args.depth} 的项目（应用过滤后）:")
             print(f"文件数量: {len(items['files'])}")
             print(f"文件夹数量: {len(items['folders'])}")
             if len(items['files']) > 0:
@@ -851,7 +939,7 @@ def main():
         
         total_items = len(items['files']) + len(items['folders'])
         if total_items == 0:
-            print(f"警告: 在深度 {args.depth} 没有找到任何文件或文件夹")
+            print(f"警告: 在深度 {args.depth} 没有找到任何符合条件的文件或文件夹")
             sys.exit(0)
         
         print(f"准备处理 {total_items} 个项目（{len(items['files'])} 个文件，{len(items['folders'])} 个文件夹）")

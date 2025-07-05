@@ -176,7 +176,9 @@ def get_rar_command():
         result = subprocess.run(['rar', '-?' if is_windows() else '--help'], 
                                 stdout=subprocess.PIPE, 
                                 stderr=subprocess.PIPE, 
-                                shell=is_windows())
+                                shell=is_windows(),
+                                encoding='utf-8', 
+                                errors='replace')
         if result.returncode in [0, 1, 7]:  # RAR命令可能返回这些代码
             return 'rar'
     except Exception:
@@ -188,7 +190,9 @@ def get_rar_command():
             result = subprocess.run(['winrar', '-?'], 
                                     stdout=subprocess.PIPE, 
                                     stderr=subprocess.PIPE, 
-                                    shell=True)
+                                    shell=True,
+                                    encoding='utf-8', 
+                                    errors='replace')
             if result.returncode in [0, 1, 7]:
                 return 'winrar'
         except Exception:
@@ -545,11 +549,11 @@ def process_file(file_path, args, base_path):
             use_shell = is_windows()
             
             if use_shell:
-                result = subprocess.run(cmd_str, shell=True, check=False, capture_output=True, text=True)
+                result = subprocess.run(cmd_str, shell=True, check=False, capture_output=True, text=True, encoding='utf-8', errors='replace')
             else:
                 # 对于非Windows系统，移除命令中的引号
                 cleaned_cmd = [arg.strip('"\'') for arg in rar_cmd]
-                result = subprocess.run(cleaned_cmd, shell=False, check=False, capture_output=True, text=True)
+                result = subprocess.run(cleaned_cmd, shell=False, check=False, capture_output=True, text=True, encoding='utf-8', errors='replace')
             
             # 输出详细的执行结果（如果开启了调试模式）
             if args.debug:
@@ -689,11 +693,11 @@ def process_folder(folder_path, args, base_path):
             use_shell = is_windows()
             
             if use_shell:
-                result = subprocess.run(cmd_str, shell=True, check=False, capture_output=True, text=True)
+                result = subprocess.run(cmd_str, shell=True, check=False, capture_output=True, text=True, encoding='utf-8', errors='replace')
             else:
                 # 对于非Windows系统，移除命令中的引号
                 cleaned_cmd = [arg.strip('"\'') for arg in rar_cmd]
-                result = subprocess.run(cleaned_cmd, shell=False, check=False, capture_output=True, text=True)
+                result = subprocess.run(cleaned_cmd, shell=False, check=False, capture_output=True, text=True, encoding='utf-8', errors='replace')
             
             # 输出详细的执行结果（如果开启了调试模式）
             if args.debug:
@@ -800,6 +804,20 @@ def main():
             signal.signal(signal.SIGBREAK, signal_handler)
     
     try:
+        # 在Windows系统上设置控制台编码为UTF-8
+        if is_windows():
+            try:
+                import ctypes
+                # 设置控制台输入输出编码为UTF-8
+                if hasattr(ctypes.windll.kernel32, 'SetConsoleCP'):
+                    ctypes.windll.kernel32.SetConsoleCP(65001)
+                    ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+                if args.debug:
+                    print("已设置Windows控制台编码为UTF-8")
+            except Exception as e:
+                if args.debug:
+                    print(f"设置Windows控制台编码时出错: {e}")
+        
         # 获取指定深度的文件和文件夹列表
         items = get_items_at_depth(args.folder_path, args.depth)
         

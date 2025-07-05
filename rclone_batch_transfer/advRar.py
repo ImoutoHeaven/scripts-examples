@@ -19,8 +19,8 @@ import signal
 def get_lock_file_path():
     """获取一致的锁文件路径"""
     if platform.system() == 'Windows':
-        # Windows: 使用Windows临时目录
-        temp_dir = os.environ.get('TEMP', os.environ.get('TMP', 'C:\\Windows\\Temp'))
+        # Windows: 硬编码使用系统临时目录，确保路径一致性
+        temp_dir = 'C:\\Windows\\Temp'
     else:
         # Unix/Linux: 使用标准临时目录
         temp_dir = '/tmp'

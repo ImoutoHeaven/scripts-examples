@@ -129,17 +129,19 @@ def release_lock():
 
 def profile_type(value):
     """用于argparse的自定义类型，以验证profile参数"""
-    if value in ['store', 'best']:
+    if value in ['store', 'best', 'fastest']:
         return value
     
-    match = re.match(r'^parted-(\d+)g$', value, re.IGNORECASE)
+    # 支持多种分卷单位格式：g/gb/m/mb/k/kb（不区分大小写）
+    match = re.match(r'^parted-(\d+)(g|gb|m|mb|k|kb)$', value, re.IGNORECASE)
     if match:
         size = int(match.group(1))
+        unit = match.group(2).lower()
         if size > 0:
             return value
     
     raise argparse.ArgumentTypeError(
-        f"'{value}' 不是一个有效的配置。请选择 'store', 'best', 或者 'parted-XXg' (XX为正整数)。"
+        f"'{value}' 不是一个有效的配置。请选择 'store', 'best', 'fastest', 或者 'parted-XXunit' (例如: 'parted-10g', 'parted-100mb', 'parted-500k')。"
     )
 
 def parse_arguments():
@@ -154,7 +156,7 @@ def parse_arguments():
         '--profile', 
         type=profile_type,  # 使用自定义验证函数
         default='best', 
-        help="压缩配置文件: 'store', 'best', 或 'parted-XXg' (例如: 'parted-10g')"
+        help="压缩配置文件: 'store', 'best', 'fastest', 或 'parted-XXunit' (例如: 'parted-10g', 'parted-100mb', 'parted-500k')"
     )
     parser.add_argument('--debug', action='store_true', help='显示调试信息')
     parser.add_argument('--no-lock', action='store_true', help='不使用全局锁（谨慎使用）')
@@ -237,6 +239,30 @@ def get_items_at_depth(base_folder, target_depth):
     
     return items
 
+def normalize_volume_size(size_str, unit_str):
+    """
+    将用户输入的分卷大小标准化为RAR可识别的格式
+    
+    Args:
+        size_str: 大小数字字符串
+        unit_str: 单位字符串（g/gb/m/mb/k/kb，不区分大小写）
+        
+    Returns:
+        str: RAR格式的分卷大小参数（如 "10g", "100m", "500k"）
+    """
+    unit = unit_str.lower()
+    
+    # 将所有单位标准化为RAR的简短格式
+    if unit in ['g', 'gb']:
+        return f"{size_str}g"
+    elif unit in ['m', 'mb']:
+        return f"{size_str}m"
+    elif unit in ['k', 'kb']:
+        return f"{size_str}k"
+    else:
+        # 默认使用原始输入（不应该到达这里，因为profile_type已经验证过）
+        return f"{size_str}{unit}"
+
 def build_rar_switches(profile, password, delete_files=False):
     """构建RAR命令开关参数"""
     switches = []
@@ -244,7 +270,7 @@ def build_rar_switches(profile, password, delete_files=False):
     if delete_files:
         switches.append('-df')
 
-    # 处理 'store' 和 'parted-XXg' 配置
+    # 处理 'store' 和 'parted-XXunit' 配置
     if profile.startswith('parted-') or profile == 'store':
         switches.extend([
             '-m0',        # 仅存储
@@ -258,10 +284,25 @@ def build_rar_switches(profile, password, delete_files=False):
         ])
         # 如果是分卷模式，添加分卷大小参数
         if profile.startswith('parted-'):
-            match = re.match(r'^parted-(\d+)g$', profile, re.IGNORECASE)
+            # 支持多种单位格式：g/gb/m/mb/k/kb
+            match = re.match(r'^parted-(\d+)(g|gb|m|mb|k|kb)$', profile, re.IGNORECASE)
             if match:
                 size = match.group(1)
-                switches.append(f'-v{size}g')
+                unit = match.group(2)
+                volume_size = normalize_volume_size(size, unit)
+                switches.append(f'-v{volume_size}')
+    # 处理 'fastest' 配置
+    elif profile == 'fastest':
+        switches.extend([
+            '-m1',        # 最快压缩
+            '-md256m',    # 字典大小：256MB
+            '-s-',        # 不固实压缩
+            '-htb',       # 使用blake2s校验和
+            '-qo+',       # 为所有文件添加快速打开记录
+            '-oi:1',      # 相同文件保存为引用
+            '-rr5p',      # 添加5%恢复记录
+            '-ma5'        # RAR5格式
+        ])
     # 处理 'best' 配置
     else:  # best
         switches.extend([
@@ -759,27 +800,6 @@ def main():
             signal.signal(signal.SIGBREAK, signal_handler)
     
     try:
-        # 在Windows系统上启用长路径支持
-        if is_windows():
-            # 尝试启用Windows长路径支持
-            try:
-                import ctypes
-                # 使用UTF-8模式以更好地支持非英文字符
-                if hasattr(ctypes.windll.kernel32, 'SetConsoleCP'):
-                    ctypes.windll.kernel32.SetConsoleCP(65001)
-                    ctypes.windll.kernel32.SetConsoleOutputCP(65001)
-                # 设置处理文件API的行为，启用长路径支持
-                if hasattr(ctypes.windll.kernel32, 'SetProcessAffinityMask'):
-                    ctypes.windll.kernel32.SetProcessAffinityMask(
-                        ctypes.windll.kernel32.GetCurrentProcess(),
-                        0x00400000  # PROCESS_LONG_PATH_AWARE
-                    )
-                if args.debug:
-                    print("已尝试启用Windows长路径支持")
-            except Exception as e:
-                if args.debug:
-                    print(f"启用Windows长路径支持时出错: {e}")
-        
         # 获取指定深度的文件和文件夹列表
         items = get_items_at_depth(args.folder_path, args.depth)
         

@@ -186,7 +186,7 @@ def get_short_path_name(long_path):
         return long_path
 
 def quote_path_for_rar(path):
-    """为RAR命令正确引用路径，处理特殊字符"""
+    """为RAR命令正确引用路径，处理特殊字符和以-开头的文件名"""
     if platform.system() == 'Windows':
         # 对于Windows，优先尝试使用短路径名
         short_path = get_short_path_name(path)
@@ -194,12 +194,32 @@ def quote_path_for_rar(path):
             # 如果成功获取短路径名，使用短路径（通常是ASCII安全的）
             path = short_path
         
+        # 检查最终路径的文件名是否以 '-' 开头
+        filename = os.path.basename(path)
+        if filename.startswith('-'):
+            # 对于以 '-' 开头的文件名，添加 './' 前缀避免被识别为选项
+            dirname = os.path.dirname(path)
+            if dirname:
+                path = os.path.join(dirname, '.' + os.sep + filename)
+            else:
+                path = '.' + os.sep + filename
+        
         # Windows下使用双引号，并转义内部的双引号
         if '"' in path:
             path = path.replace('"', '\\"')
         return f'"{path}"'
     else:
-        # Unix/Linux使用shlex.quote
+        # Unix/Linux系统
+        # 检查文件名是否以 '-' 开头
+        if os.path.basename(path).startswith('-'):
+            # 添加 './' 前缀
+            dirname = os.path.dirname(path)
+            filename = os.path.basename(path)
+            if dirname:
+                path = os.path.join(dirname, '.', filename)
+            else:
+                path = os.path.join('.', filename)
+        
         return shlex.quote(path)
 
 def execute_rar_command(rar_cmd, debug=False):
@@ -852,7 +872,6 @@ def process_file(file_path, args, base_path):
         
         # 获取RAR命令开关（恢复使用-df参数）
         rar_switches = build_rar_switches(args.profile, args.password, args.delete)
-        rar_switches = build_rar_switches(args.profile, args.password, args.delete)
         
         # 构建RAR命令
         rar_cmd = [get_rar_command(), 'a']
@@ -887,6 +906,7 @@ def process_file(file_path, args, base_path):
             print(f"- 输出RAR路径: {output_rar_path}")
             print(f"- 当前工作目录: {os.getcwd()}")
             print(f"- 命令列表: {rar_cmd}")
+            print(f"- 输入文件引用后: {quote_path_for_rar(file_name)}")
             print("=" * 50)
         
         if args.dry_run:

@@ -113,6 +113,242 @@ LOCK_FILE = get_lock_file_path()
 # 全局变量保存锁文件句柄
 lock_handle = None
 
+# ==================== 短路径API改造 ====================
+
+def get_short_path_name(long_path):
+    """获取Windows短路径名（8.3格式），用于处理特殊字符"""
+    if not is_windows():
+        return long_path
+    
+    try:
+        import ctypes
+        from ctypes import wintypes
+        
+        # 获取短路径名
+        GetShortPathNameW = ctypes.windll.kernel32.GetShortPathNameW
+        GetShortPathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        GetShortPathNameW.restype = wintypes.DWORD
+        
+        # 首先获取需要的缓冲区大小
+        buffer_size = GetShortPathNameW(long_path, None, 0)
+        if buffer_size == 0:
+            return long_path
+        
+        # 创建缓冲区并获取短路径
+        buffer = ctypes.create_unicode_buffer(buffer_size)
+        result = GetShortPathNameW(long_path, buffer, buffer_size)
+        if result == 0:
+            return long_path
+        
+        return buffer.value
+    except Exception:
+        return long_path
+
+def safe_path_for_operation(path, debug=False):
+    """
+    为文件系统操作获取安全的路径（优先使用短路径）
+    
+    Args:
+        path: 原始路径
+        debug: 是否输出调试信息
+        
+    Returns:
+        str: 安全的路径（短路径或原路径）
+    """
+    if not path:
+        return path
+    
+    if is_windows():
+        short_path = get_short_path_name(path)
+        if short_path != path and short_path:
+            if debug:
+                print(f"使用短路径: {path} -> {short_path}")
+            return short_path
+        elif debug:
+            print(f"使用原路径: {path}")
+    
+    return path
+
+def safe_exists(path, debug=False):
+    """安全的路径存在性检查"""
+    try:
+        safe_path = safe_path_for_operation(path, debug)
+        return os.path.exists(safe_path)
+    except Exception as e:
+        if debug:
+            print(f"检查路径存在性失败 {path}: {e}")
+        return False
+
+def safe_isdir(path, debug=False):
+    """安全的目录检查"""
+    try:
+        safe_path = safe_path_for_operation(path, debug)
+        return os.path.isdir(safe_path)
+    except Exception as e:
+        if debug:
+            print(f"检查路径是否为目录失败 {path}: {e}")
+        return False
+
+def safe_isfile(path, debug=False):
+    """安全的文件检查"""
+    try:
+        safe_path = safe_path_for_operation(path, debug)
+        return os.path.isfile(safe_path)
+    except Exception as e:
+        if debug:
+            print(f"检查路径是否为文件失败 {path}: {e}")
+        return False
+
+def safe_makedirs(path, exist_ok=True, debug=False):
+    """安全的目录创建"""
+    try:
+        safe_path = safe_path_for_operation(path, debug)
+        os.makedirs(safe_path, exist_ok=exist_ok)
+        if debug:
+            print(f"成功创建目录: {path}")
+        return True
+    except Exception as e:
+        if debug:
+            print(f"创建目录失败 {path}: {e}")
+        return False
+
+def safe_remove(path, debug=False):
+    """安全的文件删除"""
+    try:
+        safe_path = safe_path_for_operation(path, debug)
+        os.remove(safe_path)
+        if debug:
+            print(f"成功删除文件: {path}")
+        return True
+    except Exception as e:
+        if debug:
+            print(f"删除文件失败 {path}: {e}")
+        return False
+
+def safe_rmdir(path, debug=False):
+    """安全的空目录删除"""
+    try:
+        safe_path = safe_path_for_operation(path, debug)
+        os.rmdir(safe_path)
+        if debug:
+            print(f"成功删除目录: {path}")
+        return True
+    except Exception as e:
+        if debug:
+            print(f"删除目录失败 {path}: {e}")
+        return False
+
+def safe_rmtree(path, debug=False):
+    """安全的递归目录删除"""
+    try:
+        safe_path = safe_path_for_operation(path, debug)
+        shutil.rmtree(safe_path)
+        if debug:
+            print(f"成功递归删除目录: {path}")
+        return True
+    except Exception as e:
+        if debug:
+            print(f"递归删除目录失败 {path}: {e}")
+        return False
+
+def safe_move(src, dst, debug=False):
+    """安全的文件/目录移动/重命名"""
+    try:
+        safe_src = safe_path_for_operation(src, debug)
+        safe_dst = safe_path_for_operation(dst, debug)
+        
+        # 如果目标已存在，先删除
+        if safe_exists(dst, debug):
+            if safe_isfile(dst, debug):
+                safe_remove(dst, debug)
+            else:
+                safe_rmtree(dst, debug)
+        
+        shutil.move(safe_src, safe_dst)
+        if debug:
+            print(f"成功移动: {src} -> {dst}")
+        return True
+    except Exception as e:
+        if debug:
+            print(f"移动失败 {src} -> {dst}: {e}")
+        return False
+
+def safe_glob(pattern, debug=False):
+    """安全的文件匹配（glob）"""
+    try:
+        # 对于glob，我们需要在模式的目录部分使用短路径
+        pattern_dir = os.path.dirname(pattern)
+        pattern_name = os.path.basename(pattern)
+        
+        if pattern_dir:
+            safe_pattern_dir = safe_path_for_operation(pattern_dir, debug)
+            safe_pattern = os.path.join(safe_pattern_dir, pattern_name)
+        else:
+            safe_pattern = pattern
+        
+        if debug:
+            print(f"Glob模式: {pattern} -> {safe_pattern}")
+        
+        results = glob.glob(safe_pattern)
+        
+        # 将结果转换回原始路径格式
+        if debug and results:
+            print(f"Glob找到 {len(results)} 个文件")
+        
+        return results
+    except Exception as e:
+        if debug:
+            print(f"Glob匹配失败 {pattern}: {e}")
+        return []
+
+def safe_walk(top, debug=False):
+    """安全的目录遍历"""
+    try:
+        safe_top = safe_path_for_operation(top, debug)
+        for root, dirs, files in os.walk(safe_top):
+            # 将短路径结果转换回相对于原始top的路径
+            if safe_top != top:
+                # 需要将root从短路径转换回长路径格式
+                rel_root = os.path.relpath(root, safe_top)
+                if rel_root == '.':
+                    converted_root = top
+                else:
+                    converted_root = os.path.join(top, rel_root)
+            else:
+                converted_root = root
+            
+            yield converted_root, dirs, files
+    except Exception as e:
+        if debug:
+            print(f"目录遍历失败 {top}: {e}")
+        return
+
+def safe_chdir(path, debug=False):
+    """安全的工作目录切换"""
+    try:
+        safe_path = safe_path_for_operation(path, debug)
+        os.chdir(safe_path)
+        if debug:
+            print(f"成功切换到目录: {path}")
+        return True
+    except Exception as e:
+        if debug:
+            print(f"切换目录失败 {path}: {e}")
+        return False
+
+def safe_abspath(path, debug=False):
+    """安全的绝对路径获取"""
+    try:
+        # 先获取绝对路径，然后尝试获取短路径
+        abs_path = os.path.abspath(path)
+        return abs_path  # 返回长路径作为标准引用
+    except Exception as e:
+        if debug:
+            print(f"获取绝对路径失败 {path}: {e}")
+        return path
+
+# ==================== 结束短路径API改造 ====================
+
 def check_shell_environment():
     """检查当前shell环境，如果是cmd则提示切换到PowerShell"""
     if platform.system() == 'Windows':
@@ -155,35 +391,6 @@ def check_shell_environment():
                 print()
         except:
             pass  # 如果检测失败，继续运行
-
-def get_short_path_name(long_path):
-    """获取Windows短路径名（8.3格式），用于处理特殊字符"""
-    if not is_windows():
-        return long_path
-    
-    try:
-        import ctypes
-        from ctypes import wintypes
-        
-        # 获取短路径名
-        GetShortPathNameW = ctypes.windll.kernel32.GetShortPathNameW
-        GetShortPathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
-        GetShortPathNameW.restype = wintypes.DWORD
-        
-        # 首先获取需要的缓冲区大小
-        buffer_size = GetShortPathNameW(long_path, None, 0)
-        if buffer_size == 0:
-            return long_path
-        
-        # 创建缓冲区并获取短路径
-        buffer = ctypes.create_unicode_buffer(buffer_size)
-        result = GetShortPathNameW(long_path, buffer, buffer_size)
-        if result == 0:
-            return long_path
-        
-        return buffer.value
-    except Exception:
-        return long_path
 
 def quote_path_for_rar(path):
     """为RAR命令正确引用路径，处理特殊字符和以-开头的文件名"""
@@ -305,14 +512,17 @@ def acquire_lock(max_attempts=30, min_wait=2, max_wait=10):
     while attempt < max_attempts:
         try:
             # 检查锁文件是否存在
-            if os.path.exists(LOCK_FILE):
+            if safe_exists(LOCK_FILE):
                 # 锁文件存在，说明有其他进程正在使用
                 pass
             else:
                 # 锁文件不存在，尝试创建锁文件
                 try:
+                    # 使用短路径获取安全的锁文件路径
+                    safe_lock_file = safe_path_for_operation(LOCK_FILE)
+                    
                     # 使用 'x' 模式：只有当文件不存在时才创建，如果文件已存在会抛出异常
-                    lock_handle = open(LOCK_FILE, 'x')
+                    lock_handle = open(safe_lock_file, 'x')
                     
                     # 成功创建锁文件，写入进程信息
                     hostname = socket.gethostname()
@@ -373,10 +583,10 @@ def release_lock():
     
     for attempt in range(max_retries):
         try:
-            if os.path.exists(LOCK_FILE):
-                os.unlink(LOCK_FILE)
-                print(f"成功删除锁文件: {LOCK_FILE}")
-                return
+            if safe_exists(LOCK_FILE):
+                if safe_remove(LOCK_FILE):
+                    print(f"成功删除锁文件: {LOCK_FILE}")
+                    return
             else:
                 # 文件不存在，说明已经被删除了
                 return
@@ -489,7 +699,7 @@ def get_rar_command():
 def is_folder_empty(folder_path):
     """检查文件夹是否为空（递归检查）"""
     try:
-        for root, dirs, files in os.walk(folder_path):
+        for root, dirs, files in safe_walk(folder_path):
             # 如果找到任何文件，则不为空
             if files:
                 return False
@@ -522,12 +732,7 @@ def remove_directory(path, dry_run=False):
         print(f"[DRY-RUN] 将删除目录: {path}")
         return True
     
-    try:
-        shutil.rmtree(path)
-        return True
-    except Exception as e:
-        print(f"删除目录失败 {path}: {e}")
-        return False
+    return safe_rmtree(path)
 
 def get_items_at_depth(base_folder, target_depth, args):
     """获取指定深度的文件和文件夹列表，应用过滤规则"""
@@ -536,7 +741,7 @@ def get_items_at_depth(base_folder, target_depth, args):
     if target_depth == 0:
         # 深度0特殊处理：直接返回基础文件夹
         if not args.skip_folders:
-            folder_path = os.path.abspath(base_folder)
+            folder_path = safe_abspath(base_folder)
             # 检查文件夹是否为空
             if not is_folder_empty(folder_path):
                 items['folders'].append(folder_path)
@@ -545,7 +750,7 @@ def get_items_at_depth(base_folder, target_depth, args):
         return items
     
     # 对深度>0的情况，遍历文件系统
-    for root, dirs, files in os.walk(base_folder):
+    for root, dirs, files in safe_walk(base_folder):
         # 计算当前相对于基础文件夹的深度
         rel_path = os.path.relpath(root, base_folder)
         current_depth = 0 if rel_path == '.' else len(rel_path.split(os.sep))
@@ -556,7 +761,7 @@ def get_items_at_depth(base_folder, target_depth, args):
             if not args.skip_files:
                 for file_name in files:
                     full_path = os.path.join(root, file_name)
-                    abs_path = os.path.abspath(full_path)
+                    abs_path = safe_abspath(full_path)
                     
                     # 检查是否应该跳过此文件（基于扩展名）
                     if should_skip_file(abs_path, args.skip_extensions):
@@ -570,7 +775,7 @@ def get_items_at_depth(base_folder, target_depth, args):
             if not args.skip_folders:
                 for dir_name in dirs:
                     full_path = os.path.join(root, dir_name)
-                    abs_path = os.path.abspath(full_path)
+                    abs_path = safe_abspath(full_path)
                     
                     # 检查文件夹是否为空
                     if is_folder_empty(abs_path):
@@ -685,7 +890,7 @@ def find_and_rename_rar_files(temp_name_prefix, target_name_prefix, search_dir, 
     # 首先查找单个RAR文件
     single_rar = os.path.join(search_dir, f"{temp_name_prefix}.rar")
     
-    if os.path.exists(single_rar):
+    if safe_exists(single_rar, debug):
         # 找到单个RAR文件
         target_file = os.path.join(search_dir, f"{target_name_prefix}.rar")
         
@@ -694,19 +899,15 @@ def find_and_rename_rar_files(temp_name_prefix, target_name_prefix, search_dir, 
             print(f"目标文件: {target_file}")
         
         try:
-            # 如果目标文件已存在，先删除
-            if os.path.exists(target_file):
-                os.remove(target_file)
+            # 使用安全的移动函数
+            if safe_move(single_rar, target_file, debug):
+                moved_files.append(target_file)
                 if debug:
-                    print(f"已删除已存在的目标文件: {target_file}")
-            
-            # 移动文件
-            shutil.move(single_rar, target_file)
-            moved_files.append(target_file)
-            if debug:
-                print(f"成功移动文件: {single_rar} -> {target_file}")
-            
-            return True, moved_files
+                    print(f"成功移动文件: {single_rar} -> {target_file}")
+                return True, moved_files
+            else:
+                print(f"移动单个RAR文件时出错")
+                return False, []
             
         except Exception as e:
             print(f"移动单个RAR文件时出错: {e}")
@@ -723,7 +924,7 @@ def find_and_rename_rar_files(temp_name_prefix, target_name_prefix, search_dir, 
     part_files = []
     for pattern in part_patterns:
         search_pattern = os.path.join(search_dir, pattern)
-        found_files = glob.glob(search_pattern)
+        found_files = safe_glob(search_pattern, debug)
         part_files.extend(found_files)
     
     # 去重并排序
@@ -758,15 +959,11 @@ def find_and_rename_rar_files(temp_name_prefix, target_name_prefix, search_dir, 
                 if debug:
                     print(f"重命名分卷: {part_file} -> {target_file}")
                 
-                # 如果目标文件已存在，先删除
-                if os.path.exists(target_file):
-                    os.remove(target_file)
-                    if debug:
-                        print(f"已删除已存在的目标文件: {target_file}")
-                
-                # 移动文件
-                shutil.move(part_file, target_file)
-                moved_files.append(target_file)
+                # 使用安全的移动函数
+                if safe_move(part_file, target_file, debug):
+                    moved_files.append(target_file)
+                else:
+                    print(f"警告: 移动分卷文件失败: {part_file}")
                 
             else:
                 print(f"警告: 无法解析分卷文件名格式: {filename}")
@@ -784,8 +981,8 @@ def find_and_rename_rar_files(temp_name_prefix, target_name_prefix, search_dir, 
 def get_relative_path(item_path, base_path):
     """计算项目相对于基础路径的相对路径"""
     # 获取绝对路径
-    item_abs = os.path.abspath(item_path)
-    base_abs = os.path.abspath(base_path)
+    item_abs = safe_abspath(item_path)
+    base_abs = safe_abspath(base_path)
     
     # 计算相对路径
     rel_path = os.path.relpath(item_abs, base_abs)
@@ -802,13 +999,7 @@ def safe_delete_file(file_path, dry_run=False):
         print(f"[DRY-RUN] 将删除文件: {file_path}")
         return True
     
-    try:
-        os.remove(file_path)
-        print(f"已删除原始文件: {file_path}")
-        return True
-    except Exception as e:
-        print(f"删除文件失败 {file_path}: {e}")
-        return False
+    return safe_remove(file_path, debug=True)
 
 def safe_delete_folder(folder_path, dry_run=False):
     """安全删除文件夹（只删除空文件夹）"""
@@ -819,9 +1010,12 @@ def safe_delete_folder(folder_path, dry_run=False):
     try:
         # 检查文件夹是否为空
         if is_folder_empty(folder_path):
-            os.rmdir(folder_path)
-            print(f"已删除原始空文件夹: {folder_path}")
-            return True
+            if safe_rmdir(folder_path, debug=True):
+                print(f"已删除原始空文件夹: {folder_path}")
+                return True
+            else:
+                print(f"删除文件夹失败: {folder_path}")
+                return False
         else:
             print(f"文件夹不为空，跳过删除: {folder_path}")
             return False
@@ -845,15 +1039,15 @@ def process_file(file_path, args, base_path):
     # 如果指定了输出目录，使用输出目录；否则使用文件所在目录
     if args.out:
         # 确保输出目录存在
-        output_dir = os.path.abspath(args.out)
-        os.makedirs(output_dir, exist_ok=True)
+        output_dir = safe_abspath(args.out)
+        safe_makedirs(output_dir, exist_ok=True, debug=args.debug)
         
         # 计算相对路径的目录部分
         rel_dir = os.path.dirname(rel_path)
         if rel_dir and rel_dir != '.':
             # 如果相对路径有目录部分，在输出目录下创建对应的目录结构
             final_output_dir = os.path.join(output_dir, rel_dir)
-            os.makedirs(final_output_dir, exist_ok=True)
+            safe_makedirs(final_output_dir, exist_ok=True, debug=args.debug)
         else:
             final_output_dir = output_dir
     else:
@@ -868,7 +1062,8 @@ def process_file(file_path, args, base_path):
     
     try:
         # 切换到文件所在目录
-        os.chdir(file_dir)
+        if not safe_chdir(file_dir, args.debug):
+            raise Exception(f"无法切换到目录: {file_dir}")
         
         # 获取RAR命令开关（恢复使用-df参数）
         rar_switches = build_rar_switches(args.profile, args.password, args.delete)
@@ -930,7 +1125,7 @@ def process_file(file_path, args, base_path):
             stats.log(f"成功创建RAR文件")
             
             # 切换回原始工作目录
-            os.chdir(original_cwd)
+            safe_chdir(original_cwd, args.debug)
             
             # 查找并重命名RAR文件（支持分卷）
             # 使用相对路径的基础名作为最终文件名
@@ -975,7 +1170,7 @@ def process_file(file_path, args, base_path):
     finally:
         # 确保无论如何都会切换回原始工作目录
         try:
-            os.chdir(original_cwd)
+            safe_chdir(original_cwd, args.debug)
         except Exception as e:
             print(f"切换回原始工作目录时出错: {e}")
 
@@ -992,15 +1187,15 @@ def process_folder(folder_path, args, base_path):
     # 如果指定了输出目录，使用输出目录；否则使用文件夹的上级目录
     if args.out:
         # 确保输出目录存在
-        output_dir = os.path.abspath(args.out)
-        os.makedirs(output_dir, exist_ok=True)
+        output_dir = safe_abspath(args.out)
+        safe_makedirs(output_dir, exist_ok=True, debug=args.debug)
         
         # 计算相对路径的目录部分
         rel_dir = os.path.dirname(rel_path)
         if rel_dir and rel_dir != '.':
             # 如果相对路径有目录部分，在输出目录下创建对应的目录结构
             final_output_dir = os.path.join(output_dir, rel_dir)
-            os.makedirs(final_output_dir, exist_ok=True)
+            safe_makedirs(final_output_dir, exist_ok=True, debug=args.debug)
         else:
             final_output_dir = output_dir
     else:
@@ -1015,7 +1210,8 @@ def process_folder(folder_path, args, base_path):
     
     try:
         # 切换到目标文件夹
-        os.chdir(folder_path)
+        if not safe_chdir(folder_path, args.debug):
+            raise Exception(f"无法切换到目录: {folder_path}")
         
         # 获取RAR命令开关，对于文件夹需要添加-r选项（恢复使用-df参数）
         rar_switches = build_rar_switches(args.profile, args.password, args.delete)
@@ -1076,7 +1272,7 @@ def process_folder(folder_path, args, base_path):
             stats.log(f"成功创建RAR文件")
             
             # 切换回原始工作目录
-            os.chdir(original_cwd)
+            safe_chdir(original_cwd, args.debug)
             
             # 查找并重命名RAR文件（支持分卷）
             # 使用相对路径的基础名作为最终文件名
@@ -1125,7 +1321,7 @@ def process_folder(folder_path, args, base_path):
     finally:
         # 确保无论如何都会切换回原始工作目录
         try:
-            os.chdir(original_cwd)
+            safe_chdir(original_cwd, args.debug)
         except Exception as e:
             print(f"切换回原始工作目录时出错: {e}")
 
@@ -1156,13 +1352,13 @@ def main():
         sys.exit(1)
     
     # 验证目标路径
-    if not os.path.exists(args.folder_path):
+    if not safe_exists(args.folder_path, args.debug):
         error_msg = f"错误: 路径不存在 - {args.folder_path}"
         stats.log(error_msg)
         print(error_msg)
         sys.exit(1)
     
-    if not os.path.isdir(args.folder_path):
+    if not safe_isdir(args.folder_path, args.debug):
         error_msg = f"错误: 不是一个目录 - {args.folder_path}"
         stats.log(error_msg)
         print(error_msg)
@@ -1172,10 +1368,15 @@ def main():
     if args.out:
         # 如果输出路径不存在，尝试创建
         try:
-            os.makedirs(args.out, exist_ok=True)
-            output_msg = f"输出目录: {os.path.abspath(args.out)}"
-            stats.log(output_msg)
-            print(output_msg)
+            if safe_makedirs(args.out, exist_ok=True, debug=args.debug):
+                output_msg = f"输出目录: {safe_abspath(args.out)}"
+                stats.log(output_msg)
+                print(output_msg)
+            else:
+                error_msg = f"错误: 无法创建输出目录 {args.out}"
+                stats.log(error_msg)
+                print(error_msg)
+                sys.exit(1)
         except Exception as e:
             error_msg = f"错误: 无法创建输出目录 {args.out}: {e}"
             stats.log(error_msg)
@@ -1254,7 +1455,7 @@ def main():
         print(start_msg)
         
         # 获取基础路径（用于计算相对路径）
-        base_path = os.path.abspath(args.folder_path)
+        base_path = safe_abspath(args.folder_path)
         
         # 处理每个找到的文件
         for i, file_path in enumerate(items['files'], 1):

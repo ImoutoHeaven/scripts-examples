@@ -418,7 +418,7 @@ def check_shell_environment():
         except:
             pass  # 如果检测失败，继续运行
 
-def check_required_tools():
+def check_required_tools(no_par2=False):
     """检查7z和parpar是否在PATH中可用"""
     missing_tools = []
     
@@ -436,19 +436,20 @@ def check_required_tools():
     except Exception:
         missing_tools.append('7z')
     
-    # 检查parpar
-    try:
-        result = subprocess.run(['parpar', '--version'], 
-                                stdout=subprocess.PIPE, 
-                                stderr=subprocess.PIPE, 
-                                shell=is_windows(),
-                                encoding='utf-8', 
-                                errors='replace')
-        # parpar --version应该正常退出并输出版本信息
-        if result.returncode != 0:
+    # 只有在不跳过PAR2恢复记录时才检查parpar
+    if not no_par2:
+        try:
+            result = subprocess.run(['parpar', '--version'], 
+                                    stdout=subprocess.PIPE, 
+                                    stderr=subprocess.PIPE, 
+                                    shell=is_windows(),
+                                    encoding='utf-8', 
+                                    errors='replace')
+            # parpar --version应该正常退出并输出版本信息
+            if result.returncode != 0:
+                missing_tools.append('parpar')
+        except Exception:
             missing_tools.append('parpar')
-    except Exception:
-        missing_tools.append('parpar')
     
     if missing_tools:
         error_msg = f"错误: 以下必需工具未在PATH中找到: {', '.join(missing_tools)}\n"
@@ -457,6 +458,7 @@ def check_required_tools():
             error_msg += "- 7z: 7-Zip命令行工具 (https://www.7-zip.org/)\n"
         if 'parpar' in missing_tools:
             error_msg += "- parpar: PAR2恢复记录生成工具 (https://github.com/animetosho/ParPar)\n"
+            error_msg += "  提示: 如果不需要PAR2恢复记录，可以使用 --no-rec 参数跳过此检查\n"
         
         print(error_msg)
         sys.exit(1)
@@ -929,6 +931,7 @@ def parse_arguments():
     parser.add_argument('--lock-timeout', type=int, default=30, help='锁定超时时间（最大重试次数）')
     parser.add_argument('--out', help='指定压缩后文件的输出目录路径')
     parser.add_argument('--no-emb', action='store_true', help='生成独立的PAR2文件，不嵌入到7z文件中')
+    parser.add_argument('--no-rec', action='store_true', help='不生成PAR2恢复记录（跳过parpar工具检查）')
     
     # 新增的过滤参数
     parser.add_argument('--skip-files', action='store_true', help='跳过文件，仅处理文件夹')
@@ -1438,31 +1441,36 @@ def process_file(file_path, args, base_path):
                         for f in moved_files:
                             stats.log(f"  - {f}")
                 
-                # 生成PAR2恢复记录
-                embed_par2 = not args.no_emb
-                par2_success, par2_files = process_par2_for_archives(moved_files, embed_par2, args.debug)
-                
-                if par2_success:
-                    if embed_par2:
-                        stats.log(f"成功为压缩文件生成并嵌入PAR2恢复记录")
+                # 只有在不跳过PAR2恢复记录时才生成PAR2
+                if not args.no_rec:
+                    # 生成PAR2恢复记录
+                    embed_par2 = not args.no_emb
+                    par2_success, par2_files = process_par2_for_archives(moved_files, embed_par2, args.debug)
+                    
+                    if par2_success:
+                        if embed_par2:
+                            stats.log(f"成功为压缩文件生成并嵌入PAR2恢复记录")
+                        else:
+                            stats.log(f"成功为压缩文件生成独立PAR2恢复记录")
+                            
+                            # 处理独立PAR2文件的移动（如果需要移动到输出目录）
+                            if args.out and par2_files:
+                                for par2_file in par2_files:
+                                    par2_filename = os.path.basename(par2_file)
+                                    target_par2_path = os.path.join(final_output_dir, par2_filename)
+                                    
+                                    if par2_file != target_par2_path:  # 只有当路径不同时才移动
+                                        if safe_move(par2_file, target_par2_path, args.debug):
+                                            if args.debug:
+                                                stats.log(f"成功移动PAR2文件: {par2_file} -> {target_par2_path}")
+                                        else:
+                                            stats.log(f"警告: 移动PAR2文件失败: {par2_file}")
                     else:
-                        stats.log(f"成功为压缩文件生成独立PAR2恢复记录")
-                        
-                        # 处理独立PAR2文件的移动（如果需要移动到输出目录）
-                        if args.out and par2_files:
-                            for par2_file in par2_files:
-                                par2_filename = os.path.basename(par2_file)
-                                target_par2_path = os.path.join(final_output_dir, par2_filename)
-                                
-                                if par2_file != target_par2_path:  # 只有当路径不同时才移动
-                                    if safe_move(par2_file, target_par2_path, args.debug):
-                                        if args.debug:
-                                            stats.log(f"成功移动PAR2文件: {par2_file} -> {target_par2_path}")
-                                    else:
-                                        stats.log(f"警告: 移动PAR2文件失败: {par2_file}")
+                        stats.log(f"警告: PAR2恢复记录生成失败，但压缩文件已成功创建")
+                        stats.add_par2_failure('文件', file_path, moved_files)
                 else:
-                    stats.log(f"警告: PAR2恢复记录生成失败，但压缩文件已成功创建")
-                    stats.add_par2_failure('文件', file_path, moved_files)
+                    if args.debug:
+                        stats.log(f"跳过PAR2恢复记录生成（--no-rec参数）")
                 
                 # 记录成功
                 stats.add_success('文件', file_path)
@@ -1609,31 +1617,36 @@ def process_folder(folder_path, args, base_path):
                         for f in moved_files:
                             stats.log(f"  - {f}")
                 
-                # 生成PAR2恢复记录
-                embed_par2 = not args.no_emb
-                par2_success, par2_files = process_par2_for_archives(moved_files, embed_par2, args.debug)
-                
-                if par2_success:
-                    if embed_par2:
-                        stats.log(f"成功为压缩文件生成并嵌入PAR2恢复记录")
+                # 只有在不跳过PAR2恢复记录时才生成PAR2
+                if not args.no_rec:
+                    # 生成PAR2恢复记录
+                    embed_par2 = not args.no_emb
+                    par2_success, par2_files = process_par2_for_archives(moved_files, embed_par2, args.debug)
+                    
+                    if par2_success:
+                        if embed_par2:
+                            stats.log(f"成功为压缩文件生成并嵌入PAR2恢复记录")
+                        else:
+                            stats.log(f"成功为压缩文件生成独立PAR2恢复记录")
+                            
+                            # 处理独立PAR2文件的移动（如果需要移动到输出目录）
+                            if args.out and par2_files:
+                                for par2_file in par2_files:
+                                    par2_filename = os.path.basename(par2_file)
+                                    target_par2_path = os.path.join(final_output_dir, par2_filename)
+                                    
+                                    if par2_file != target_par2_path:  # 只有当路径不同时才移动
+                                        if safe_move(par2_file, target_par2_path, args.debug):
+                                            if args.debug:
+                                                stats.log(f"成功移动PAR2文件: {par2_file} -> {target_par2_path}")
+                                        else:
+                                            stats.log(f"警告: 移动PAR2文件失败: {par2_file}")
                     else:
-                        stats.log(f"成功为压缩文件生成独立PAR2恢复记录")
-                        
-                        # 处理独立PAR2文件的移动（如果需要移动到输出目录）
-                        if args.out and par2_files:
-                            for par2_file in par2_files:
-                                par2_filename = os.path.basename(par2_file)
-                                target_par2_path = os.path.join(final_output_dir, par2_filename)
-                                
-                                if par2_file != target_par2_path:  # 只有当路径不同时才移动
-                                    if safe_move(par2_file, target_par2_path, args.debug):
-                                        if args.debug:
-                                            stats.log(f"成功移动PAR2文件: {par2_file} -> {target_par2_path}")
-                                    else:
-                                        stats.log(f"警告: 移动PAR2文件失败: {par2_file}")
+                        stats.log(f"警告: PAR2恢复记录生成失败，但压缩文件已成功创建")
+                        stats.add_par2_failure('文件夹', folder_path, moved_files)
                 else:
-                    stats.log(f"警告: PAR2恢复记录生成失败，但压缩文件已成功创建")
-                    stats.add_par2_failure('文件夹', folder_path, moved_files)
+                    if args.debug:
+                        stats.log(f"跳过PAR2恢复记录生成（--no-rec参数）")
                 
                 # 7z的-sdel参数已经删除了文件夹内的文件
                 # 如果指定了删除选项，需要检查并删除可能剩余的空文件夹
@@ -1682,13 +1695,14 @@ def main():
     # 检查shell环境
     check_shell_environment()
     
-    # 检查必需工具
-    check_required_tools()
+    # 解析参数（需要先解析参数才能知道是否使用--no-rec）
+    args = parse_arguments()
+    
+    # 检查必需工具（根据--no-rec参数决定是否检查parpar）
+    check_required_tools(no_par2=args.no_rec)
     
     # 初始化统计信息
     stats.log("程序开始执行")
-    
-    args = parse_arguments()
     
     # 验证参数组合
     if args.skip_files and args.skip_folders:
@@ -1709,6 +1723,12 @@ def main():
             warning_msg = "警告: --ext-skip-folder-tree 与 --skip-folders 组合时，逻辑与原先一致（不处理文件夹）"
             stats.log(warning_msg)
             print(warning_msg)
+    
+    # 验证--no-rec与--no-emb的组合
+    if args.no_rec and args.no_emb:
+        warning_msg = "警告: --no-rec 与 --no-emb 同时使用时，--no-emb 参数无效（因为不会生成PAR2文件）"
+        stats.log(warning_msg)
+        print(warning_msg)
     
     # 验证目标路径
     if not safe_exists(args.folder_path, args.debug):
@@ -1741,6 +1761,16 @@ def main():
             stats.log(error_msg)
             print(error_msg)
             sys.exit(1)
+    
+    # 显示PAR2恢复记录设置
+    if args.no_rec:
+        rec_msg = "PAR2恢复记录: 已禁用（--no-rec参数）"
+    elif args.no_emb:
+        rec_msg = "PAR2恢复记录: 生成独立文件（--no-emb参数）"
+    else:
+        rec_msg = "PAR2恢复记录: 嵌入到7z文件中"
+    stats.log(rec_msg)
+    print(rec_msg)
     
     # 尝试获取全局锁（除非指定了--no-lock选项）
     lock_acquired = False
@@ -1785,6 +1815,7 @@ def main():
             stats.log(f"- 跳过文件夹: {args.skip_folders}")
             stats.log(f"- 跳过扩展名: {args.skip_extensions}")
             stats.log(f"- 扩展名文件夹树过滤: {args.ext_skip_folder_tree}")
+            stats.log(f"- 跳过PAR2恢复记录: {args.no_rec}")
         
         # 获取指定深度的文件和文件夹列表（应用过滤规则）
         items = get_items_at_depth(args.folder_path, args.depth, args)

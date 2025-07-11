@@ -717,10 +717,10 @@ def append_par2_to_file(archive_file, par2_file, debug=False):
             print(f"追加PAR2内容失败: {e}")
         return False
 
-def process_par2_for_archives(archive_files, debug=False):
-    """为压缩文件列表生成并附加PAR2恢复记录"""
+def process_par2_for_archives(archive_files, embed_par2=True, debug=False):
+    """为压缩文件列表生成PAR2恢复记录，可选择是否嵌入到7z文件中"""
     if not archive_files:
-        return False
+        return False, []
     
     try:
         generated_par2_files = []
@@ -736,31 +736,42 @@ def process_par2_for_archives(archive_files, debug=False):
                     print(f"PAR2生成失败，清理已生成的PAR2文件")
                 for _, cleanup_par2 in generated_par2_files:
                     safe_remove(cleanup_par2, debug)
-                return False
+                return False, []
         
-        # 第二阶段：将所有PAR2内容追加到对应的压缩文件
-        for archive_file, par2_file in generated_par2_files:
-            if not append_par2_to_file(archive_file, par2_file, debug):
-                # 如果追加失败，不清理压缩文件，只清理PAR2文件
-                if debug:
-                    print(f"PAR2追加失败，清理PAR2文件")
-                for _, cleanup_par2 in generated_par2_files:
-                    safe_remove(cleanup_par2, debug)
-                return False
-        
-        # 第三阶段：清理临时PAR2文件
-        for _, par2_file in generated_par2_files:
-            safe_remove(par2_file, debug)
-        
-        if debug:
-            print(f"成功为 {len(archive_files)} 个文件生成并附加PAR2恢复记录")
-        
-        return True
+        if embed_par2:
+            # 第二阶段：将所有PAR2内容追加到对应的压缩文件
+            for archive_file, par2_file in generated_par2_files:
+                if not append_par2_to_file(archive_file, par2_file, debug):
+                    # 如果追加失败，不清理压缩文件，只清理PAR2文件
+                    if debug:
+                        print(f"PAR2追加失败，清理PAR2文件")
+                    for _, cleanup_par2 in generated_par2_files:
+                        safe_remove(cleanup_par2, debug)
+                    return False, []
+            
+            # 第三阶段：清理临时PAR2文件
+            for _, par2_file in generated_par2_files:
+                safe_remove(par2_file, debug)
+            
+            if debug:
+                print(f"成功为 {len(archive_files)} 个文件生成并嵌入PAR2恢复记录")
+            
+            return True, []
+        else:
+            # 不嵌入模式：保留PAR2文件，返回文件列表用于后续移动
+            par2_files = [par2_file for _, par2_file in generated_par2_files]
+            
+            if debug:
+                print(f"成功为 {len(archive_files)} 个文件生成独立PAR2恢复记录")
+                for par2_file in par2_files:
+                    print(f"  - PAR2文件: {par2_file}")
+            
+            return True, par2_files
         
     except Exception as e:
         if debug:
             print(f"处理PAR2时出现异常: {e}")
-        return False
+        return False, []
 
 def acquire_lock(max_attempts=30, min_wait=2, max_wait=10):
     """
@@ -917,6 +928,7 @@ def parse_arguments():
     parser.add_argument('--no-lock', action='store_true', help='不使用全局锁（谨慎使用）')
     parser.add_argument('--lock-timeout', type=int, default=30, help='锁定超时时间（最大重试次数）')
     parser.add_argument('--out', help='指定压缩后文件的输出目录路径')
+    parser.add_argument('--no-emb', action='store_true', help='生成独立的PAR2文件，不嵌入到7z文件中')
     
     # 新增的过滤参数
     parser.add_argument('--skip-files', action='store_true', help='跳过文件，仅处理文件夹')
@@ -1388,10 +1400,28 @@ def process_file(file_path, args, base_path):
                         for f in moved_files:
                             stats.log(f"  - {f}")
                 
-                # 生成并附加PAR2恢复记录
-                par2_success = process_par2_for_archives(moved_files, args.debug)
+                # 生成PAR2恢复记录
+                embed_par2 = not args.no_emb
+                par2_success, par2_files = process_par2_for_archives(moved_files, embed_par2, args.debug)
+                
                 if par2_success:
-                    stats.log(f"成功为压缩文件生成PAR2恢复记录")
+                    if embed_par2:
+                        stats.log(f"成功为压缩文件生成并嵌入PAR2恢复记录")
+                    else:
+                        stats.log(f"成功为压缩文件生成独立PAR2恢复记录")
+                        
+                        # 处理独立PAR2文件的移动（如果需要移动到输出目录）
+                        if args.out and par2_files:
+                            for par2_file in par2_files:
+                                par2_filename = os.path.basename(par2_file)
+                                target_par2_path = os.path.join(final_output_dir, par2_filename)
+                                
+                                if par2_file != target_par2_path:  # 只有当路径不同时才移动
+                                    if safe_move(par2_file, target_par2_path, args.debug):
+                                        if args.debug:
+                                            stats.log(f"成功移动PAR2文件: {par2_file} -> {target_par2_path}")
+                                    else:
+                                        stats.log(f"警告: 移动PAR2文件失败: {par2_file}")
                 else:
                     stats.log(f"警告: PAR2恢复记录生成失败，但压缩文件已成功创建")
                     stats.add_par2_failure('文件', file_path, moved_files)
@@ -1541,10 +1571,28 @@ def process_folder(folder_path, args, base_path):
                         for f in moved_files:
                             stats.log(f"  - {f}")
                 
-                # 生成并附加PAR2恢复记录
-                par2_success = process_par2_for_archives(moved_files, args.debug)
+                # 生成PAR2恢复记录
+                embed_par2 = not args.no_emb
+                par2_success, par2_files = process_par2_for_archives(moved_files, embed_par2, args.debug)
+                
                 if par2_success:
-                    stats.log(f"成功为压缩文件生成PAR2恢复记录")
+                    if embed_par2:
+                        stats.log(f"成功为压缩文件生成并嵌入PAR2恢复记录")
+                    else:
+                        stats.log(f"成功为压缩文件生成独立PAR2恢复记录")
+                        
+                        # 处理独立PAR2文件的移动（如果需要移动到输出目录）
+                        if args.out and par2_files:
+                            for par2_file in par2_files:
+                                par2_filename = os.path.basename(par2_file)
+                                target_par2_path = os.path.join(final_output_dir, par2_filename)
+                                
+                                if par2_file != target_par2_path:  # 只有当路径不同时才移动
+                                    if safe_move(par2_file, target_par2_path, args.debug):
+                                        if args.debug:
+                                            stats.log(f"成功移动PAR2文件: {par2_file} -> {target_par2_path}")
+                                    else:
+                                        stats.log(f"警告: 移动PAR2文件失败: {par2_file}")
                 else:
                     stats.log(f"警告: PAR2恢复记录生成失败，但压缩文件已成功创建")
                     stats.add_par2_failure('文件夹', folder_path, moved_files)

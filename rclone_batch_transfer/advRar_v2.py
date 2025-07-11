@@ -113,6 +113,9 @@ LOCK_FILE = get_lock_file_path()
 # 全局变量保存锁文件句柄
 lock_handle = None
 
+# 新增：标记当前实例是否拥有锁的全局变量
+lock_owner = False
+
 # ==================== 短路径API改造 ====================
 
 def get_short_path_name(long_path):
@@ -506,6 +509,7 @@ def acquire_lock(max_attempts=30, min_wait=2, max_wait=10):
     """
     global lock_handle
     global LOCK_FILE
+    global lock_owner  # 新增：锁所有者标记
     
     attempt = 0
     
@@ -532,6 +536,9 @@ def acquire_lock(max_attempts=30, min_wait=2, max_wait=10):
                     lock_handle.flush()
                     lock_handle.close()  # 关闭文件句柄，但保留锁文件
                     lock_handle = None
+                    
+                    # 设置锁所有者标记
+                    lock_owner = True
                     
                     # 注册退出时的清理函数
                     atexit.register(release_lock)
@@ -566,8 +573,13 @@ def acquire_lock(max_attempts=30, min_wait=2, max_wait=10):
     return False
 
 def release_lock():
-    """释放全局锁，带重试机制"""
+    """释放全局锁，只有锁的拥有者才能释放锁"""
     global lock_handle
+    global lock_owner
+    
+    # 只有锁的拥有者才能释放锁
+    if not lock_owner:
+        return
     
     # 关闭文件句柄（如果还打开着）
     if lock_handle:
@@ -586,9 +598,11 @@ def release_lock():
             if safe_exists(LOCK_FILE):
                 if safe_remove(LOCK_FILE):
                     print(f"成功删除锁文件: {LOCK_FILE}")
+                    lock_owner = False  # 重置锁所有者标记
                     return
             else:
                 # 文件不存在，说明已经被删除了
+                lock_owner = False  # 重置锁所有者标记
                 return
                 
         except Exception as e:
@@ -1329,12 +1343,13 @@ def signal_handler(signum, frame):
     """信号处理器，用于在程序被中断时清理锁文件"""
     print(f"\n收到信号 {signum}，正在清理...")
     stats.print_final_stats()
-    release_lock()
+    release_lock()  # 只有锁的拥有者才会释放锁
     sys.exit(1)
 
 def main():
     """主函数"""
     global stats
+    global lock_owner
     
     # 检查shell环境
     check_shell_environment()
@@ -1384,21 +1399,25 @@ def main():
             sys.exit(1)
     
     # 尝试获取全局锁（除非指定了--no-lock选项）
+    lock_acquired = False
     if not args.no_lock:
-        if not acquire_lock(max_attempts=args.lock_timeout):
+        if acquire_lock(max_attempts=args.lock_timeout):
+            lock_acquired = True
+            lock_msg = f"成功获取全局锁: {LOCK_FILE}"
+            stats.log(lock_msg)
+            print(lock_msg)
+            
+            # 设置信号处理器，确保异常退出时能清理锁文件
+            signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
+            signal.signal(signal.SIGTERM, signal_handler)  # 终止信号
+            if hasattr(signal, 'SIGBREAK'):  # Windows
+                signal.signal(signal.SIGBREAK, signal_handler)
+        else:
             error_msg = "无法获取全局锁，退出程序"
             stats.log(error_msg)
             print(error_msg)
+            # 注意：这里不调用release_lock()，因为当前实例没有获取到锁
             sys.exit(2)
-        lock_msg = f"成功获取全局锁: {LOCK_FILE}"
-        stats.log(lock_msg)
-        print(lock_msg)
-        
-        # 设置信号处理器，确保异常退出时能清理锁文件
-        signal.signal(signal.SIGINT, signal_handler)   # Ctrl+C
-        signal.signal(signal.SIGTERM, signal_handler)  # 终止信号
-        if hasattr(signal, 'SIGBREAK'):  # Windows
-            signal.signal(signal.SIGBREAK, signal_handler)
     
     try:
         # 在Windows系统上设置控制台编码为UTF-8
@@ -1476,7 +1495,7 @@ def main():
         stats.print_final_stats()
         
         # 确保释放锁（如果已获取）
-        if not args.no_lock:
+        if lock_acquired:
             release_lock()
             stats.log("已释放全局锁")
 
@@ -1486,10 +1505,14 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n程序被用户中断")
         stats.print_final_stats()
-        release_lock()
+        # 只有获取了锁的实例才释放锁
+        if lock_owner:
+            release_lock()
         sys.exit(1)
     except Exception as e:
         print(f"\n程序异常退出: {e}")
         stats.print_final_stats()
-        release_lock()
+        # 只有获取了锁的实例才释放锁
+        if lock_owner:
+            release_lock()
         sys.exit(1)

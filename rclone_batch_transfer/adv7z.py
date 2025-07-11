@@ -605,6 +605,38 @@ def execute_parpar_command(parpar_cmd, debug=False):
         
         return MockResult(-1, "", str(e))
 
+def quote_path_for_parpar(path):
+    """为parpar命令正确引用路径，但保持完整文件名不使用短路径"""
+    if platform.system() == 'Windows':
+        # 对于Windows，不使用短路径，保持原始长路径
+        # 只处理以 '-' 开头的文件名
+        filename = os.path.basename(path)
+        if filename.startswith('-'):
+            # 对于以 '-' 开头的文件名，添加 './' 前缀避免被识别为选项
+            dirname = os.path.dirname(path)
+            if dirname:
+                path = os.path.join(dirname, '.' + os.sep + filename)
+            else:
+                path = '.' + os.sep + filename
+        
+        # Windows下使用双引号，并转义内部的双引号
+        if '"' in path:
+            path = path.replace('"', '\\"')
+        return f'"{path}"'
+    else:
+        # Unix/Linux系统
+        # 检查文件名是否以 '-' 开头
+        if os.path.basename(path).startswith('-'):
+            # 添加 './' 前缀
+            dirname = os.path.dirname(path)
+            filename = os.path.basename(path)
+            if dirname:
+                path = os.path.join(dirname, '.', filename)
+            else:
+                path = os.path.join('.', filename)
+        
+        return shlex.quote(path)
+
 def generate_par2_for_file(file_path, debug=False):
     """为单个文件生成PAR2文件"""
     try:
@@ -624,8 +656,8 @@ def generate_par2_for_file(file_path, debug=False):
             '--unicode',
             '--recovery-files', '1',
             '-R',
-            '-o', quote_path_for_7z(par2_output),
-            quote_path_for_7z(file_path)
+            '-o', quote_path_for_parpar(par2_output),
+            quote_path_for_parpar(file_path)  # 使用完整长路径，不使用短路径
         ]
         
         cmd_str = ' '.join(parpar_cmd)

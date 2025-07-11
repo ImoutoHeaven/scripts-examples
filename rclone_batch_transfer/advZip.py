@@ -418,7 +418,7 @@ def check_shell_environment():
         except:
             pass  # 如果检测失败，继续运行
 
-def check_required_tools():
+def check_required_tools(skip_parpar=False):
     """检查7z和parpar是否在PATH中可用"""
     missing_tools = []
     
@@ -436,19 +436,20 @@ def check_required_tools():
     except Exception:
         missing_tools.append('7z')
     
-    # 检查parpar
-    try:
-        result = subprocess.run(['parpar', '--version'], 
-                                stdout=subprocess.PIPE, 
-                                stderr=subprocess.PIPE, 
-                                shell=is_windows(),
-                                encoding='utf-8', 
-                                errors='replace')
-        # parpar --version应该正常退出并输出版本信息
-        if result.returncode != 0:
+    # 检查parpar（如果需要）
+    if not skip_parpar:
+        try:
+            result = subprocess.run(['parpar', '--version'], 
+                                    stdout=subprocess.PIPE, 
+                                    stderr=subprocess.PIPE, 
+                                    shell=is_windows(),
+                                    encoding='utf-8', 
+                                    errors='replace')
+            # parpar --version应该正常退出并输出版本信息
+            if result.returncode != 0:
+                missing_tools.append('parpar')
+        except Exception:
             missing_tools.append('parpar')
-    except Exception:
-        missing_tools.append('parpar')
     
     if missing_tools:
         error_msg = f"错误: 以下必需工具未在PATH中找到: {', '.join(missing_tools)}\n"
@@ -696,77 +697,33 @@ def generate_par2_for_file(file_path, debug=False):
             print(f"生成PAR2时出现异常: {e}")
         return False, None
 
-def append_par2_to_file(archive_file, par2_file, debug=False):
-    """将PAR2文件内容追加到压缩文件末尾"""
-    try:
-        # 读取PAR2文件的二进制内容
-        with open(safe_path_for_operation(par2_file, debug), 'rb') as par2_f:
-            par2_content = par2_f.read()
-        
-        # 将PAR2内容追加到压缩文件末尾
-        with open(safe_path_for_operation(archive_file, debug), 'ab') as archive_f:
-            archive_f.write(par2_content)
-        
-        if debug:
-            print(f"PAR2内容已追加到: {archive_file}")
-        
-        return True
-        
-    except Exception as e:
-        if debug:
-            print(f"追加PAR2内容失败: {e}")
-        return False
-
-def process_par2_for_archives(archive_files, embed_par2=True, debug=False):
-    """为压缩文件列表生成PAR2恢复记录，可选择是否嵌入到zip文件中"""
+def process_par2_for_archives(archive_files, debug=False):
+    """为压缩文件列表生成独立的PAR2恢复记录"""
     if not archive_files:
         return False, []
     
     try:
         generated_par2_files = []
         
-        # 第一阶段：为所有文件生成PAR2
+        # 为所有文件生成PAR2
         for archive_file in archive_files:
             success, par2_file = generate_par2_for_file(archive_file, debug)
             if success and par2_file:
-                generated_par2_files.append((archive_file, par2_file))
+                generated_par2_files.append(par2_file)
             else:
                 # 如果任何一个PAR2生成失败，清理已生成的PAR2文件
                 if debug:
                     print(f"PAR2生成失败，清理已生成的PAR2文件")
-                for _, cleanup_par2 in generated_par2_files:
+                for cleanup_par2 in generated_par2_files:
                     safe_remove(cleanup_par2, debug)
                 return False, []
         
-        if embed_par2:
-            # 第二阶段：将所有PAR2内容追加到对应的压缩文件
-            for archive_file, par2_file in generated_par2_files:
-                if not append_par2_to_file(archive_file, par2_file, debug):
-                    # 如果追加失败，不清理压缩文件，只清理PAR2文件
-                    if debug:
-                        print(f"PAR2追加失败，清理PAR2文件")
-                    for _, cleanup_par2 in generated_par2_files:
-                        safe_remove(cleanup_par2, debug)
-                    return False, []
-            
-            # 第三阶段：清理临时PAR2文件
-            for _, par2_file in generated_par2_files:
-                safe_remove(par2_file, debug)
-            
-            if debug:
-                print(f"成功为 {len(archive_files)} 个文件生成并嵌入PAR2恢复记录")
-            
-            return True, []
-        else:
-            # 不嵌入模式：保留PAR2文件，返回文件列表用于后续移动
-            par2_files = [par2_file for _, par2_file in generated_par2_files]
-            
-            if debug:
-                print(f"成功为 {len(archive_files)} 个文件生成独立PAR2恢复记录")
-                for par2_file in par2_files:
-                    print(f"  - PAR2文件: {par2_file}")
-            
-            return True, par2_files
+        if debug:
+            print(f"成功为 {len(archive_files)} 个文件生成独立PAR2恢复记录")
+            for par2_file in generated_par2_files:
+                print(f"  - PAR2文件: {par2_file}")
+        
+        return True, generated_par2_files
         
     except Exception as e:
         if debug:
@@ -943,7 +900,9 @@ def parse_arguments():
     parser.add_argument('--no-lock', action='store_true', help='不使用全局锁（谨慎使用）')
     parser.add_argument('--lock-timeout', type=int, default=30, help='锁定超时时间（最大重试次数）')
     parser.add_argument('--out', help='指定压缩后文件的输出目录路径')
-    parser.add_argument('--no-emb', action='store_true', help='生成独立的PAR2文件，不嵌入到ZIP文件中')
+
+    
+    parser.add_argument('--no-rec', action='store_true', help='不生成PAR2恢复记录文件')
     
     # 新增的过滤参数
     parser.add_argument('--skip-files', action='store_true', help='跳过文件，仅处理文件夹')
@@ -1082,29 +1041,24 @@ def build_7z_switches(profile, password, code_page, delete_files=False):
     else:
         switches.append(f'-mcp={code_page}')
     
-    # 处理不同的压缩配置
+    # 处理不同的压缩配置 - ZIP格式使用-mx参数
     if profile == 'store':
-        switches.extend([
-            '-m0=Copy',   # 仅存储，不压缩
-            '-ms=off',    # 不使用固实压缩
-        ])
+        switches.append('-mx=0')      # 仅存储，不压缩
     elif profile == 'fastest':
         switches.extend([
             '-mx=1',      # 最快压缩级别
-            '-ms=off',    # 不使用固实压缩
             '-mfb=32',    # 字典大小：32
         ])
     else:  # best
         switches.extend([
             '-mx=9',      # 最佳压缩级别
-            '-ms=on',     # 使用固实压缩
             '-mfb=256',   # 字典大小：256
         ])
     
     # 添加密码参数（如果提供了密码）
-    # ZIP格式不支持加密文件头，所以不添加-mhe=on
+    # ZIP格式不支持加密文件头，使用引号包围密码以处理特殊字符
     if password:
-        switches.append(f'-p{password}')
+        switches.append(f'-p"{password}"')
     
     return switches
 
@@ -1314,14 +1268,11 @@ def process_file(file_path, args, base_path):
             if success and moved_files:
                 stats.log(f"成功创建ZIP文件: {moved_files[0]}")
                 
-                # 生成PAR2恢复记录
-                embed_par2 = not args.no_emb
-                par2_success, par2_files = process_par2_for_archives(moved_files, embed_par2, args.debug)
-                
-                if par2_success:
-                    if embed_par2:
-                        stats.log(f"成功为压缩文件生成并嵌入PAR2恢复记录")
-                    else:
+                # 生成PAR2恢复记录（如果需要）
+                if not args.no_rec:
+                    par2_success, par2_files = process_par2_for_archives(moved_files, args.debug)
+                    
+                    if par2_success:
                         stats.log(f"成功为压缩文件生成独立PAR2恢复记录")
                         
                         # 处理独立PAR2文件的移动（如果需要移动到输出目录）
@@ -1336,9 +1287,11 @@ def process_file(file_path, args, base_path):
                                             stats.log(f"成功移动PAR2文件: {par2_file} -> {target_par2_path}")
                                     else:
                                         stats.log(f"警告: 移动PAR2文件失败: {par2_file}")
+                    else:
+                        stats.log(f"警告: PAR2恢复记录生成失败，但压缩文件已成功创建")
+                        stats.add_par2_failure('文件', file_path, moved_files)
                 else:
-                    stats.log(f"警告: PAR2恢复记录生成失败，但压缩文件已成功创建")
-                    stats.add_par2_failure('文件', file_path, moved_files)
+                    stats.log(f"跳过PAR2恢复记录生成（--no-rec参数）")
                 
                 # 记录成功
                 stats.add_success('文件', file_path)
@@ -1479,14 +1432,11 @@ def process_folder(folder_path, args, base_path):
             if success and moved_files:
                 stats.log(f"成功创建ZIP文件: {moved_files[0]}")
                 
-                # 生成PAR2恢复记录
-                embed_par2 = not args.no_emb
-                par2_success, par2_files = process_par2_for_archives(moved_files, embed_par2, args.debug)
-                
-                if par2_success:
-                    if embed_par2:
-                        stats.log(f"成功为压缩文件生成并嵌入PAR2恢复记录")
-                    else:
+                # 生成PAR2恢复记录（如果需要）
+                if not args.no_rec:
+                    par2_success, par2_files = process_par2_for_archives(moved_files, args.debug)
+                    
+                    if par2_success:
                         stats.log(f"成功为压缩文件生成独立PAR2恢复记录")
                         
                         # 处理独立PAR2文件的移动（如果需要移动到输出目录）
@@ -1501,9 +1451,11 @@ def process_folder(folder_path, args, base_path):
                                             stats.log(f"成功移动PAR2文件: {par2_file} -> {target_par2_path}")
                                     else:
                                         stats.log(f"警告: 移动PAR2文件失败: {par2_file}")
+                    else:
+                        stats.log(f"警告: PAR2恢复记录生成失败，但压缩文件已成功创建")
+                        stats.add_par2_failure('文件夹', folder_path, moved_files)
                 else:
-                    stats.log(f"警告: PAR2恢复记录生成失败，但压缩文件已成功创建")
-                    stats.add_par2_failure('文件夹', folder_path, moved_files)
+                    stats.log(f"跳过PAR2恢复记录生成（--no-rec参数）")
                 
                 # 7z的-sdel参数已经删除了文件夹内的文件
                 # 如果指定了删除选项，需要检查并删除可能剩余的空文件夹
@@ -1552,13 +1504,14 @@ def main():
     # 检查shell环境
     check_shell_environment()
     
-    # 检查必需工具
-    check_required_tools()
+    # 解析参数（需要先解析以确定是否需要检查parpar）
+    args = parse_arguments()
+    
+    # 检查必需工具（根据--no-rec参数决定是否检查parpar）
+    check_required_tools(skip_parpar=args.no_rec)
     
     # 初始化统计信息
     stats.log("程序开始执行")
-    
-    args = parse_arguments()
     
     # 验证参数组合
     if args.skip_files and args.skip_folders:
@@ -1643,6 +1596,7 @@ def main():
             stats.log(f"- 跳过扩展名: {args.skip_extensions}")
             stats.log(f"- 压缩配置: {args.profile}")
             stats.log(f"- 代码页: {args.code_page}")
+            stats.log(f"- 生成PAR2: {not args.no_rec}")
         
         # 获取指定深度的文件和文件夹列表（应用过滤规则）
         items = get_items_at_depth(args.folder_path, args.depth, args)

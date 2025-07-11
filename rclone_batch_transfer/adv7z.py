@@ -934,6 +934,10 @@ def parse_arguments():
     parser.add_argument('--skip-files', action='store_true', help='跳过文件，仅处理文件夹')
     parser.add_argument('--skip-folders', action='store_true', help='跳过文件夹，仅处理文件')
     
+    # 新增：文件夹树过滤参数
+    parser.add_argument('--ext-skip-folder-tree', action='store_true', 
+                       help='当指定--skip-${ext}参数时，跳过包含对应扩展名文件的整个文件夹')
+    
     args, unknown = parser.parse_known_args()
     
     # 处理 --skip-ext 类型的参数
@@ -988,6 +992,26 @@ def should_skip_file(file_path, skip_extensions):
     
     return ext in skip_extensions
 
+def folder_contains_skip_extensions(folder_path, skip_extensions, debug=False):
+    """递归检查文件夹是否包含指定扩展名的文件"""
+    if not skip_extensions:
+        return False
+    
+    try:
+        for root, dirs, files in safe_walk(folder_path):
+            for file_name in files:
+                file_path = os.path.join(root, file_name)
+                if should_skip_file(file_path, skip_extensions):
+                    if debug:
+                        print(f"文件夹 {folder_path} 包含跳过的扩展名文件: {file_path}")
+                    return True
+        return False
+    except Exception as e:
+        if debug:
+            print(f"检查文件夹 {folder_path} 时出错: {e}")
+        # 如果无法访问文件夹，为安全起见返回True（跳过）
+        return True
+
 def remove_directory(path, dry_run=False):
     """递归删除目录及其内容"""
     if dry_run:
@@ -1006,6 +1030,13 @@ def get_items_at_depth(base_folder, target_depth, args):
             folder_path = safe_abspath(base_folder)
             # 检查文件夹是否为空
             if not is_folder_empty(folder_path):
+                # 新增：检查文件夹是否包含要跳过的扩展名文件（如果启用了ext-skip-folder-tree）
+                if args.ext_skip_folder_tree and args.skip_extensions:
+                    if folder_contains_skip_extensions(folder_path, args.skip_extensions, args.debug):
+                        if args.debug:
+                            print(f"跳过包含排除扩展名文件的文件夹: {folder_path}")
+                        return items
+                
                 items['folders'].append(folder_path)
             elif args.debug:
                 print(f"跳过空文件夹: {folder_path}")
@@ -1044,6 +1075,13 @@ def get_items_at_depth(base_folder, target_depth, args):
                         if args.debug:
                             print(f"跳过空文件夹: {abs_path}")
                         continue
+                    
+                    # 新增：检查文件夹是否包含要跳过的扩展名文件（如果启用了ext-skip-folder-tree）
+                    if args.ext_skip_folder_tree and args.skip_extensions:
+                        if folder_contains_skip_extensions(abs_path, args.skip_extensions, args.debug):
+                            if args.debug:
+                                print(f"跳过包含排除扩展名文件的文件夹: {abs_path}")
+                            continue
                     
                     items['folders'].append(abs_path)
     
@@ -1659,6 +1697,19 @@ def main():
         print(error_msg)
         sys.exit(1)
     
+    # 验证ext-skip-folder-tree参数的使用条件
+    if args.ext_skip_folder_tree:
+        if not args.skip_extensions:
+            error_msg = "错误: --ext-skip-folder-tree 参数只有在指定 --skip-${ext} 参数时才有效"
+            stats.log(error_msg)
+            print(error_msg)
+            sys.exit(1)
+        
+        if args.skip_folders:
+            warning_msg = "警告: --ext-skip-folder-tree 与 --skip-folders 组合时，逻辑与原先一致（不处理文件夹）"
+            stats.log(warning_msg)
+            print(warning_msg)
+    
     # 验证目标路径
     if not safe_exists(args.folder_path, args.debug):
         error_msg = f"错误: 路径不存在 - {args.folder_path}"
@@ -1733,6 +1784,7 @@ def main():
             stats.log(f"- 跳过文件: {args.skip_files}")
             stats.log(f"- 跳过文件夹: {args.skip_folders}")
             stats.log(f"- 跳过扩展名: {args.skip_extensions}")
+            stats.log(f"- 扩展名文件夹树过滤: {args.ext_skip_folder_tree}")
         
         # 获取指定深度的文件和文件夹列表（应用过滤规则）
         items = get_items_at_depth(args.folder_path, args.depth, args)

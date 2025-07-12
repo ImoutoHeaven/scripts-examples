@@ -912,6 +912,10 @@ def profile_type(value):
         f"'{value}' 不是一个有效的配置。请选择 'store', 'best', 'fastest', 或者 'parted-XXunit' (例如: 'parted-10g', 'parted-100mb', 'parted-500k')。"
     )
 
+def is_parted_profile(profile):
+    """检查profile是否为分卷模式"""
+    return profile.startswith('parted-')
+
 def parse_arguments():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description='7z压缩工具（含PAR2恢复记录）')
@@ -1443,8 +1447,15 @@ def process_file(file_path, args, base_path):
                 
                 # 只有在不跳过PAR2恢复记录时才生成PAR2
                 if not args.no_rec:
+                    # 对于分卷模式，自动使用独立PAR2（不嵌入）
+                    if is_parted_profile(args.profile):
+                        embed_par2 = False  # 分卷模式强制使用独立PAR2
+                        if args.debug:
+                            stats.log(f"分卷模式自动使用独立PAR2文件（不嵌入）")
+                    else:
+                        embed_par2 = not args.no_emb
+                    
                     # 生成PAR2恢复记录
-                    embed_par2 = not args.no_emb
                     par2_success, par2_files = process_par2_for_archives(moved_files, embed_par2, args.debug)
                     
                     if par2_success:
@@ -1619,8 +1630,15 @@ def process_folder(folder_path, args, base_path):
                 
                 # 只有在不跳过PAR2恢复记录时才生成PAR2
                 if not args.no_rec:
+                    # 对于分卷模式，自动使用独立PAR2（不嵌入）
+                    if is_parted_profile(args.profile):
+                        embed_par2 = False  # 分卷模式强制使用独立PAR2
+                        if args.debug:
+                            stats.log(f"分卷模式自动使用独立PAR2文件（不嵌入）")
+                    else:
+                        embed_par2 = not args.no_emb
+                    
                     # 生成PAR2恢复记录
-                    embed_par2 = not args.no_emb
                     par2_success, par2_files = process_par2_for_archives(moved_files, embed_par2, args.debug)
                     
                     if par2_success:
@@ -1698,6 +1716,15 @@ def main():
     # 解析参数（需要先解析参数才能知道是否使用--no-rec）
     args = parse_arguments()
     
+    # 新增：分卷模式下PAR2处理逻辑调整
+    if is_parted_profile(args.profile):
+        if not args.no_rec:
+            # 分卷模式且未禁用PAR2：强制使用独立PAR2（不嵌入）
+            if not args.no_emb:
+                args.no_emb = True  # 自动设置为独立模式
+                print("注意: 分卷模式自动使用独立PAR2文件（不嵌入），以确保分卷文件格式兼容性")
+        # 如果指定了--no-rec，则不生成PAR2文件（保持原有逻辑）
+    
     # 检查必需工具（根据--no-rec参数决定是否检查parpar）
     check_required_tools(no_par2=args.no_rec)
     
@@ -1765,6 +1792,8 @@ def main():
     # 显示PAR2恢复记录设置
     if args.no_rec:
         rec_msg = "PAR2恢复记录: 已禁用（--no-rec参数）"
+    elif is_parted_profile(args.profile):
+        rec_msg = "PAR2恢复记录: 生成独立文件（分卷模式自动设置）"
     elif args.no_emb:
         rec_msg = "PAR2恢复记录: 生成独立文件（--no-emb参数）"
     else:
@@ -1816,6 +1845,7 @@ def main():
             stats.log(f"- 跳过扩展名: {args.skip_extensions}")
             stats.log(f"- 扩展名文件夹树过滤: {args.ext_skip_folder_tree}")
             stats.log(f"- 跳过PAR2恢复记录: {args.no_rec}")
+            stats.log(f"- 分卷模式: {is_parted_profile(args.profile)}")
         
         # 获取指定深度的文件和文件夹列表（应用过滤规则）
         items = get_items_at_depth(args.folder_path, args.depth, args)

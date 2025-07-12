@@ -3,6 +3,7 @@
 Advanced Decompressor Script
 Supports Windows 10/Debian 12 platforms
 Recursively scans and extracts various archive formats including SFX files
+Fixed Unicode handling for all subprocess operations
 """
 
 import os
@@ -21,6 +22,145 @@ from typing import List, Dict, Optional, Union, Tuple
 
 # Global verbose flag
 VERBOSE = False
+
+def setup_windows_utf8():
+    """Setup UTF-8 encoding for Windows console operations"""
+    if sys.platform.startswith('win'):
+        try:
+            # Set environment variables for UTF-8 encoding
+            os.environ['PYTHONIOENCODING'] = 'utf-8'
+            os.environ['LC_ALL'] = 'C.UTF-8'
+            os.environ['LANG'] = 'C.UTF-8'
+            
+            # Try to set console code page to UTF-8 (65001)
+            try:
+                subprocess.run(['chcp', '65001'], 
+                             stdout=subprocess.DEVNULL, 
+                             stderr=subprocess.DEVNULL, 
+                             check=False)
+            except:
+                pass
+                
+            if VERBOSE:
+                print("  DEBUG: Windows UTF-8 environment setup attempted")
+        except Exception as e:
+            if VERBOSE:
+                print(f"  DEBUG: Could not setup UTF-8 environment: {e}")
+
+def safe_decode(byte_data, encoding='utf-8', fallback_encodings=None):
+    """
+    Safely decode byte data to string with multiple encoding fallbacks
+    
+    Args:
+        byte_data: Bytes to decode
+        encoding: Primary encoding to try (default: utf-8)
+        fallback_encodings: List of fallback encodings to try
+        
+    Returns:
+        str: Decoded string
+    """
+    if fallback_encodings is None:
+        fallback_encodings = ['cp1252', 'iso-8859-1', 'gbk', 'shift-jis']
+    
+    if isinstance(byte_data, str):
+        return byte_data
+    
+    # Try primary encoding with error handling
+    try:
+        return byte_data.decode(encoding, errors='replace')
+    except (UnicodeDecodeError, LookupError):
+        pass
+    
+    # Try fallback encodings
+    for fallback in fallback_encodings:
+        try:
+            return byte_data.decode(fallback, errors='replace')
+        except (UnicodeDecodeError, LookupError):
+            continue
+    
+    # Last resort: decode with ignore errors
+    try:
+        return byte_data.decode('utf-8', errors='ignore')
+    except:
+        return str(byte_data, errors='ignore')
+
+def safe_subprocess_run(cmd, **kwargs):
+    """
+    Safely run subprocess with proper encoding handling
+    
+    Args:
+        cmd: Command to run
+        **kwargs: Additional arguments for subprocess.run
+        
+    Returns:
+        subprocess.CompletedProcess with safely decoded output
+    """
+    # Force binary mode and handle encoding manually
+    kwargs_copy = kwargs.copy()
+    kwargs_copy.pop('text', None)  # Remove text=True if present
+    kwargs_copy.pop('encoding', None)  # Remove encoding if present
+    kwargs_copy.pop('universal_newlines', None)  # Remove universal_newlines if present
+    
+    try:
+        result = subprocess.run(cmd, **kwargs_copy)
+        
+        # Safely decode stdout and stderr
+        if hasattr(result, 'stdout') and result.stdout is not None:
+            if isinstance(result.stdout, bytes):
+                result.stdout = safe_decode(result.stdout)
+        
+        if hasattr(result, 'stderr') and result.stderr is not None:
+            if isinstance(result.stderr, bytes):
+                result.stderr = safe_decode(result.stderr)
+        
+        return result
+        
+    except Exception as e:
+        if VERBOSE:
+            print(f"  DEBUG: subprocess error: {e}")
+        # Return a mock result object for error cases
+        class MockResult:
+            def __init__(self):
+                self.returncode = 1
+                self.stdout = ""
+                self.stderr = str(e)
+        return MockResult()
+
+def safe_popen_communicate(cmd, **kwargs):
+    """
+    Safely use Popen and communicate with proper encoding handling
+    
+    Args:
+        cmd: Command to run
+        **kwargs: Additional arguments for Popen
+        
+    Returns:
+        tuple: (stdout_str, stderr_str, returncode)
+    """
+    # Force binary mode
+    kwargs_copy = kwargs.copy()
+    kwargs_copy.pop('text', None)
+    kwargs_copy.pop('encoding', None)
+    kwargs_copy.pop('universal_newlines', None)
+    
+    try:
+        proc = subprocess.Popen(cmd, 
+                               stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE,
+                               **kwargs_copy)
+        
+        stdout_bytes, stderr_bytes = proc.communicate()
+        
+        # Safely decode output
+        stdout_str = safe_decode(stdout_bytes) if stdout_bytes else ""
+        stderr_str = safe_decode(stderr_bytes) if stderr_bytes else ""
+        
+        return stdout_str, stderr_str, proc.returncode
+        
+    except Exception as e:
+        if VERBOSE:
+            print(f"  DEBUG: Popen error: {e}")
+        return "", str(e), 1
 
 class SFXDetector:
     """Detects if an EXE file is a self-extracting archive by analyzing file headers"""
@@ -481,29 +621,15 @@ def check_encryption(filepath):
         if VERBOSE:
             print(f"  DEBUG: Checking with dummy password")
         
-        # Use binary mode and handle decoding errors
-        proc = subprocess.Popen(['7z', 'l', '-slt', '-pDUMMYPASSWORD', filepath], 
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                universal_newlines=False)  # Use binary mode instead of text=True
-        
-        stdout_bytes, stderr_bytes = proc.communicate()
-        
-        # Safely decode with error handling
-        try:
-            stdout_output = stdout_bytes.decode('utf-8', errors='replace')
-        except:
-            stdout_output = ""
-        
-        try:
-            stderr_output = stderr_bytes.decode('utf-8', errors='replace')
-        except:
-            stderr_output = ""
+        # Use safe subprocess handling
+        stdout_output, stderr_output, returncode = safe_popen_communicate(
+            ['7z', 'l', '-slt', '-pDUMMYPASSWORD', filepath]
+        )
         
         output_combined = stdout_output + stderr_output
         
         if VERBOSE:
-            print(f"  DEBUG: Return code: {proc.returncode}")
+            print(f"  DEBUG: Return code: {returncode}")
             print(f"  DEBUG: Output excerpt: {output_combined[:200]}")
         
         # Check for encryption indicators
@@ -523,28 +649,14 @@ def check_encryption(filepath):
         if VERBOSE:
             print(f"  DEBUG: Checking without password")
             
-        proc = subprocess.Popen(['7z', 'l', '-slt', filepath], 
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                universal_newlines=False)  # Use binary mode
-        
-        stdout_bytes, stderr_bytes = proc.communicate()
-        
-        # Safely decode with error handling
-        try:
-            stdout_output = stdout_bytes.decode('utf-8', errors='replace')
-        except:
-            stdout_output = ""
-        
-        try:
-            stderr_output = stderr_bytes.decode('utf-8', errors='replace')
-        except:
-            stderr_output = ""
+        stdout_output, stderr_output, returncode = safe_popen_communicate(
+            ['7z', 'l', '-slt', filepath]
+        )
         
         output_combined = stdout_output + stderr_output
         
         if VERBOSE:
-            print(f"  DEBUG: Return code: {proc.returncode}")
+            print(f"  DEBUG: Return code: {returncode}")
             print(f"  DEBUG: Output excerpt: {output_combined[:200]}")
         
         # Check for other encryption indicators
@@ -562,30 +674,37 @@ def check_encryption(filepath):
             print(f"  DEBUG: No encryption detected")
         return False
             
-    except subprocess.SubprocessError as e:
-        print(f"  Subprocess error: {str(e)}")
-        return None
     except Exception as e:
-        print(f"  Error: {str(e)}")
+        print(f"  Error checking encryption: {str(e)}")
         return None
 
 
 def is_password_correct(archive_path, password):
     """Test if a password is correct for an archive."""
-    cmd = ['7z', 't', str(archive_path), f'-p{password}', '-y']
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    
-    if result.returncode == 0:
-        return True
-    else:
+    try:
+        cmd = ['7z', 't', str(archive_path), f'-p{password}', '-y']
+        result = safe_subprocess_run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        if result.returncode == 0:
+            return True
+        else:
+            return False
+    except Exception as e:
+        if VERBOSE:
+            print(f"  DEBUG: Error testing password: {e}")
         return False
 
 
 def try_extract(archive_path, password, tmp_dir):
     """Extract archive to temporary directory."""
-    cmd = ['7z', 'x', archive_path, f'-o{tmp_dir}', f'-p{password}', '-y']
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    return result.returncode == 0
+    try:
+        cmd = ['7z', 'x', archive_path, f'-o{tmp_dir}', f'-p{password}', '-y']
+        result = safe_subprocess_run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return result.returncode == 0
+    except Exception as e:
+        if VERBOSE:
+            print(f"  DEBUG: Error extracting: {e}")
+        return False
 
 
 def get_archive_base_name(filepath):
@@ -1012,6 +1131,9 @@ def main():
     """Main function."""
     global VERBOSE
     
+    # Setup UTF-8 environment early
+    setup_windows_utf8()
+    
     parser = argparse.ArgumentParser(
         description='Advanced archive decompressor supporting various formats and policies'
     )
@@ -1119,7 +1241,7 @@ def main():
     
     # Check if 7z is available
     try:
-        subprocess.run(['7z'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        safe_subprocess_run(['7z'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except FileNotFoundError:
         print("Error: 7z command not found. Please install p7zip or 7-Zip.")
         return 1

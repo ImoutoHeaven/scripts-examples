@@ -754,6 +754,9 @@ def find_archive_volumes(main_archive_path):
     main_filename = os.path.basename(main_archive_path)
     main_filename_lower = main_filename.lower()
     
+    if VERBOSE:
+        print(f"    DEBUG: Finding volumes for: {main_archive_path}")
+    
     # For different archive types, find related volumes
     if main_filename_lower.endswith('.rar') and not re.search(r'\.part\d+\.rar$', main_filename_lower):
         # Single RAR, look for .r00, .r01, etc.
@@ -763,6 +766,8 @@ def find_archive_volumes(main_archive_path):
             volume_path = os.path.join(base_dir, volume_name)
             if os.path.exists(volume_path):
                 volumes.append(volume_path)
+                if VERBOSE:
+                    print(f"    DEBUG: Found volume: {volume_path}")
     
     elif re.search(r'\.part0*1\.rar$', main_filename_lower):
         # Multi-part RAR, find all parts
@@ -772,15 +777,19 @@ def find_archive_volumes(main_archive_path):
                 volume_path = os.path.join(base_dir, filename)
                 if volume_path != main_archive_path:
                     volumes.append(volume_path)
+                    if VERBOSE:
+                        print(f"    DEBUG: Found volume: {volume_path}")
     
     elif main_filename_lower.endswith('.7z.001'):
         # Multi-part 7z, find all parts
-        base_name = main_filename[:-4]  # Remove .001
+        base_name = main_filename[:-4]  # Remove .001 to get "filename.7z"
         for i in range(2, 1000):  # Check .002, .003, etc.
-            volume_name = f"{base_name}{i:03d}"
+            volume_name = f"{base_name}.{i:03d}"  # Fixed: Add the missing dot
             volume_path = os.path.join(base_dir, volume_name)
             if os.path.exists(volume_path):
                 volumes.append(volume_path)
+                if VERBOSE:
+                    print(f"    DEBUG: Found volume: {volume_path}")
             else:
                 break
     
@@ -792,6 +801,8 @@ def find_archive_volumes(main_archive_path):
             volume_path = os.path.join(base_dir, volume_name)
             if os.path.exists(volume_path):
                 volumes.append(volume_path)
+                if VERBOSE:
+                    print(f"    DEBUG: Found volume: {volume_path}")
     
     elif re.search(r'\.part0*1\.exe$', main_filename_lower):
         # Multi-part SFX, find all parts
@@ -801,9 +812,13 @@ def find_archive_volumes(main_archive_path):
                 volume_path = os.path.join(base_dir, filename)
                 if volume_path != main_archive_path:
                     volumes.append(volume_path)
+                    if VERBOSE:
+                        print(f"    DEBUG: Found volume: {volume_path}")
+    
+    if VERBOSE:
+        print(f"    DEBUG: Total volumes found: {len(volumes)}")
     
     return volumes
-
 
 def count_items_in_dir(directory):
     """Count files and directories in a directory recursively."""
@@ -902,6 +917,11 @@ class ArchiveProcessor:
         os.makedirs(target_base, exist_ok=True)
         
         base_path = self.args.path if os.path.isdir(self.args.path) else os.path.dirname(self.args.path)
+        
+        if VERBOSE:
+            print(f"    DEBUG: Moving {len(volumes)} volumes to {target_base}")
+            for vol in volumes:
+                print(f"    DEBUG: Volume to move: {vol}")
         
         for volume in volumes:
             try:

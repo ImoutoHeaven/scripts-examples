@@ -1155,7 +1155,7 @@ def is_password_correct(archive_path, password):
         return False
 
 
-def try_extract(archive_path, password, tmp_dir, zip_decode=None):
+def try_extract(archive_path, password, tmp_dir, zip_decode=None, enable_rar=False, sfx_detector=None):
     """
     Extract archive to temporary directory.
     
@@ -1164,30 +1164,64 @@ def try_extract(archive_path, password, tmp_dir, zip_decode=None):
         password: 解压密码
         tmp_dir: 临时目录
         zip_decode: ZIP文件代码页（例如932表示shift-jis）
+        enable_rar: 是否启用RAR解压器
+        sfx_detector: SFXDetector实例，用于检测SFX文件格式
     """
     try:
         if VERBOSE:
             print(f"  DEBUG: 开始解压: {archive_path} -> {tmp_dir}")
         
-        cmd = ['7z', 'x', archive_path, f'-o{tmp_dir}', f'-p{password}', '-y']
+        # 判断是否应该使用RAR解压
+        use_rar = should_use_rar_extractor(archive_path, enable_rar, sfx_detector)
         
-        # 如果指定了zip_decode参数且当前文件是ZIP格式，则添加-scc参数
-        if zip_decode is not None and is_zip_format(archive_path):
-            scc_param = f'-scc{zip_decode}'
-            cmd.append(scc_param)
+        if use_rar:
+            # 使用RAR命令解压
             if VERBOSE:
-                print(f"  DEBUG: 添加ZIP代码页参数: {scc_param}")
-        
-        result = safe_subprocess_run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                print(f"  DEBUG: 使用RAR命令解压")
+            
+            cmd = ['rar', 'x', archive_path, tmp_dir]
+            
+            # 添加密码参数（如果有）
+            if password:
+                cmd.extend([f'-p{password}'])
+            
+            # 添加其他RAR参数
+            cmd.extend(['-y'])  # 自动回答yes
+            
+            if VERBOSE:
+                print(f"  DEBUG: RAR命令: {' '.join(cmd)}")
+            
+            result = safe_subprocess_run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            
+        else:
+            # 使用7z命令解压
+            if VERBOSE:
+                print(f"  DEBUG: 使用7z命令解压")
+            
+            cmd = ['7z', 'x', archive_path, f'-o{tmp_dir}', f'-p{password}', '-y']
+            
+            # 如果指定了zip_decode参数且当前文件是ZIP格式，则添加-scc参数
+            if zip_decode is not None and is_zip_format(archive_path):
+                scc_param = f'-scc{zip_decode}'
+                cmd.append(scc_param)
+                if VERBOSE:
+                    print(f"  DEBUG: 添加ZIP代码页参数: {scc_param}")
+            
+            if VERBOSE:
+                print(f"  DEBUG: 7z命令: {' '.join(cmd)}")
+            
+            result = safe_subprocess_run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         
         success = result.returncode == 0
         
         if VERBOSE:
-            print(f"  DEBUG: 解压结果: {'成功' if success else '失败'}")
+            extractor = 'RAR' if use_rar else '7z'
+            print(f"  DEBUG: {extractor}解压结果: {'成功' if success else '失败'}")
             if not success and result.stderr:
                 print(f"  DEBUG: 解压错误: {result.stderr[:300]}")
         
         return success
+        
     except Exception as e:
         if VERBOSE:
             print(f"  DEBUG: Error extracting: {e}")
@@ -1802,6 +1836,153 @@ def apply_separate_policy_internal(tmp_dir, output_dir, archive_name, unique_suf
 
 # ==================== 结束新增解压策略 ====================
 
+# ==================== 新增RAR策略 ====================
+
+def check_rar_available():
+    """
+    Check if rar command is available in PATH
+    
+    Returns:
+        bool: True if rar command is available, False otherwise
+    """
+    try:
+        if VERBOSE:
+            print(f"  DEBUG: 检查rar命令可用性")
+        
+        # Try to run rar command to check if it's available
+        result = safe_subprocess_run(['rar'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        # rar command typically returns non-zero when run without arguments
+        # but if it's found, we should get some output
+        available = True  # If command runs without FileNotFoundError, it's available
+        
+        if VERBOSE:
+            print(f"  DEBUG: rar命令{'可用' if available else '不可用'}")
+        
+        return available
+        
+    except FileNotFoundError:
+        if VERBOSE:
+            print(f"  DEBUG: rar命令未找到")
+        return False
+    except Exception as e:
+        if VERBOSE:
+            print(f"  DEBUG: 检查rar命令时出错: {e}")
+        return False
+
+def is_rar_format(archive_path):
+    """
+    判断文件是否为RAR格式或RAR分卷
+    
+    Args:
+        archive_path: 归档文件路径
+        
+    Returns:
+        bool: 如果是RAR格式或RAR分卷返回True，否则返回False
+    """
+    filename_lower = os.path.basename(archive_path).lower()
+    
+    if VERBOSE:
+        print(f"  DEBUG: 检查是否为RAR格式: {archive_path}")
+    
+    # 检查文件扩展名
+    if filename_lower.endswith('.rar'):
+        if VERBOSE:
+            print(f"  DEBUG: 检测到RAR文件（扩展名）")
+        return True
+    
+    # 检查RAR分卷格式 (.part*.rar)
+    if re.search(r'\.part\d+\.rar$', filename_lower):
+        if VERBOSE:
+            print(f"  DEBUG: 检测到RAR分卷文件（扩展名）")
+        return True
+    
+    # 检查RAR老式分卷格式 (.r00, .r01, etc.)
+    if re.search(r'\.r\d+$', filename_lower):
+        if VERBOSE:
+            print(f"  DEBUG: 检测到RAR老式分卷文件（扩展名）")
+        return True
+    
+    # 检查文件魔术字节 (Rar! header)
+    try:
+        with open(archive_path, 'rb') as f:
+            header = f.read(4)
+            if header == b'Rar!':
+                if VERBOSE:
+                    print(f"  DEBUG: 通过魔术字节检测到RAR格式")
+                return True
+    except Exception as e:
+        if VERBOSE:
+            print(f"  DEBUG: 读取文件头失败: {e}")
+    
+    if VERBOSE:
+        print(f"  DEBUG: 非RAR格式")
+    return False
+
+def should_use_rar_extractor(archive_path, enable_rar=False, sfx_detector=None):
+    """
+    判断是否应该使用RAR命令解压文件
+    
+    Args:
+        archive_path: 归档文件路径
+        enable_rar: 是否启用RAR解压器
+        sfx_detector: SFXDetector实例，用于检测SFX文件
+        
+    Returns:
+        bool: 如果应该使用RAR解压返回True，否则返回False
+    """
+    if not enable_rar:
+        if VERBOSE:
+            print(f"  DEBUG: RAR解压器未启用，使用7z")
+        return False
+    
+    filename_lower = os.path.basename(archive_path).lower()
+    
+    if VERBOSE:
+        print(f"  DEBUG: 判断是否使用RAR解压: {archive_path}")
+    
+    # 对于明显的RAR文件，直接返回True
+    if is_rar_format(archive_path):
+        if VERBOSE:
+            print(f"  DEBUG: 检测到RAR格式，使用RAR解压")
+        return True
+    
+    # 对于SFX文件（.exe），需要检测内部格式
+    if filename_lower.endswith('.exe') and sfx_detector:
+        if VERBOSE:
+            print(f"  DEBUG: 检测SFX文件格式")
+        
+        # 使用详细的SFX检测
+        sfx_result = sfx_detector.is_sfx(archive_path, detailed=True)
+        
+        if sfx_result and sfx_result.get('is_sfx', False):
+            # 检查是否找到了RAR签名或RAR标记
+            signature_info = sfx_result.get('signature', {})
+            rar_marker = sfx_result.get('rar_marker', False)
+            
+            if signature_info.get('found', False) and signature_info.get('format') == 'RAR':
+                if VERBOSE:
+                    print(f"  DEBUG: SFX文件包含RAR签名，使用RAR解压")
+                return True
+            
+            if rar_marker:
+                if VERBOSE:
+                    print(f"  DEBUG: SFX文件包含RAR标记，使用RAR解压")
+                return True
+            
+            if VERBOSE:
+                print(f"  DEBUG: SFX文件非RAR格式，使用7z解压")
+        else:
+            if VERBOSE:
+                print(f"  DEBUG: 非SFX文件，使用7z解压")
+    
+    if VERBOSE:
+        print(f"  DEBUG: 使用7z解压")
+    return False
+
+
+# ==================== 结束新增RAR策略 ====================
+
 class ArchiveProcessor:
     """Handles archive processing with various policies."""
     
@@ -1986,9 +2167,16 @@ class ArchiveProcessor:
             print(f"  DEBUG: 创建临时目录: {tmp_dir}")
         
         try:
-            # Step 5: Extract using try_extract function (with zip_decode parameter)
+            # Step 5: Extract using try_extract function (with new parameters)
             zip_decode = getattr(self.args, 'zip_decode', None)
-            success = try_extract(archive_path, correct_password, tmp_dir, zip_decode)
+            enable_rar = getattr(self.args, 'enable_rar', False)
+            
+            # Check RAR availability if needed
+            if enable_rar and not check_rar_available():
+                print(f"  Warning: RAR command not available, falling back to 7z")
+                enable_rar = False
+            
+            success = try_extract(archive_path, correct_password, tmp_dir, zip_decode, enable_rar, self.sfx_detector)
             
             # Step 6: Find all volumes for this archive
             all_volumes = find_archive_volumes(archive_path)
@@ -2193,6 +2381,12 @@ def main():
     )
     
     parser.add_argument(
+        '-er', '--enable-rar',
+        action='store_true',
+        help='Enable RAR command-line tool for extracting RAR archives and RAR SFX files. Falls back to 7z if RAR is not available.'
+    )
+    
+    parser.add_argument(
         '-t', '--threads',
         type=int,
         default=1,
@@ -2240,6 +2434,8 @@ def main():
         action='store_true',
         help='Enable verbose output'
     )
+    
+    
     
     # 锁相关参数
     parser.add_argument(
@@ -2304,6 +2500,13 @@ def main():
         except FileNotFoundError:
             print("Error: 7z command not found. Please install p7zip or 7-Zip.")
             return 1
+        
+        # Check if RAR is available when --enable-rar is used
+        if args.enable_rar:
+            if not check_rar_available():
+                print("Warning: RAR command not found in PATH. Will fall back to 7z for all archives.")
+                print("To use RAR extraction, please install WinRAR or RAR command-line tool.")
+                # Don't return error, just warn and continue with 7z fallback
         
         # Create processor and find archives
         processor = ArchiveProcessor(args)

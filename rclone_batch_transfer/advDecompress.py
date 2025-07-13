@@ -31,6 +31,67 @@ from typing import List, Dict, Optional, Union, Tuple
 VERBOSE = False
 
 
+# === depth 限制 实现 ====
+
+def parse_depth_range(depth_range_str):
+    """
+    解析深度范围字符串
+    
+    Args:
+        depth_range_str: 深度范围字符串，格式为 "int1-int2" 或 "int"
+        
+    Returns:
+        tuple: (min_depth, max_depth) 或 None（如果解析失败）
+        
+    Raises:
+        ValueError: 如果格式无效或深度值无效
+    """
+    if not depth_range_str:
+        return None
+        
+    depth_range_str = depth_range_str.strip()
+    
+    if VERBOSE:
+        print(f"  DEBUG: 解析深度范围: {depth_range_str}")
+    
+    try:
+        if '-' in depth_range_str:
+            # 格式: "int1-int2"
+            parts = depth_range_str.split('-')
+            if len(parts) != 2:
+                raise ValueError(f"Invalid depth range format: {depth_range_str}")
+                
+            min_depth = int(parts[0].strip())
+            max_depth = int(parts[1].strip())
+            
+            if min_depth < 0 or max_depth < 0:
+                raise ValueError(f"Depth values must be non-negative: {depth_range_str}")
+                
+            if min_depth > max_depth:
+                raise ValueError(f"Min depth must be <= max depth: {depth_range_str}")
+                
+            if VERBOSE:
+                print(f"  DEBUG: 解析范围 {min_depth}-{max_depth}")
+                
+            return (min_depth, max_depth)
+        else:
+            # 格式: "int"
+            depth = int(depth_range_str)
+            if depth < 0:
+                raise ValueError(f"Depth value must be non-negative: {depth_range_str}")
+                
+            if VERBOSE:
+                print(f"  DEBUG: 解析单一深度 {depth}")
+                
+            return (depth, depth)
+            
+    except ValueError as e:
+        if VERBOSE:
+            print(f"  DEBUG: 深度范围解析失败: {e}")
+        raise
+        
+
+
 # ==== 解压filter实现 ====
 def is_zip_multi_volume(zip_path):
     """
@@ -2323,7 +2384,27 @@ class ArchiveProcessor:
         if VERBOSE:
             print(f"  DEBUG: 查找归档文件: {search_path}")
 
+        # 解析深度范围参数
+        depth_range = None
+        if hasattr(self.args, 'depth_range') and self.args.depth_range:
+            try:
+                depth_range = parse_depth_range(self.args.depth_range)
+                if VERBOSE:
+                    print(f"  DEBUG: 使用深度范围: {depth_range[0]}-{depth_range[1]}")
+            except ValueError as e:
+                print(f"Error: Invalid depth range: {e}")
+                return []
+
         if safe_isfile(search_path, VERBOSE):
+            # 处理单个文件的情况
+            if depth_range is not None:
+                # 单个文件被认为在深度0
+                if not (depth_range[0] <= 0 <= depth_range[1]):
+                    if VERBOSE:
+                        print(f"  DEBUG: 跳过文件（深度0超出范围）: {search_path}")
+                    self.skipped_archives.append(search_path)
+                    return archives
+            
             if is_main_volume(search_path):
                 # 检查是否应该跳过
                 should_skip, skip_reason = should_skip_archive(search_path, self.args, self.sfx_detector)
@@ -2334,8 +2415,34 @@ class ArchiveProcessor:
                 else:
                     archives.append(search_path)
         else:
+            # 处理目录的情况
             try:
                 for root, dirs, files in safe_walk(search_path, VERBOSE):
+                    # 计算当前目录相对于搜索路径的深度
+                    try:
+                        rel_path = os.path.relpath(root, search_path)
+                        if rel_path == '.':
+                            current_depth = 0
+                        else:
+                            # 计算路径段数量作为深度
+                            path_parts = [p for p in rel_path.split(os.sep) if p and p != '.']
+                            current_depth = len(path_parts)
+                    except ValueError:
+                        # 如果无法计算相对路径，跳过
+                        if VERBOSE:
+                            print(f"  DEBUG: 无法计算相对路径，跳过: {root}")
+                        continue
+
+                    # 检查当前深度是否在指定范围内
+                    if depth_range is not None:
+                        if not (depth_range[0] <= current_depth <= depth_range[1]):
+                            if VERBOSE:
+                                print(f"  DEBUG: 跳过深度{current_depth}的目录（超出范围）: {root}")
+                            continue
+
+                    if VERBOSE:
+                        print(f"  DEBUG: 处理深度{current_depth}的目录: {root}")
+
                     for file in files:
                         filepath = os.path.join(root, file)
 
@@ -2360,13 +2467,13 @@ class ArchiveProcessor:
                                 if self.sfx_detector.is_sfx(filepath):
                                     archives.append(filepath)
                                     if VERBOSE:
-                                        print(f"  DEBUG: 找到SFX归档: {filepath}")
+                                        print(f"  DEBUG: 找到SFX归档（深度{current_depth}）: {filepath}")
                                 elif VERBOSE:
                                     print(f"  DEBUG: 非SFX可执行文件: {filepath}")
                             else:
                                 archives.append(filepath)
                                 if VERBOSE:
-                                    print(f"  DEBUG: 找到归档: {filepath}")
+                                    print(f"  DEBUG: 找到归档（深度{current_depth}）: {filepath}")
             except Exception as e:
                 if VERBOSE:
                     print(f"  DEBUG: 遍历目录失败: {e}")
@@ -2376,7 +2483,6 @@ class ArchiveProcessor:
             print(f"  DEBUG: 跳过 {len(self.skipped_archives)} 个文件")
 
         return archives
-
 
     def find_correct_password(self, archive_path, password_candidates):
         """Find correct password from candidates using is_password_correct."""
@@ -2838,6 +2944,16 @@ def main():
         default=30,
         help='锁定超时时间（最大重试次数）'
     )
+    
+
+    parser.add_argument(
+        '-dr', '--depth-range',
+        help='Depth range for recursive scanning. Format: "int1-int2" or "int". '
+             'Controls which directory depths to scan for archives. '
+             'Depth 0 means files directly in the root path, depth 1 means files in immediate subdirectories, etc. '
+             'Examples: "0-1" (scan root and first level), "1" (only first level), "0" (only root level). '
+             'If not specified, all depths are scanned.'
+    )
 
     args = parser.parse_args()
 
@@ -2881,6 +2997,20 @@ def main():
                 if threshold < 0:
                     print(f"Error: N-collect threshold must be >= 0")
                     return 1
+
+
+        # Validate depth range parameter
+        if args.depth_range:
+            try:
+                depth_range = parse_depth_range(args.depth_range)
+                if VERBOSE:
+                    print(f"  DEBUG: 验证深度范围: {depth_range[0]}-{depth_range[1]}")
+            except ValueError as e:
+                print(f"Error: {e}")
+                return 1
+
+
+
 
         # Check if 7z is available
         try:

@@ -1171,6 +1171,12 @@ def try_extract(archive_path, password, tmp_dir, zip_decode=None, enable_rar=Fal
         if VERBOSE:
             print(f"  DEBUG: 开始解压: {archive_path} -> {tmp_dir}")
         
+        # 创建临时目录（重要！RAR和7z都需要目标目录存在）
+        if not safe_makedirs(tmp_dir, debug=VERBOSE):
+            if VERBOSE:
+                print(f"  DEBUG: 创建临时目录失败: {tmp_dir}")
+            return False
+        
         # 判断是否应该使用RAR解压
         use_rar = should_use_rar_extractor(archive_path, enable_rar, sfx_detector)
         
@@ -1179,7 +1185,11 @@ def try_extract(archive_path, password, tmp_dir, zip_decode=None, enable_rar=Fal
             if VERBOSE:
                 print(f"  DEBUG: 使用RAR命令解压")
             
-            cmd = ['rar', 'x', archive_path, tmp_dir]
+            # 获取安全的路径（短路径）
+            safe_archive_path = safe_path_for_operation(archive_path, VERBOSE)
+            safe_tmp_dir = safe_path_for_operation(tmp_dir, VERBOSE)
+            
+            cmd = ['rar', 'x', safe_archive_path, safe_tmp_dir]
             
             # 添加密码参数（如果有）
             if password:
@@ -1190,6 +1200,8 @@ def try_extract(archive_path, password, tmp_dir, zip_decode=None, enable_rar=Fal
             
             if VERBOSE:
                 print(f"  DEBUG: RAR命令: {' '.join(cmd)}")
+                print(f"  DEBUG: 原始路径: {archive_path}")
+                print(f"  DEBUG: 安全路径: {safe_archive_path}")
             
             result = safe_subprocess_run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             
@@ -1198,7 +1210,11 @@ def try_extract(archive_path, password, tmp_dir, zip_decode=None, enable_rar=Fal
             if VERBOSE:
                 print(f"  DEBUG: 使用7z命令解压")
             
-            cmd = ['7z', 'x', archive_path, f'-o{tmp_dir}', f'-p{password}', '-y']
+            # 7z命令也使用安全路径
+            safe_archive_path = safe_path_for_operation(archive_path, VERBOSE)
+            safe_tmp_dir = safe_path_for_operation(tmp_dir, VERBOSE)
+            
+            cmd = ['7z', 'x', safe_archive_path, f'-o{safe_tmp_dir}', f'-p{password}', '-y']
             
             # 如果指定了zip_decode参数且当前文件是ZIP格式，则添加-scc参数
             if zip_decode is not None and is_zip_format(archive_path):
@@ -1209,6 +1225,8 @@ def try_extract(archive_path, password, tmp_dir, zip_decode=None, enable_rar=Fal
             
             if VERBOSE:
                 print(f"  DEBUG: 7z命令: {' '.join(cmd)}")
+                print(f"  DEBUG: 原始路径: {archive_path}")
+                print(f"  DEBUG: 安全路径: {safe_archive_path}")
             
             result = safe_subprocess_run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         

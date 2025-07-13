@@ -1155,13 +1155,29 @@ def is_password_correct(archive_path, password):
         return False
 
 
-def try_extract(archive_path, password, tmp_dir):
-    """Extract archive to temporary directory."""
+def try_extract(archive_path, password, tmp_dir, zip_decode=None):
+    """
+    Extract archive to temporary directory.
+    
+    Args:
+        archive_path: 归档文件路径
+        password: 解压密码
+        tmp_dir: 临时目录
+        zip_decode: ZIP文件代码页（例如932表示shift-jis）
+    """
     try:
         if VERBOSE:
             print(f"  DEBUG: 开始解压: {archive_path} -> {tmp_dir}")
         
         cmd = ['7z', 'x', archive_path, f'-o{tmp_dir}', f'-p{password}', '-y']
+        
+        # 如果指定了zip_decode参数且当前文件是ZIP格式，则添加-scc参数
+        if zip_decode is not None and is_zip_format(archive_path):
+            scc_param = f'-scc{zip_decode}'
+            cmd.append(scc_param)
+            if VERBOSE:
+                print(f"  DEBUG: 添加ZIP代码页参数: {scc_param}")
+        
         result = safe_subprocess_run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         
         success = result.returncode == 0
@@ -1355,6 +1371,52 @@ def clean_temp_dir(temp_dir):
                     print(f"  DEBUG: 删除临时目录失败: {temp_dir}, {e}")
     except Exception as e:
         print(f"Warning: Could not remove temporary directory {temp_dir}: {e}")
+
+
+def is_zip_format(archive_path):
+    """
+    判断文件是否为ZIP格式或ZIP分卷
+    
+    Args:
+        archive_path: 归档文件路径
+        
+    Returns:
+        bool: 如果是ZIP格式或ZIP分卷返回True，否则返回False
+    """
+    filename_lower = os.path.basename(archive_path).lower()
+    
+    if VERBOSE:
+        print(f"  DEBUG: 检查是否为ZIP格式: {archive_path}")
+    
+    # 检查文件扩展名
+    if filename_lower.endswith('.zip'):
+        if VERBOSE:
+            print(f"  DEBUG: 检测到ZIP文件")
+        return True
+    
+    # 检查ZIP分卷格式 (.z01, .z02, etc.)
+    if re.search(r'\.z\d+$', filename_lower):
+        if VERBOSE:
+            print(f"  DEBUG: 检测到ZIP分卷文件")
+        return True
+    
+    # 检查文件魔术字节 (PK header)
+    try:
+        with open(archive_path, 'rb') as f:
+            header = f.read(4)
+            if header.startswith(b'PK'):
+                if VERBOSE:
+                    print(f"  DEBUG: 通过魔术字节检测到ZIP格式")
+                return True
+    except Exception as e:
+        if VERBOSE:
+            print(f"  DEBUG: 读取文件头失败: {e}")
+    
+    if VERBOSE:
+        print(f"  DEBUG: 非ZIP格式")
+    return False
+
+
 
 # ==================== 新增解压策略 ====================
 
@@ -1937,8 +1999,9 @@ class ArchiveProcessor:
             print(f"  DEBUG: 创建临时目录: {tmp_dir}")
         
         try:
-            # Step 5: Extract using try_extract function
-            success = try_extract(archive_path, correct_password, tmp_dir)
+            # Step 5: Extract using try_extract function (with zip_decode parameter)
+            zip_decode = getattr(self.args, 'zip_decode', None)
+            success = try_extract(archive_path, correct_password, tmp_dir, zip_decode)
             
             # Step 6: Find all volumes for this archive
             all_volumes = find_archive_volumes(archive_path)
@@ -2134,6 +2197,12 @@ def main():
     parser.add_argument(
         '-pf', '--password-file',
         help='Path to password file (one password per line)'
+    )
+    
+    parser.add_argument(
+        '-zd', '--zip-decode',
+        type=int,
+        help='Code page for ZIP file extraction (e.g., 932 for Shift-JIS). Only applies to ZIP files and ZIP volumes.'
     )
     
     parser.add_argument(

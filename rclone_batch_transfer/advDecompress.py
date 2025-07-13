@@ -1434,7 +1434,8 @@ def find_file_content(tmp_dir, debug=False):
             'path': str,    # file_content所在路径
             'depth': int,   # 相对深度
             'items': list,  # file_content项目列表
-            'deepest_folder': str  # 最深层空文件夹名称（用于file-content-with-folder策略）
+            'parent_folder_path': str,  # file_content的父文件夹路径
+            'parent_folder_name': str   # file_content的父文件夹名称
         }
     """
     result = {
@@ -1442,7 +1443,8 @@ def find_file_content(tmp_dir, debug=False):
         'path': tmp_dir,
         'depth': 0,
         'items': [],
-        'deepest_folder': ''
+        'parent_folder_path': tmp_dir,
+        'parent_folder_name': ''
     }
     
     if debug:
@@ -1489,29 +1491,6 @@ def find_file_content(tmp_dir, debug=False):
                 print(f"  DEBUG: 获取深度{current_depth}项目失败: {e}")
             return []
     
-    def find_deepest_folder(path):
-        """查找最深层的文件夹名称"""
-        deepest = ""
-        max_depth = 0
-        
-        try:
-            for root, dirs, files in safe_walk(path, debug):
-                rel_path = os.path.relpath(root, path)
-                if rel_path == '.':
-                    depth = 0
-                else:
-                    depth = len([p for p in rel_path.split(os.sep) if p])
-                
-                if depth > max_depth:
-                    max_depth = depth
-                    deepest = os.path.basename(root)
-                    
-        except Exception as e:
-            if debug:
-                print(f"  DEBUG: 查找最深文件夹失败: {e}")
-        
-        return deepest
-    
     # 从深度1开始递归查找
     max_search_depth = 10  # 避免无限递归
     
@@ -1529,9 +1508,11 @@ def find_file_content(tmp_dir, debug=False):
             result['depth'] = depth
             result['items'] = items
             
-            # 计算file_content所在的父目录路径
+            # 计算file_content所在的父目录路径和名称
             if depth == 1:
                 result['path'] = tmp_dir
+                result['parent_folder_path'] = tmp_dir
+                result['parent_folder_name'] = os.path.basename(tmp_dir)
             else:
                 # 需要找到深度为depth-1的目录
                 for root, dirs, files in safe_walk(tmp_dir, debug):
@@ -1543,10 +1524,15 @@ def find_file_content(tmp_dir, debug=False):
                     
                     if current_depth == depth - 1:
                         result['path'] = root
+                        result['parent_folder_path'] = root
+                        result['parent_folder_name'] = os.path.basename(root)
                         break
             
             if debug:
-                print(f"  DEBUG: 找到file_content在深度{depth}, 路径: {result['path']}")
+                print(f"  DEBUG: 找到file_content在深度{depth}")
+                print(f"  DEBUG: file_content路径: {result['path']}")
+                print(f"  DEBUG: 父文件夹路径: {result['parent_folder_path']}")
+                print(f"  DEBUG: 父文件夹名称: {result['parent_folder_name']}")
             break
         
         if not items:
@@ -1561,6 +1547,7 @@ def find_file_content(tmp_dir, debug=False):
         
         deepest_items = []
         max_depth = 0
+        deepest_parent_path = tmp_dir
         
         for root, dirs, files in safe_walk(tmp_dir, debug):
             rel_path = os.path.relpath(root, tmp_dir)
@@ -1572,6 +1559,7 @@ def find_file_content(tmp_dir, debug=False):
             if depth > max_depth:
                 max_depth = depth
                 deepest_items = []
+                deepest_parent_path = root
                 
                 # 添加当前层的文件
                 for file_name in files:
@@ -1582,7 +1570,7 @@ def find_file_content(tmp_dir, debug=False):
                         'is_dir': False
                     })
                 
-                # 添加当前层的目录（如果没有更深层的话）
+                # 添加当前层的空目录
                 for dir_name in dirs:
                     dir_path = os.path.join(root, dir_name)
                     # 检查这个目录是否有子内容
@@ -1615,16 +1603,14 @@ def find_file_content(tmp_dir, debug=False):
             result['found'] = True
             result['depth'] = max_depth + 1
             result['items'] = deepest_items
-            result['path'] = os.path.dirname(deepest_items[0]['path']) if deepest_items else tmp_dir
+            result['path'] = deepest_parent_path
+            result['parent_folder_path'] = deepest_parent_path
+            result['parent_folder_name'] = os.path.basename(deepest_parent_path)
             
             if debug:
                 print(f"  DEBUG: 使用最深层项目作为file_content，深度{result['depth']}")
-    
-    # 查找最深层文件夹名称
-    result['deepest_folder'] = find_deepest_folder(tmp_dir)
-    
-    if debug:
-        print(f"  DEBUG: 最深文件夹名称: {result['deepest_folder']}")
+                print(f"  DEBUG: 父文件夹路径: {result['parent_folder_path']}")
+                print(f"  DEBUG: 父文件夹名称: {result['parent_folder_name']}")
     
     return result
 
@@ -1712,7 +1698,7 @@ def apply_file_content_with_folder_policy(tmp_dir, output_dir, archive_name, uni
     Args:
         tmp_dir: 临时目录
         output_dir: 输出目录
-        archive_name: 归档名称（这里不使用，用最深文件夹名称代替）
+        archive_name: 归档名称（压缩文件名称或分卷压缩包主名称）
         unique_suffix: 唯一后缀
     """
     if VERBOSE:
@@ -1747,18 +1733,19 @@ def apply_file_content_with_folder_policy(tmp_dir, output_dir, archive_name, uni
             
             safe_move(src_path, dst_path, VERBOSE)
         
-        # 4. 获取最深文件夹名称
-        deepest_folder_name = file_content['deepest_folder']
-        if not deepest_folder_name:
-            # 如果没有找到，使用归档名称作为后备
+        # 4. 确定deepest_folder_name
+        # 如果父文件夹就是tmp文件夹，则认为父文件夹名称是archive_name
+        # 如果父文件夹不是tmp文件夹，则使用file_content的父文件夹名称
+        if file_content['parent_folder_path'] == tmp_dir:
             deepest_folder_name = archive_name
             if VERBOSE:
-                print(f"  DEBUG: 未找到最深文件夹，使用归档名称: {deepest_folder_name}")
+                print(f"  DEBUG: file_content的父文件夹是tmp目录，使用归档名称: {deepest_folder_name}")
         else:
+            deepest_folder_name = file_content['parent_folder_name']
             if VERBOSE:
-                print(f"  DEBUG: 使用最深文件夹名称: {deepest_folder_name}")
+                print(f"  DEBUG: 使用file_content的父文件夹名称: {deepest_folder_name}")
         
-        # 5. 创建最终输出目录（使用最深文件夹名称）
+        # 5. 创建最终输出目录（使用deepest_folder_name）
         final_archive_dir = os.path.join(output_dir, deepest_folder_name)
         final_archive_dir = ensure_unique_name(final_archive_dir, unique_suffix)
         safe_makedirs(final_archive_dir, debug=VERBOSE)

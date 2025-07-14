@@ -1683,19 +1683,23 @@ def is_secondary_volume(filepath):
 
 def check_encryption(filepath):
     """
-    Check if an archive is encrypted by running 7z command with a dummy password.
-    Returns True if encrypted, False if not, None if not an archive.
+    Check if an archive is encrypted and determine the encryption type.
+    
+    Returns:
+        str: One of the following encryption status:
+            - 'encrypted_header': Header+content encrypted, or header corrupted
+            - 'encrypted_content': Header readable, content encrypted (Encrypted = +)
+            - 'plain': Not encrypted
+            - None: Not an archive
     """
     try:
         if VERBOSE:
-            print(f"  DEBUG: Testing archive: {filepath}")
+            print(f"  DEBUG: Testing archive encryption: {filepath}")
 
-        # Direct approach: Try listing with a dummy password
-        # This will immediately fail for encrypted archives with a clear error message
+        # Step 1: Try with dummy password to test header encryption
         if VERBOSE:
-            print(f"  DEBUG: Checking with dummy password")
+            print(f"  DEBUG: Testing header encryption with dummy password")
 
-        # Use safe subprocess handling
         stdout_output, stderr_output, returncode = safe_popen_communicate(
             ['7z', 'l', '-slt', '-pDUMMYPASSWORD', filepath]
         )
@@ -1703,69 +1707,85 @@ def check_encryption(filepath):
         output_combined = stdout_output + stderr_output
 
         if VERBOSE:
-            print(f"  DEBUG: Return code: {returncode}")
+            print(f"  DEBUG: Dummy password test - Return code: {returncode}")
             print(f"  DEBUG: Output excerpt: {output_combined[:200]}")
 
-        # Check for encryption indicators
+        # Check for header encryption or corruption (returncode != 0)
+        if returncode != 0:
+            # Check if it's not an archive at all
+            if "Cannot open the file as archive" in output_combined:
+                if VERBOSE:
+                    print(f"  DEBUG: Not an archive detected")
+                return None
+            
+            # Assume header encryption or corruption
+            if VERBOSE:
+                print(f"  DEBUG: Header encryption/corruption detected (returncode != 0)")
+            return 'encrypted_header'
+
+        # Additional check for "Cannot open encrypted archive" message even with returncode 0
         if "Cannot open encrypted archive. Wrong password?" in output_combined:
             if VERBOSE:
-                print(f"  DEBUG: Wrong password error detected - file is encrypted")
-            return True
+                print(f"  DEBUG: Header encryption detected (wrong password message)")
+            return 'encrypted_header'
 
-        # Check if it's not an archive
-        if "Cannot open the file as archive" in output_combined:
-            if VERBOSE:
-                print(f"  DEBUG: Not an archive detected")
-            return None
-
-        # If the dummy password didn't trigger an error, try without password
-        # to check other encryption indicators
+        # Step 2: Header is readable, check for content encryption
         if VERBOSE:
-            print(f"  DEBUG: Checking without password")
+            print(f"  DEBUG: Header readable, checking content encryption")
 
-        stdout_output, stderr_output, returncode = safe_popen_communicate(
-            ['7z', 'l', '-slt', filepath]
-        )
-
-        output_combined = stdout_output + stderr_output
-
-        if VERBOSE:
-            print(f"  DEBUG: Return code: {returncode}")
-            print(f"  DEBUG: Output excerpt: {output_combined[:200]}")
-
-        # Check for other encryption indicators
+        # Check if content is encrypted by looking for "Encrypted = +" in the output
         if "Encrypted = +" in output_combined:
             if VERBOSE:
-                print(f"  DEBUG: Found 'Encrypted = +' in output")
-            return True
+                print(f"  DEBUG: Content encryption detected")
+            return 'encrypted_content'
 
-        if "Enter password" in output_combined:
-            if VERBOSE:
-                print(f"  DEBUG: Found password prompt in output")
-            return True
-
+        # Step 3: No encryption detected
         if VERBOSE:
             print(f"  DEBUG: No encryption detected")
-        return False
+        return 'plain'
 
     except Exception as e:
+        if VERBOSE:
+            print(f"  DEBUG: Error checking encryption: {str(e)}")
         print(f"  Error checking encryption: {str(e)}")
         return None
 
-
-def is_password_correct(archive_path, password):
-    """Test if a password is correct for an archive."""
+def is_password_correct(archive_path, password, encryption_status='encrypted_content'):
+    """
+    Test if a password is correct for an archive.
+    
+    Args:
+        archive_path: Path to the archive
+        password: Password to test
+        encryption_status: Type of encryption ('encrypted_header', 'encrypted_content', or 'plain')
+    
+    Returns:
+        bool: True if password is correct, False otherwise
+    """
     try:
         if VERBOSE:
-            print(f"  DEBUG: 测试密码: {archive_path} with {'<empty>' if not password else '<provided>'}")
+            print(f"  DEBUG: Testing password for {archive_path} with encryption type: {encryption_status}")
+            print(f"  DEBUG: Password: {'<empty>' if not password else '<provided>'}")
 
-        cmd = ['7z', 't', str(archive_path), f'-p{password}', '-y']
+        if encryption_status == 'encrypted_header':
+            # For header encryption, use list command with lower IO overhead
+            cmd = ['7z', 'l', '-slt', str(archive_path), f'-p{password}', '-y']
+            if VERBOSE:
+                print(f"  DEBUG: Using list command for header encryption test")
+        else:
+            # For content-only encryption or plain archives, use test command (current logic)
+            cmd = ['7z', 't', str(archive_path), f'-p{password}', '-y']
+            if VERBOSE:
+                print(f"  DEBUG: Using test command for content encryption test")
+
         result = safe_subprocess_run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         success = result.returncode == 0
 
         if VERBOSE:
-            print(f"  DEBUG: 密码测试结果: {'成功' if success else '失败'}")
+            print(f"  DEBUG: Password test result: {'Success' if success else 'Failed'}")
+            if not success and result.stderr:
+                print(f"  DEBUG: Error details: {result.stderr[:200]}")
 
         return success
     except Exception as e:
@@ -2770,21 +2790,32 @@ class ArchiveProcessor:
 
         return archives
 
-    def find_correct_password(self, archive_path, password_candidates):
-        """Find correct password from candidates using is_password_correct."""
+    def find_correct_password(self, archive_path, password_candidates, encryption_status='encrypted_content'):
+        """
+        Find correct password from candidates using is_password_correct.
+        
+        Args:
+            archive_path: Path to the archive
+            password_candidates: List of password candidates to test
+            encryption_status: Type of encryption ('encrypted_header', 'encrypted_content', or 'plain')
+        
+        Returns:
+            str or None: Correct password if found, None if no correct password found
+        """
         if not password_candidates:
             return ""
 
         if VERBOSE:
-            print(f"  DEBUG: 测试 {len(password_candidates)} 个密码候选")
+            print(f"  DEBUG: Testing {len(password_candidates)} password candidates")
+            print(f"  DEBUG: Encryption type: {encryption_status}")
 
         for i, password in enumerate(password_candidates):
             if VERBOSE:
-                print(f"  DEBUG: 测试密码 {i + 1}/{len(password_candidates)}")
+                print(f"  DEBUG: Testing password {i + 1}/{len(password_candidates)}")
 
-            if is_password_correct(archive_path, password):
+            if is_password_correct(archive_path, password, encryption_status):
                 if VERBOSE:
-                    print(f"  DEBUG: 找到正确密码（第{i + 1}个）")
+                    print(f"  DEBUG: Found correct password (candidate {i + 1})")
                 return password
 
         return None
@@ -2851,31 +2882,30 @@ class ArchiveProcessor:
         if VERBOSE:
             print(f"  DEBUG: 需要密码测试: {need_password_testing}")
 
-        # Step 2: Check encryption only if we need to test passwords
-        is_encrypted = False
+        # Step 2: Check encryption status (modified for new logic)
+        encryption_status = 'plain'
         if need_password_testing:
             encryption_status = check_encryption(archive_path)
-            if encryption_status is True:
-                is_encrypted = True
-                if VERBOSE:
-                    print(f"  DEBUG: 归档已加密")
-            elif encryption_status is None:
+            if encryption_status is None:
                 print(f"  Warning: Cannot determine if {archive_path} is an archive")
                 self.skipped_archives.append(archive_path)
                 return False
+            elif encryption_status in ['encrypted_header', 'encrypted_content']:
+                if VERBOSE:
+                    print(f"  DEBUG: Archive is encrypted (type: {encryption_status})")
             elif VERBOSE:
-                print(f"  DEBUG: 归档未加密")
+                print(f"  DEBUG: Archive is not encrypted")
 
-        # Step 3: Prepare password candidates according to spec
+        # Step 3: Prepare password candidates and find correct password
         password_candidates = []
         correct_password = ""
 
-        if need_password_testing and is_encrypted:
+        if need_password_testing and encryption_status in ['encrypted_header', 'encrypted_content']:
             # Build password candidate list: -p first, then -pf
             if self.args.password:
                 password_candidates.append(self.args.password)
                 if VERBOSE:
-                    print(f"  DEBUG: 添加命令行密码")
+                    print(f"  DEBUG: Added command line password")
 
             if self.args.password_file:
                 try:
@@ -2885,12 +2915,12 @@ class ArchiveProcessor:
                             if password and password not in password_candidates:
                                 password_candidates.append(password)
                     if VERBOSE:
-                        print(f"  DEBUG: 从密码文件读取 {len(password_candidates)} 个密码")
+                        print(f"  DEBUG: Read {len(password_candidates)} passwords from password file")
                 except Exception as e:
                     print(f"  Warning: Cannot read password file: {e}")
 
-            # Test passwords using is_password_correct
-            correct_password = self.find_correct_password(archive_path, password_candidates)
+            # Test passwords using is_password_correct with encryption status
+            correct_password = self.find_correct_password(archive_path, password_candidates, encryption_status)
             if correct_password is None:
                 print(f"  Error: No correct password found for {archive_path}")
                 # Apply fail policy before returning
@@ -2903,7 +2933,7 @@ class ArchiveProcessor:
             # Not testing passwords - use provided password directly or empty
             correct_password = self.args.password if self.args.password else ""
             if VERBOSE:
-                print(f"  DEBUG: 使用提供的密码（或空密码）")
+                print(f"  DEBUG: Using provided password (or empty password)")
 
         # Step 4: Create temporary directory with thread-safe unique name
         timestamp = str(int(time.time() * 1000))

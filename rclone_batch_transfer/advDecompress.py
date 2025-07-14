@@ -861,6 +861,9 @@ class ArchiveProcessor:
         elif self.args.decompress_policy == 'file-content-with-folder':
             apply_file_content_with_folder_policy(tmp_dir, final_output_dir, archive_base_name, unique_suffix)
 
+        elif self.args.decompress_policy == 'file-content-with-folder-separate':
+            apply_file_content_with_folder_separate_policy(tmp_dir, final_output_dir, archive_base_name, unique_suffix)
+
         else:
             # N-collect policy
             threshold = int(self.args.decompress_policy.split('-')[0])
@@ -3493,6 +3496,90 @@ def apply_separate_policy_internal(tmp_dir, output_dir, archive_name, unique_suf
         if safe_exists(separate_dir, VERBOSE):
             safe_rmtree(separate_dir, VERBOSE)
 
+def apply_file_content_with_folder_separate_policy(tmp_dir, output_dir, archive_name, unique_suffix):
+    """
+    应用file-content-with-folder-separate策略
+
+    Args:
+        tmp_dir: 临时目录
+        output_dir: 输出目录
+        archive_name: 归档名称（压缩文件名称或分卷压缩包主名称）
+        unique_suffix: 唯一后缀
+    """
+    if VERBOSE:
+        print(f"  DEBUG: 应用file-content-with-folder-separate策略")
+
+    # 1. 查找file_content
+    file_content = find_file_content(tmp_dir, VERBOSE)
+
+    if not file_content['found']:
+        if VERBOSE:
+            print(f"  DEBUG: 未找到file_content，回退到separate策略")
+        # 回退到separate策略
+        apply_separate_policy_internal(tmp_dir, output_dir, archive_name, unique_suffix)
+        return
+
+    # 2. 创建content临时目录
+    content_dir = f"content_{unique_suffix}"
+
+    try:
+        safe_makedirs(content_dir, debug=VERBOSE)
+
+        if VERBOSE:
+            print(f"  DEBUG: 创建content目录: {content_dir}")
+
+        # 3. 移动file_content到content目录
+        for item in file_content['items']:
+            src_path = item['path']
+            dst_path = os.path.join(content_dir, item['name'])
+
+            if VERBOSE:
+                print(f"  DEBUG: 移动file_content项目: {src_path} -> {dst_path}")
+
+            safe_move(src_path, dst_path, VERBOSE)
+
+        # 4. 确定deepest_folder_name
+        # 如果父文件夹就是tmp文件夹，则认为父文件夹名称是archive_name
+        # 如果父文件夹不是tmp文件夹，则使用file_content的父文件夹名称
+        if file_content['parent_folder_path'] == tmp_dir:
+            deepest_folder_name = archive_name
+            if VERBOSE:
+                print(f"  DEBUG: file_content的父文件夹是tmp目录，使用归档名称: {deepest_folder_name}")
+        else:
+            deepest_folder_name = file_content['parent_folder_name']
+            if VERBOSE:
+                print(f"  DEBUG: 使用file_content的父文件夹名称: {deepest_folder_name}")
+
+        # 5. 创建最终输出目录（使用archive_name/{deepest_folder_name}结构）
+        archive_container_dir = os.path.join(output_dir, archive_name)
+        archive_container_dir = ensure_unique_name(archive_container_dir, unique_suffix)
+        safe_makedirs(archive_container_dir, debug=VERBOSE)
+        
+        final_archive_dir = os.path.join(archive_container_dir, deepest_folder_name)
+        final_archive_dir = ensure_unique_name(final_archive_dir, unique_suffix)
+        safe_makedirs(final_archive_dir, debug=VERBOSE)
+
+        if VERBOSE:
+            print(f"  DEBUG: 创建archive容器目录: {archive_container_dir}")
+            print(f"  DEBUG: 创建最终目录: {final_archive_dir}")
+
+        # 6. 移动content到最终目录
+        for item in os.listdir(content_dir):
+            src_path = os.path.join(content_dir, item)
+            dst_path = os.path.join(final_archive_dir, item)
+
+            if VERBOSE:
+                print(f"  DEBUG: 移动到最终目录: {src_path} -> {dst_path}")
+
+            safe_move(src_path, dst_path, VERBOSE)
+
+        print(f"  Extracted using file-content-with-folder-separate policy to: {final_archive_dir}")
+
+    finally:
+        # 7. 清理content目录
+        if safe_exists(content_dir, VERBOSE):
+            safe_rmtree(content_dir, VERBOSE)
+            
 
 # ==================== 结束新增解压策略 ====================
 
@@ -3723,7 +3810,7 @@ def main():
     parser.add_argument(
         '-dp', '--decompress-policy',
         default='2-collect',
-        help='Decompress policy: separate/direct/only-file-content/file-content-with-folder/N-collect (default: 2-collect)'
+        help='Decompress policy: separate/direct/only-file-content/file-content-with-folder/file-content-with-folder-separate/N-collect (default: 2-collect)'
     )
 
     parser.add_argument(
@@ -3928,7 +4015,7 @@ def main():
                     return 1
 
         # Validate decompress policy
-        if args.decompress_policy not in ['separate', 'direct', 'only-file-content', 'file-content-with-folder']:
+        if args.decompress_policy not in ['separate', 'direct', 'only-file-content', 'file-content-with-folder', 'file-content-with-folder-separate']:
             if not re.match(r'^\d+-collect$', args.decompress_policy):
                 print(f"Error: Invalid decompress policy: {args.decompress_policy}")
                 return 1
@@ -3948,9 +4035,6 @@ def main():
             except ValueError as e:
                 print(f"Error: {e}")
                 return 1
-
-
-
 
         # Check if 7z is available
         try:
@@ -3991,7 +4075,24 @@ def main():
                     archive = futures[future]
                     try:
                         future.result()
+                    except KeyboardInterrupt:
+                        # 用户中断，立即重新抛出异常以终止程序
+                        print(f"\nKeyboard interrupt detected during processing {archive}")
+                        # 取消所有未完成的任务
+                        for pending_future in futures:
+                            if not pending_future.done():
+                                pending_future.cancel()
+                        raise
+                    except SystemExit:
+                        # 系统退出信号，立即重新抛出
+                        print(f"\nSystem exit signal detected during processing {archive}")
+                        # 取消所有未完成的任务
+                        for pending_future in futures:
+                            if not pending_future.done():
+                                pending_future.cancel()
+                        raise
                     except Exception as e:
+                        # 普通异常，记录错误并继续处理下一个文件
                         print(f"Error processing {archive}: {e}")
                         processor.failed_archives.append(archive)
 

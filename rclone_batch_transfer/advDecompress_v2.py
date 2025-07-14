@@ -3140,13 +3140,11 @@ class ArchiveProcessor:
             'reason': ''
         }
         
-        # 检查是否是ZIP文件且需要处理传统ZIP策略
+        # 检查是否是ZIP文件
         if not is_zip_format(archive_path):
             return result
             
-        if not hasattr(self.args, 'traditional_zip_policy') or not self.args.traditional_zip_policy:
-            return result
-            
+        # 现在总是有 traditional_zip_policy 值（默认为decode-auto）
         # 检查是否是传统ZIP
         if not is_traditional_zip(archive_path):
             if VERBOSE:
@@ -3210,6 +3208,18 @@ class ArchiveProcessor:
         # 处理decode-auto策略
         elif policy == 'decode-auto':
             try:
+                # 首先检查依赖库是否可用
+                try:
+                    import zipfile
+                    import chardet
+                except ImportError as e:
+                    if VERBOSE:
+                        print(f"  DEBUG: decode-auto所需库不可用，跳过传统ZIP策略: {e}")
+                    # 对于默认的decode-auto策略，如果依赖库不可用，就静默跳过而不是报错
+                    result['should_continue'] = False
+                    result['reason'] = f'decode-auto依赖库不可用，跳过处理'
+                    return result
+                
                 # 检测编码
                 encoding_result = guess_zip_encoding(archive_path)
                 
@@ -3261,9 +3271,11 @@ class ArchiveProcessor:
                 return result
                 
             except Exception as e:
-                print(f"  Error in decode-auto processing: {e}")
+                if VERBOSE:
+                    print(f"  DEBUG: decode-auto处理异常: {e}")
+                # 编码检测异常时应该跳过，避免产生乱码
                 result['should_continue'] = False
-                result['reason'] = f'自动编码检测失败: {e}'
+                result['reason'] = f'自动编码检测异常，跳过处理: {e}'
                 return result
         
         # 处理asis策略（实际上在should_skip_archive中已经处理了，这里是保险）
@@ -3280,7 +3292,6 @@ class ArchiveProcessor:
             result['should_continue'] = False  
             result['reason'] = f'未知策略: {policy}'
             return result
-
 
 def main():
     """Main function."""
@@ -3315,15 +3326,17 @@ def main():
         help='Path to password file (one password per line)'
     )
 
-    # 修正：移除choices限制，支持动态decode-${int}格式
+    # 修正：移除choices限制，支持动态decode-${int}格式，设置默认值为decode-auto
     parser.add_argument(
         '-tzp', '--traditional-zip-policy',
+        default='decode-auto',  # 新增：设置默认值为decode-auto
         help='Policy for traditional encoding ZIP files: '
              'move (move to specified directory), '
              'asis (skip processing), '
              'decode-auto (auto-detect encoding), '
              'decode-${int} (manual encoding, e.g., decode-932 for Shift-JIS, decode-936 for GBK). '
-             'Only applies to ZIP files that use traditional encoding (non-UTF-8).'
+             'Only applies to ZIP files that use traditional encoding (non-UTF-8). '
+             'Default: decode-auto'  # 新增：在帮助信息中说明默认值
     )
 
     parser.add_argument(

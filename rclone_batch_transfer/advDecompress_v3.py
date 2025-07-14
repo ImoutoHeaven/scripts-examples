@@ -1787,6 +1787,7 @@ def guess_zip_encoding(zip_path):
 def get_7z_encoding_param(encoding):
     """
     将检测到的编码转换为7z命令的-mcp参数值
+    基于chardet的稳定输出进行精确映射
     
     Args:
         encoding: chardet检测到的编码名称
@@ -1797,71 +1798,98 @@ def get_7z_encoding_param(encoding):
     if not encoding:
         return None
     
-    # 编码映射表：chardet编码名 -> 7z代码页
+    # chardet稳定输出的完整映射表
     encoding_map = {
-        'shift_jis': '932',
-        'sjis': '932', 
-        'cp932': '932',
-        'gb2312': '936',
-        'gbk': '936',
-        'gb18030': '936',
-        'big5': '950',
-        'cp950': '950',
-        'euc-kr': '949',
-        'cp949': '949',
-        'iso-8859-1': '1252',
-        'cp1252': '1252',
-        'windows-1252': '1252',
-        'iso-8859-2': '1250',
-        'cp1250': '1250',
-        'windows-1250': '1250',
-        'iso-8859-5': '1251',
-        'cp1251': '1251',
-        'windows-1251': '1251',
-        'koi8-r': '20866',
+        # ASCII和基础编码
+        'ascii': '1252',  # ASCII可以安全地使用Windows-1252
+        
+        # Unicode编码系列
         'utf-8': 'UTF-8',
-        'utf8': 'UTF-8'
+        'utf-16': 'UTF-16',
+        'utf-16-be': 'UTF-16BE',
+        'utf-16-le': 'UTF-16LE', 
+        'utf-32': 'UTF-32',
+        'utf-32-be': 'UTF-32BE',
+        'utf-32-le': 'UTF-32LE',
+        
+        # 中文编码 (chardet返回的确切名称)
+        'big5': '950',
+        'gb2312': '936',
+        'gb18030': '936',
+        'euc-tw': '950',
+        'hz-gb-2312': '936',
+        'iso-2022-cn': '936',
+        
+        # 日文编码
+        'shift_jis': '932',
+        'euc-jp': '20932',
+        'iso-2022-jp': '50222',
+        
+        # 韩文编码
+        'euc-kr': '949',
+        'iso-2022-kr': '50225',
+        
+        # 俄语/西里尔编码
+        'koi8-r': '20866',
+        'maccyrillic': '10007',
+        'ibm855': '855',
+        'ibm866': '866',
+        'iso-8859-5': '28595',
+        'windows-1251': '1251',
+        
+        # 西欧语言编码
+        'iso-8859-1': '28591',
+        'windows-1252': '1252',
+        
+        # 中欧语言编码（匈牙利语等）
+        'iso-8859-2': '28592', 
+        'windows-1250': '1250',
+        
+        # 希腊语编码
+        'iso-8859-7': '28597',
+        'windows-1253': '1253',
+        
+        # 希伯来语编码
+        'iso-8859-8': '28598',
+        'windows-1255': '1255',
+        
+        # 泰语编码
+        'tis-620': '874',
     }
     
-    # 标准化编码名称（转小写，移除连字符和下划线）
-    normalized_encoding = encoding.lower().replace('-', '').replace('_', '')
+    # 标准化输入编码名称（只处理大小写）
+    encoding_lower = encoding.lower().strip()
     
-    # 先尝试直接匹配
-    if encoding.lower() in encoding_map:
-        code_page = encoding_map[encoding.lower()]
+    # 精确匹配
+    if encoding_lower in encoding_map:
+        code_page = encoding_map[encoding_lower]
         if VERBOSE:
             print(f"  DEBUG: 编码映射 {encoding} -> {code_page}")
         return code_page
     
-    # 尝试标准化后匹配
-    for enc_name, code_page in encoding_map.items():
-        if normalized_encoding in enc_name.replace('-', '').replace('_', ''):
+    # 处理chardet可能的命名变体（只处理连字符和下划线的差异）
+    # 因为chardet在不同版本间可能有细微的命名差异
+    normalized_variants = [
+        encoding_lower.replace('-', '_'),  # ISO-8859-1 -> ISO_8859_1
+        encoding_lower.replace('_', '-'),  # SHIFT_JIS -> SHIFT-JIS
+        encoding_lower.replace('-', ''),   # ISO-8859-1 -> ISO88591
+        encoding_lower.replace('_', ''),   # SHIFT_JIS -> SHIFTJIS
+    ]
+    
+    for variant in normalized_variants:
+        if variant in encoding_map:
+            code_page = encoding_map[variant]
             if VERBOSE:
-                print(f"  DEBUG: 编码映射（标准化后） {encoding} -> {code_page}")
+                print(f"  DEBUG: 编码变体映射 {encoding} -> {code_page}")
             return code_page
     
-    # 如果没有找到映射，尝试一些常见的别名
-    common_aliases = {
-        'shift': '932',
-        'japanese': '932',
-        'chinese': '936',
-        'simplified': '936',
-        'traditional': '950',
-        'korean': '949',
-        'russian': '1251',
-        'cyrillic': '1251'
-    }
-    
-    for alias, code_page in common_aliases.items():
-        if alias in normalized_encoding:
-            if VERBOSE:
-                print(f"  DEBUG: 编码别名映射 {encoding} -> {code_page}")
-            return code_page
-    
+    # 如果完全没有匹配，记录并返回None
     if VERBOSE:
         print(f"  DEBUG: 未知编码，无法映射到7z参数: {encoding}")
+        print(f"  DEBUG: 建议检查chardet版本和文档，确认 '{encoding}' 是否为有效输出")
     
     return None
+    
 
 # === 传统zip编码检测实现 ===
 def is_traditional_zip(archive_path):

@@ -1933,84 +1933,87 @@ def get_archive_base_name(filepath):
 
 
 def find_archive_volumes(main_archive_path):
-    """Find all volumes related to a main archive."""
+    """Find all volumes related to a main archive using pattern matching instead of loops."""
     volumes = [main_archive_path]
-    base_dir = os.path.dirname(main_archive_path)
-    main_filename = os.path.basename(main_archive_path)
-    main_filename_lower = main_filename.lower()
-
+    folder_path = os.path.dirname(main_archive_path)
+    filename = os.path.basename(main_archive_path)
+    filename_lower = filename.lower()
+    
     if VERBOSE:
         print(f"  DEBUG: Finding volumes for: {main_archive_path}")
-
-    # For different archive types, find related volumes
-    if main_filename_lower.endswith('.rar') and not re.search(r'\.part\d+\.rar$', main_filename_lower):
-        # Single RAR, look for .r00, .r01, etc.
-        base_name = os.path.splitext(main_filename)[0]
-        for i in range(100):  # Check up to .r99
-            volume_name = f"{base_name}.r{i:02d}"
-            volume_path = os.path.join(base_dir, volume_name)
-            if safe_exists(volume_path, VERBOSE):
-                volumes.append(volume_path)
+    
+    try:
+        # Get all files in the directory once (避免多次文件系统调用)
+        all_files = os.listdir(folder_path)
+        
+        # 确定分卷类型和基础名称
+        volume_pattern = None
+        base_name = None
+        
+        # Case 1: RAR5 分卷 (.part*.rar)
+        if filename_lower.endswith('.rar'):
+            part_match = re.search(r'^(.+)\.part\d+\.rar$', filename_lower)
+            if part_match:
+                base_name = part_match.group(1)
+                volume_pattern = rf'^{re.escape(base_name)}\.part\d+\.rar$'
                 if VERBOSE:
-                    print(f"  DEBUG: Found volume: {volume_path}")
-
-    elif re.search(r'\.part0*1\.rar$', main_filename_lower):
-        # Multi-part RAR, find all parts
-        base_name = re.sub(r'\.part0*1\.rar$', '', main_filename, flags=re.IGNORECASE)
-        try:
-            for filename in os.listdir(base_dir):
-                if re.search(rf'^{re.escape(base_name)}\.part\d+\.rar$', filename, re.IGNORECASE):
-                    volume_path = os.path.join(base_dir, filename)
-                    if volume_path != main_archive_path:
-                        volumes.append(volume_path)
-                        if VERBOSE:
-                            print(f"  DEBUG: Found volume: {volume_path}")
-        except Exception as e:
-            if VERBOSE:
-                print(f"  DEBUG: 查找RAR分卷失败: {e}")
-
-    elif main_filename_lower.endswith('.7z.001'):
-        # Multi-part 7z, find all parts
-        base_name = main_filename[:-4]  # Remove .001 to get "filename.7z"
-        for i in range(2, 1000):  # Check .002, .003, etc.
-            volume_name = f"{base_name}.{i:03d}"  # Fixed: Add the missing dot
-            volume_path = os.path.join(base_dir, volume_name)
-            if safe_exists(volume_path, VERBOSE):
-                volumes.append(volume_path)
-                if VERBOSE:
-                    print(f"  DEBUG: Found volume: {volume_path}")
+                    print(f"  DEBUG: Detected RAR5 multi-part, base: {base_name}")
             else:
-                break
-
-    elif main_filename_lower.endswith('.zip'):
-        # Split ZIP, look for .z01, .z02, etc.
-        base_name = os.path.splitext(main_filename)[0]
-        for i in range(1, 100):
-            volume_name = f"{base_name}.z{i:02d}"
-            volume_path = os.path.join(base_dir, volume_name)
-            if safe_exists(volume_path, VERBOSE):
-                volumes.append(volume_path)
+                # Case 4: RAR4 老式分卷 (.rar with .r00, .r01, etc.)
+                base_name = filename_lower[:-4]  # 移除 .rar
+                volume_pattern = rf'^{re.escape(base_name)}\.r\d+$'
                 if VERBOSE:
-                    print(f"  DEBUG: Found volume: {volume_path}")
-
-    elif re.search(r'\.part0*1\.exe$', main_filename_lower):
-        # Multi-part SFX, find all parts
-        base_name = re.sub(r'\.part0*1\.exe$', '', main_filename, flags=re.IGNORECASE)
-        try:
-            for filename in os.listdir(base_dir):
-                if re.search(rf'^{re.escape(base_name)}\.part\d+\.exe$', filename, re.IGNORECASE):
-                    volume_path = os.path.join(base_dir, filename)
-                    if volume_path != main_archive_path:
-                        volumes.append(volume_path)
-                        if VERBOSE:
-                            print(f"  DEBUG: Found volume: {volume_path}")
-        except Exception as e:
+                    print(f"  DEBUG: Detected RAR4 old format, base: {base_name}")
+        
+        # Case 2: 7z 分卷 (.7z.001/.7z.0001/.7z.00001)
+        elif re.search(r'\.7z\.\d+$', filename_lower):
+            seven_match = re.search(r'^(.+\.7z)\.\d+$', filename_lower)
+            if seven_match:
+                base_name = seven_match.group(1)
+                volume_pattern = rf'^{re.escape(base_name)}\.\d+$'
+                if VERBOSE:
+                    print(f"  DEBUG: Detected 7z multi-part, base: {base_name}")
+        
+        # Case 3: ZIP 分卷 (.zip with .z01, .z02, etc.)
+        elif filename_lower.endswith('.zip'):
+            base_name = filename_lower[:-4]  # 移除 .zip
+            volume_pattern = rf'^{re.escape(base_name)}\.z\d+$'
             if VERBOSE:
-                print(f"  DEBUG: 查找SFX分卷失败: {e}")
-
+                print(f"  DEBUG: Detected ZIP split, base: {base_name}")
+        
+        # Case 5 & 6: SFX 分卷 (.exe)
+        elif filename_lower.endswith('.exe'):
+            part_match = re.search(r'^(.+)\.part\d+\.exe$', filename_lower)
+            if part_match:
+                # Case 5: SFX RAR5 分卷 (.part*.exe) -> 查找 .part*.rar
+                base_name = part_match.group(1)
+                volume_pattern = rf'^{re.escape(base_name)}\.part\d+\.rar$'
+                if VERBOSE:
+                    print(f"  DEBUG: Detected SFX RAR5 multi-part, base: {base_name}")
+            else:
+                # Case 6: SFX 7z 分卷 (.exe) -> 查找 .7z.*
+                base_name = filename_lower[:-4]  # 移除 .exe
+                volume_pattern = rf'^{re.escape(base_name)}\.7z\.\d+$'
+                if VERBOSE:
+                    print(f"  DEBUG: Detected SFX 7z multi-part, base: {base_name}")
+        
+        # 如果找到了模式，搜索匹配的文件
+        if volume_pattern:
+            for file in all_files:
+                file_lower = file.lower()
+                if file_lower != filename_lower and re.match(volume_pattern, file_lower):
+                    file_path = os.path.join(folder_path, file)
+                    volumes.append(file_path)
+                    if VERBOSE:
+                        print(f"  DEBUG: Found volume: {file_path}")
+        
+    except Exception as e:
+        if VERBOSE:
+            print(f"  DEBUG: Error finding volumes: {e}")
+    
     if VERBOSE:
         print(f"  DEBUG: Total volumes found: {len(volumes)}")
-
+    
     return volumes
 
 

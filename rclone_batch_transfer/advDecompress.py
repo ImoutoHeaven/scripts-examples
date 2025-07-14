@@ -31,6 +31,61 @@ from typing import List, Dict, Optional, Union, Tuple
 VERBOSE = False
 
 
+# === 传统zip编码检测实现 ===
+def is_traditional_zip(archive_path):
+    """
+    检查ZIP文件是否使用传统编码（非UTF-8）
+    
+    Args:
+        archive_path: ZIP文件路径
+        
+    Returns:
+        bool: 如果是传统编码ZIP返回True，否则返回False
+    """
+    try:
+        if not archive_path.lower().endswith('.zip'):
+            return False  # 只检查ZIP文件
+            
+        if VERBOSE:
+            print(f"  DEBUG: 检查ZIP是否为传统编码: {archive_path}")
+            
+        with open(archive_path, 'rb') as f:
+            # 读取本地文件头
+            while True:
+                header = f.read(30)
+                if len(header) < 30:
+                    break
+                    
+                # 检查PK签名
+                if header[0:4] != b'PK\x03\x04':
+                    break
+                    
+                # 通用目的位标志在字节6-7
+                gpbf = int.from_bytes(header[6:8], 'little')
+                
+                # 位11表示UTF-8编码
+                is_utf8 = (gpbf & (1 << 11)) != 0
+                if is_utf8:
+                    if VERBOSE:
+                        print(f"  DEBUG: 发现UTF-8编码，非传统ZIP")
+                    return False  # 它是UTF-8编码的
+                    
+                # 跳过文件名和额外字段
+                filename_length = int.from_bytes(header[26:28], 'little')
+                extra_field_length = int.from_bytes(header[28:30], 'little')
+                f.seek(filename_length + extra_field_length, 1)  # 使用os.SEEK_CUR的值1
+                
+            if VERBOSE:
+                print(f"  DEBUG: 未发现UTF-8标志，认为是传统ZIP")
+            return True  # 未找到UTF-8标志，假设为传统ZIP
+            
+    except Exception as e:
+        if VERBOSE:
+            print(f"  DEBUG: 读取ZIP文件时出错 '{archive_path}': {e}")
+        return False
+
+
+
 # === depth 限制 实现 ====
 
 def parse_depth_range(depth_range_str):
@@ -345,6 +400,12 @@ def should_skip_archive(archive_path, args, sfx_detector=None):
             # 单个ZIP文件
             if args.skip_zip:
                 return True, "单个ZIP文件被跳过 (--skip-zip)"
+        
+        # 检查传统ZIP编码（新增）
+        if hasattr(args, 'skip_traditional_zip') and args.skip_traditional_zip:
+            if is_traditional_zip(archive_path):
+                return True, "传统编码ZIP文件被跳过 (--skip-traditional-zip)"
+        
         return False, ""
 
     # 8. 检查EXE文件 (file.exe) - 使用SFXDetector准确判断
@@ -364,7 +425,6 @@ def should_skip_archive(archive_path, args, sfx_detector=None):
         print(f"  DEBUG: 归档文件不被跳过")
 
     return False, ""
-
 
 # ==================== 短路径API改造 ====================
 
@@ -2930,6 +2990,16 @@ def main():
         action='store_true',
         help='Skip multi-volume SFX archives (.partN.exe and related volumes)'
     )
+    
+    
+    # Skip traditional encoding ZIP files (新增)
+    parser.add_argument(
+        '--skip-traditional-zip', '-stz',
+        action='store_true',
+        help='Skip ZIP files that use traditional encoding (non-UTF-8). Only applies to .zip files and main volumes of split ZIP archives.'
+    )
+    
+    
 
     # 锁相关参数
     parser.add_argument(

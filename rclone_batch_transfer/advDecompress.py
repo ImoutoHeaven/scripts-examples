@@ -34,7 +34,10 @@ VERBOSE = False
 # === 传统zip编码检测实现 ===
 def is_traditional_zip(archive_path):
     """
-    检查ZIP文件是否使用传统编码（非UTF-8）
+    Check if zip file uses traditional encoding (non-UTF-8).
+    Returns False if the file uses UTF-8 encoding via either:
+    1. EFS flag (General Purpose Bit Flag bit 11)
+    2. UTF-8 Extra Field (ID 0x7075)
     
     Args:
         archive_path: ZIP文件路径
@@ -44,44 +47,72 @@ def is_traditional_zip(archive_path):
     """
     try:
         if not archive_path.lower().endswith('.zip'):
-            return False  # 只检查ZIP文件
+            return False  # Only interested in zip files
             
         if VERBOSE:
             print(f"  DEBUG: 检查ZIP是否为传统编码: {archive_path}")
             
         with open(archive_path, 'rb') as f:
-            # 读取本地文件头
+            # Read the local file headers
             while True:
                 header = f.read(30)
                 if len(header) < 30:
                     break
                     
-                # 检查PK签名
+                # Check for PK signature (Local File Header)
                 if header[0:4] != b'PK\x03\x04':
                     break
                     
-                # 通用目的位标志在字节6-7
+                # General purpose bit flag is at bytes 6-7
                 gpbf = int.from_bytes(header[6:8], 'little')
                 
-                # 位11表示UTF-8编码
-                is_utf8 = (gpbf & (1 << 11)) != 0
-                if is_utf8:
+                # Bit 11 indicates UTF-8 encoding (EFS flag)
+                is_utf8_efs = (gpbf & (1 << 11)) != 0
+                if is_utf8_efs:
                     if VERBOSE:
-                        print(f"  DEBUG: 发现UTF-8编码，非传统ZIP")
-                    return False  # 它是UTF-8编码的
-                    
-                # 跳过文件名和额外字段
+                        print(f"  DEBUG: 发现UTF-8 EFS标志，非传统ZIP")
+                    return False  # Found UTF-8 via EFS flag
+                
+                # Get filename and extra field lengths
                 filename_length = int.from_bytes(header[26:28], 'little')
                 extra_field_length = int.from_bytes(header[28:30], 'little')
-                f.seek(filename_length + extra_field_length, 1)  # 使用os.SEEK_CUR的值1
                 
+                # Skip filename
+                f.seek(filename_length, os.SEEK_CUR)
+                
+                # Check extra field for UTF-8 Extra Field (0x7075)
+                if extra_field_length > 0:
+                    extra_field_data = f.read(extra_field_length)
+                    if len(extra_field_data) == extra_field_length:
+                        # Parse extra field entries
+                        offset = 0
+                        while offset + 4 <= len(extra_field_data):
+                            # Read header ID and data size
+                            header_id = int.from_bytes(extra_field_data[offset:offset+2], 'little')
+                            data_size = int.from_bytes(extra_field_data[offset+2:offset+4], 'little')
+                            
+                            # Check for UTF-8 Extra Fields (0x7075 for path, 0x6375 for comment)
+                            if header_id == 0x7075 or header_id == 0x6375:
+                                if VERBOSE:
+                                    print(f"  DEBUG: 发现UTF-8额外字段(0x{header_id:04x})，非传统ZIP")
+                                return False  # Found UTF-8 Extra Field
+                            
+                            # Move to next extra field entry
+                            offset += 4 + data_size
+                            
+                            # Safety check to prevent infinite loop
+                            if offset >= len(extra_field_data):
+                                break
+                    
             if VERBOSE:
-                print(f"  DEBUG: 未发现UTF-8标志，认为是传统ZIP")
-            return True  # 未找到UTF-8标志，假设为传统ZIP
+                print(f"  DEBUG: 未发现UTF-8指示符，认为是传统ZIP")
+            return True  # Did not find any UTF-8 indicators, assume traditional zip
             
     except Exception as e:
         if VERBOSE:
             print(f"  DEBUG: 读取ZIP文件时出错 '{archive_path}': {e}")
+        else:
+            print(f"Error reading zip file '{archive_path}': {e}")
         return False
 
 

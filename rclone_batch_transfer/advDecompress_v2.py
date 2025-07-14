@@ -119,7 +119,7 @@ def guess_zip_encoding(zip_path):
 
 def get_7z_encoding_param(encoding):
     """
-    将检测到的编码转换为7z命令的-scc参数值
+    将检测到的编码转换为7z命令的-mcp参数值
     
     Args:
         encoding: chardet检测到的编码名称
@@ -195,7 +195,6 @@ def get_7z_encoding_param(encoding):
         print(f"  DEBUG: 未知编码，无法映射到7z参数: {encoding}")
     
     return None
-
 
 # === 传统zip编码检测实现 ===
 def is_traditional_zip(archive_path):
@@ -1836,27 +1835,33 @@ def try_extract(archive_path, password, tmp_dir, zip_decode=None, enable_rar=Fal
 
             cmd = ['7z', 'x', safe_archive_path, f'-o{safe_tmp_dir}', f'-p{password}', '-y']
 
-            # 如果指定了zip_decode参数且当前文件是ZIP格式，则添加-scc参数
+            # 如果指定了zip_decode参数且当前文件是ZIP格式，则添加-mcp参数
             if zip_decode is not None and is_zip_format(archive_path):
                 try:
                     # 确保zip_decode是有效的整数或字符串
                     if isinstance(zip_decode, int):
-                        scc_param = f'-scc{zip_decode}'
+                        mcp_param = f'-mcp={zip_decode}'
                     elif isinstance(zip_decode, str) and zip_decode.isdigit():
-                        scc_param = f'-scc{zip_decode}'
+                        mcp_param = f'-mcp={zip_decode}'
                     elif isinstance(zip_decode, str):
                         # 处理非数字字符串编码（如'UTF-8'）
-                        scc_param = f'-scc{zip_decode}'
+                        if zip_decode.upper() == 'UTF-8':
+                            # 对于UTF-8，7z默认就是UTF-8，无需添加参数
+                            mcp_param = None
+                            if VERBOSE:
+                                print(f"  DEBUG: UTF-8编码，使用7z默认处理")
+                        else:
+                            mcp_param = f'-mcp={zip_decode}'
                     else:
                         # 无效的编码参数，跳过
                         if VERBOSE:
                             print(f"  DEBUG: 无效的ZIP编码参数，跳过: {zip_decode}")
-                        scc_param = None
+                        mcp_param = None
                     
-                    if scc_param:
-                        cmd.append(scc_param)
+                    if mcp_param:
+                        cmd.append(mcp_param)
                         if VERBOSE:
-                            print(f"  DEBUG: 添加ZIP代码页参数: {scc_param}")
+                            print(f"  DEBUG: 添加ZIP代码页参数: {mcp_param}")
                             
                 except Exception as e:
                     if VERBOSE:

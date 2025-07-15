@@ -145,6 +145,39 @@ lock_handle = None
 # 新增：标记当前实例是否拥有锁的全局变量
 lock_owner = False
 
+def run_tasks_concurrently(items, args, base_path):
+    """
+    使用 ThreadPoolExecutor 并发执行文件/文件夹压缩任务。
+    捕获 Ctrl+C / SIGTERM 等中断，确保线程池被正确关闭。
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _dispatch(path, item_type):
+        if item_type == 'file':
+            process_file(path, args, base_path)
+        else:
+            process_folder(path, args, base_path)
+
+    total = len(items['files']) + len(items['folders'])
+    print(f"并发模式: 启动 {args.threads} 个工作线程，任务总数 {total}")
+
+    # 线程池执行
+    with ThreadPoolExecutor(max_workers=args.threads) as executor:
+        futures = []
+        for p in items['files']:
+            futures.append(executor.submit(_dispatch, p, 'file'))
+        for p in items['folders']:
+            futures.append(executor.submit(_dispatch, p, 'folder'))
+
+        try:
+            for fut in as_completed(futures):
+                fut.result()          # 触发异常回溯到主线程
+        except KeyboardInterrupt:
+            print("\n检测到用户中断，正在取消剩余任务 ...")
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+
+
 
 def build_folder_input_path(folder_path: str, debug: bool = False) -> str:
     """
@@ -1035,7 +1068,7 @@ def code_page_type(value):
 
 
 def parse_arguments():
-    """解析命令行参数"""
+    """解析命令行参数（新增 -t / --threads 并默认 1）"""
     parser = argparse.ArgumentParser(description='ZIP压缩工具（含PAR2恢复记录）')
     parser.add_argument('folder_path', help='要处理的文件夹路径')
     parser.add_argument('--dry-run', action='store_true', help='仅预览操作，不执行实际命令')
@@ -1058,34 +1091,41 @@ def parse_arguments():
     parser.add_argument('--no-lock', action='store_true', help='不使用全局锁（谨慎使用）')
     parser.add_argument('--lock-timeout', type=int, default=30, help='锁定超时时间（最大重试次数）')
     parser.add_argument('--out', help='指定压缩后文件的输出目录路径')
-
     parser.add_argument('--no-rec', action='store_true', help='不生成PAR2恢复记录文件')
 
-    # 新增的过滤参数
+    # 线程数（新增）
+    parser.add_argument('-t', '--threads', type=int, default=1,
+                        help='同时进行的压缩任务数，默认为 1')
+
+    # 过滤参数
     parser.add_argument('--skip-files', action='store_true', help='跳过文件，仅处理文件夹')
     parser.add_argument('--skip-folders', action='store_true', help='跳过文件夹，仅处理文件')
     parser.add_argument('--ext-skip-folder-tree', action='store_true',
-                        help='与--skip-扩展名参数配合使用，跳过包含指定扩展名文件的整个文件夹树')
+                        help='与 --skip-扩展名 配合使用，跳过包含指定扩展名文件的整个文件夹树')
 
     args, unknown = parser.parse_known_args()
 
-    # 处理 --skip-ext 类型的参数
+    # 处理 --skip-<ext>
     skip_extensions = []
     for arg in unknown:
         if arg.startswith('--skip-'):
-            ext = arg[7:]  # 移除 '--skip-' 前缀
-            if ext:  # 确保扩展名不为空
-                skip_extensions.append(ext.lower())  # 转为小写以便不区分大小写比较
+            ext = arg[7:]
+            if ext:
+                skip_extensions.append(ext.lower())
             else:
                 print(f"警告: 忽略无效的跳过参数: {arg}")
         else:
             print(f"错误: 未知参数: {arg}")
             sys.exit(1)
-
-    # 将跳过的扩展名添加到args对象中
     args.skip_extensions = skip_extensions
 
+    # 合法性检查：线程数必须 ≥1
+    if args.threads < 1:
+        print("错误: --threads 必须为正整数")
+        sys.exit(1)
+
     return args
+
 
 
 def is_windows():
@@ -1686,19 +1726,19 @@ def main():
         # 获取基础路径（用于计算相对路径）
         base_path = safe_abspath(args.folder_path)
 
-        # 处理每个找到的文件
-        for i, file_path in enumerate(items['files'], 1):
-            progress_msg = f"\n[{i}/{len(items['files'])}] 处理文件: {file_path}"
-            stats.log(progress_msg)
-            print(progress_msg)
-            process_file(file_path, args, base_path)
+        # 根据线程数选择执行模式
+        if args.threads > 1:
+            run_tasks_concurrently(items, args, base_path)
+        else:
+            # 顺序执行（保持旧行为）
+            for i, file_path in enumerate(items['files'], 1):
+                print(f"\n[{i}/{len(items['files'])}] 处理文件: {file_path}")
+                process_file(file_path, args, base_path)
 
-        # 处理每个找到的文件夹
-        for i, folder_path in enumerate(items['folders'], 1):
-            progress_msg = f"\n[{i}/{len(items['folders'])}] 处理文件夹: {folder_path}"
-            stats.log(progress_msg)
-            print(progress_msg)
-            process_folder(folder_path, args, base_path)
+            for i, folder_path in enumerate(items['folders'], 1):
+                print(f"\n[{i}/{len(items['folders'])}] 处理文件夹: {folder_path}")
+                process_folder(folder_path, args, base_path)
+
 
     finally:
         # 打印最终统计信息

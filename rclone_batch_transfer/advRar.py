@@ -19,7 +19,9 @@ import threading
 import uuid
 from datetime import datetime
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+executor = None
 
 # 全局统计信息
 class CompressionStats:
@@ -779,7 +781,7 @@ def profile_type(value):
 
 
 def parse_arguments():
-    """解析命令行参数"""
+    """解析命令行参数（新增 --threads 选项）"""
     parser = argparse.ArgumentParser(description='RAR压缩工具')
     parser.add_argument('folder_path', help='要处理的文件夹路径')
     parser.add_argument('--dry-run', action='store_true', help='仅预览操作，不执行实际命令')
@@ -787,43 +789,74 @@ def parse_arguments():
     parser.add_argument('-p', '--password', help='设置压缩包密码')
     parser.add_argument('-d', '--delete', action='store_true', help='压缩成功后删除原文件/文件夹')
     parser.add_argument(
-        '--profile',
-        type=profile_type,  # 使用自定义验证函数
-        default='best',
-        help="压缩配置文件: 'store', 'best', 'fastest', 或 'parted-XXunit' (例如: 'parted-10g', 'parted-100mb', 'parted-500k')"
+        '--profile', type=profile_type, default='best',
+        help="压缩配置文件: 'store', 'best', 'fastest', 或 'parted-XXunit'"
     )
     parser.add_argument('--debug', action='store_true', help='显示调试信息')
     parser.add_argument('--no-lock', action='store_true', help='不使用全局锁（谨慎使用）')
     parser.add_argument('--lock-timeout', type=int, default=30, help='锁定超时时间（最大重试次数）')
     parser.add_argument('--out', help='指定压缩后文件的输出目录路径')
 
-    # 新增的过滤参数
+    # 线程数（新增）
+    parser.add_argument(
+        '-t', '--threads', type=int, default=1, metavar='N',
+        help='同时进行压缩的任务数，默认为 1（顺序执行）'
+    )
+
+    # 过滤参数
     parser.add_argument('--skip-files', action='store_true', help='跳过文件，仅处理文件夹')
     parser.add_argument('--skip-folders', action='store_true', help='跳过文件夹，仅处理文件')
-
-    # 新增：--ext-skip-folder-tree 参数
-    parser.add_argument('--ext-skip-folder-tree', action='store_true',
-                        help='当指定 --skip-${ext} 参数时，跳过包含指定扩展名文件的整个文件夹树')
+    parser.add_argument(
+        '--ext-skip-folder-tree', action='store_true',
+        help='当指定 --skip-${ext} 参数时，跳过包含指定扩展名文件的整个文件夹树'
+    )
 
     args, unknown = parser.parse_known_args()
 
-    # 处理 --skip-ext 类型的参数
+    # 处理 --skip-<ext>
     skip_extensions = []
     for arg in unknown:
         if arg.startswith('--skip-'):
-            ext = arg[7:]  # 移除 '--skip-' 前缀
-            if ext:  # 确保扩展名不为空
-                skip_extensions.append(ext.lower())  # 转为小写以便不区分大小写比较
+            ext = arg[7:]
+            if ext:
+                skip_extensions.append(ext.lower())
             else:
                 print(f"警告: 忽略无效的跳过参数: {arg}")
         else:
             print(f"错误: 未知参数: {arg}")
             sys.exit(1)
-
-    # 将跳过的扩展名添加到args对象中
     args.skip_extensions = skip_extensions
 
+    # 校验线程数
+    if args.threads < 1:
+        parser.error('--threads 必须为大于等于 1 的整数')
+
     return args
+
+def process_items_multithread(items, args, base_path):
+    """
+    使用 ThreadPoolExecutor 并发处理文件与文件夹。
+    线程数由 args.threads 指定。
+    """
+    global executor
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    executor = ThreadPoolExecutor(max_workers=args.threads)
+    futures = []
+
+    # 提交任务
+    for file_path in items['files']:
+        futures.append(executor.submit(process_file, file_path, args, base_path))
+    for folder_path in items['folders']:
+        futures.append(executor.submit(process_folder, folder_path, args, base_path))
+
+    try:
+        for _ in as_completed(futures):
+            pass  # 结果已由各自函数写入 stats
+    finally:
+        # 立即关闭线程池（不等待未完成的子进程）
+        executor.shutdown(wait=False, cancel_futures=True)
+        executor = None
 
 
 def is_windows():
@@ -1368,18 +1401,30 @@ def process_folder(folder_path, args, base_path):
 
 
 def signal_handler(signum, frame):
-    """信号处理器，用于在程序被中断时清理锁文件"""
-    print(f"\n收到信号 {signum}，正在清理...")
+    """信号处理器：优雅中断并终止线程池"""
+    global executor
+    print(f"\n收到信号 {signum}，正在清理…")
+
+    # 终止线程池（若存在）
+    if executor is not None:
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        executor = None
+
     stats.print_final_stats()
-    release_lock()  # 只有锁的拥有者才会释放锁
+    release_lock()            # 仅锁拥有者会真正释放锁
     sys.exit(1)
+
 
 
 def main():
     """主函数"""
-    global stats
-    global lock_owner
+    global stats, lock_owner, executor
 
+    executor = None
+    
     # 检查shell环境
     check_shell_environment()
 
@@ -1518,26 +1563,27 @@ def main():
         # 获取基础路径（用于计算相对路径）
         base_path = safe_abspath(args.folder_path)
 
-        # 处理每个找到的文件
-        for i, file_path in enumerate(items['files'], 1):
-            progress_msg = f"\n[{i}/{len(items['files'])}] 处理文件: {file_path}"
-            stats.log(progress_msg)
-            print(progress_msg)
-            process_file(file_path, args, base_path)
+        if args.threads > 1:
+            stats.log(f"启用线程池并发，线程数: {args.threads}")
+            process_items_multithread(items, args, base_path)
+        else:
+            # 顺序处理（与旧逻辑相同）
+            for i, file_path in enumerate(items['files'], 1):
+                stats.log(f"\n[{i}/{len(items['files'])}] 处理文件: {file_path}")
+                process_file(file_path, args, base_path)
 
-        # 处理每个找到的文件夹
-        for i, folder_path in enumerate(items['folders'], 1):
-            progress_msg = f"\n[{i}/{len(items['folders'])}] 处理文件夹: {folder_path}"
-            stats.log(progress_msg)
-            print(progress_msg)
-            process_folder(folder_path, args, base_path)
+            for i, folder_path in enumerate(items['folders'], 1):
+                stats.log(f"\n[{i}/{len(items['folders'])}] 处理文件夹: {folder_path}")
+                process_folder(folder_path, args, base_path)
 
     finally:
-        # 打印最终统计信息
         stats.print_final_stats()
-
-        # 确保释放锁（如果已获取）
-        if lock_acquired:
+        # 关闭线程池（若仍存在）
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+            executor = None
+        # 释放全局锁
+        if not args.no_lock and lock_owner:
             release_lock()
             stats.log("已释放全局锁")
 

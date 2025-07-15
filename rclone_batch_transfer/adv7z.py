@@ -613,38 +613,29 @@ def check_required_tools(no_par2=False):
 
 
 def quote_path_for_7z(path):
-    """
-    生成 7-Zip 安全参数（支持文件 / 目录*，并在 Windows 下转换短路径）。
-    * 目录应以 “\\*” 或 “/*” 结尾；本函数会仅对目录部分做短路径转换。
-    """
+    """为 7‑Zip CLI 安全引用路径（支持包含 * 通配符的绝对路径）。"""
     import os, platform, shlex
 
-    # 识别并分离通配符
-    wildcard = ''
-    if path.endswith(('\\*', '/*')):
-        wildcard = path[-2:]
-        base_path = path[:-2].rstrip('\\/')
+    wildcard_part = ""
+    if path.endswith(os.sep + "*"):
+        wildcard_part = os.sep + "*"; dir_part = path[:-2]
+    elif path.endswith("/*"):
+        wildcard_part = "/*"; dir_part = path[:-2]
     else:
-        base_path = path
+        dir_part = path
 
-    # Windows：尝试短路径
-    if platform.system() == 'Windows':
-        short_base = get_short_path_name(base_path) or base_path
-        safe_path = short_base + wildcard
-        fname = os.path.basename(base_path)
-        if fname.startswith('-'):                       # 处理以“-”开头的文件/目录
-            dname = os.path.dirname(short_base)
-            safe_path = os.path.join(dname, '.' + os.sep + fname) + wildcard
-        safe_path = '"' + safe_path.replace('"', '\\"') + '"'
-    else:                                              # *nix 系统
-        safe_path = base_path + wildcard
-        if os.path.basename(base_path).startswith('-'):
-            dname = os.path.dirname(base_path)
-            fname = os.path.basename(base_path)
-            safe_path = os.path.join(dname, '.', fname) + wildcard
-        safe_path = shlex.quote(safe_path)
-
-    return safe_path
+    if platform.system() == "Windows":
+        short_dir = get_short_path_name(dir_part) or dir_part
+        if os.path.basename(short_dir).startswith("-") and not wildcard_part:
+            short_dir = os.path.join(os.path.dirname(short_dir), "." + os.sep + os.path.basename(short_dir))
+        safe_path = short_dir + wildcard_part
+        safe_path = safe_path.replace('"', '\\"') if '"' in safe_path else safe_path
+        return f'"{safe_path}"'
+    else:
+        unix_path = dir_part + wildcard_part
+        if os.path.basename(dir_part).startswith("-") and not wildcard_part:
+            unix_path = os.path.join(os.path.dirname(dir_part), "./" + os.path.basename(dir_part)) + wildcard_part
+        return shlex.quote(unix_path)
 
 
 
@@ -1494,143 +1485,116 @@ def safe_delete_folder(folder_path, dry_run=False):
 
 
 def process_file(file_path, args, base_path):
-    """使用绝对路径压缩单个文件；全程无目录切换。"""
     global stats
+    file_path = safe_abspath(file_path)
+    file_dir = os.path.dirname(file_path)
+    file_name = os.path.basename(file_path)
+    rel_path = get_relative_path(file_path, base_path)
 
-    file_abs_path = safe_abspath(file_path)
-    file_dir      = os.path.dirname(file_abs_path)
-    rel_path      = get_relative_path(file_abs_path, base_path)
-
-    # 目标目录
+    # 目标输出目录
     final_target_dir = safe_abspath(args.out) if args.out else file_dir
     safe_makedirs(final_target_dir, exist_ok=True, debug=args.debug)
 
-    # 创建临时目录
-    tmp_dir = create_unique_tmp_dir(os.getcwd(), args.debug)
+    original_cwd = os.getcwd()  # 记录但不修改
+    tmp_dir = create_unique_tmp_dir(original_cwd, args.debug)
     if not tmp_dir:
-        stats.log("创建临时目录失败")
-        stats.add_failure('文件', file_path, -1, "创建临时目录失败", "")
+        stats.add_failure('文件', file_path, -1, '创建临时目录失败', '')
         return
 
     try:
-        z7_cmd = ['7z', 'a', *build_7z_switches(args.profile, args.password, args.delete)]
-        temp_archive_path = os.path.join(tmp_dir, "temp_archive.7z")
+        z7_switches = build_7z_switches(args.profile, args.password, args.delete)
+        temp_archive_path = os.path.join(tmp_dir, 'temp_archive.7z')
 
-        # 输出文件 & 输入文件（均为绝对路径）
-        z7_cmd.append(quote_path_for_7z(temp_archive_path))
-        z7_cmd.append(quote_path_for_7z(file_abs_path))
-
+        z7_cmd = ['7z', 'a', *z7_switches, quote_path_for_7z(temp_archive_path), quote_path_for_7z(file_path)]
         cmd_str = ' '.join(z7_cmd)
         if args.debug:
-            stats.log(f"执行命令:\n{cmd_str}")
-
+            print(f"执行命令: {cmd_str}")
         if args.dry_run:
-            stats.log(f"[DRY-RUN] {cmd_str}")
-            return
+            stats.log(f"[DRY-RUN] {cmd_str}"); return
 
         result = execute_7z_command(z7_cmd, args.debug)
         if result.returncode != 0:
-            stats.add_failure('文件', file_path, result.returncode,
-                              result.stderr or "未知错误", cmd_str)
+            stats.add_failure('文件', file_path, result.returncode, result.stderr or '未知错误', cmd_str)
             return
 
-        # 后续流程（改名、PAR2、移动等）保持不变
+        # 后续逻辑（重命名/生成 PAR2/移动）保持不变
         final_name = os.path.splitext(os.path.basename(rel_path))[0]
-        success, renamed_files = find_and_rename_7z_files("temp_archive",
-                                                          final_name, tmp_dir, args.debug)
-        if not success or not renamed_files:
-            stats.add_failure('文件', file_path, 0, "重命名7z文件失败", cmd_str)
-            return
+        success, renamed_files = find_and_rename_7z_files('temp_archive', final_name, tmp_dir, args.debug)
+        if not (success and renamed_files):
+            stats.add_failure('文件', file_path, 0, '重命名7z文件失败', cmd_str); return
 
         all_files_to_move = renamed_files[:]
         if not args.no_rec:
             embed_par2 = not (is_parted_profile(args.profile) or args.no_emb)
-            par2_ok, extra_par2 = process_par2_for_archives(renamed_files, embed_par2, args.debug)
-            if par2_ok and not embed_par2:
-                all_files_to_move.extend(extra_par2)
-            elif not par2_ok:
+            par2_success, par2_files = process_par2_for_archives(renamed_files, embed_par2, args.debug)
+            if not par2_success:
                 stats.add_par2_failure('文件', file_path, renamed_files)
+            else:
+                all_files_to_move.extend(par2_files)
 
-        move_ok, _ = move_files_to_final_destination(all_files_to_move,
-                                                     final_target_dir, rel_path, args.debug)
-        if move_ok:
+        moved, _ = move_files_to_final_destination(all_files_to_move, final_target_dir, rel_path, args.debug)
+        if moved:
             stats.add_success('文件', file_path)
         else:
-            stats.add_failure('文件', file_path, 0, "移动文件失败", cmd_str)
-
+            stats.add_failure('文件', file_path, 0, '移动文件失败', cmd_str)
     finally:
+        safe_chdir(original_cwd, args.debug)
         cleanup_tmp_dir(tmp_dir, args.debug)
 
 
-
 def process_folder(folder_path, args, base_path):
-    """使用绝对路径 + 通配符压缩文件夹；全程无目录切换。"""
     global stats
-
-    folder_abs_path = safe_abspath(folder_path)
-    rel_path        = get_relative_path(folder_abs_path, base_path)
-
-    final_target_dir = safe_abspath(args.out) if args.out else os.path.dirname(folder_abs_path)
+    folder_path = safe_abspath(folder_path)
+    rel_path = get_relative_path(folder_path, base_path)
+    final_target_dir = safe_abspath(args.out) if args.out else os.path.dirname(folder_path)
     safe_makedirs(final_target_dir, exist_ok=True, debug=args.debug)
 
-    tmp_dir = create_unique_tmp_dir(os.getcwd(), args.debug)
+    original_cwd = os.getcwd()
+    tmp_dir = create_unique_tmp_dir(original_cwd, args.debug)
     if not tmp_dir:
-        stats.log("创建临时目录失败")
-        stats.add_failure('文件夹', folder_path, -1, "创建临时目录失败", "")
+        stats.add_failure('文件夹', folder_path, -1, '创建临时目录失败', '')
         return
 
     try:
-        z7_cmd = ['7z', 'a', *build_7z_switches(args.profile, args.password, args.delete)]
-        temp_archive_path = os.path.join(tmp_dir, "temp_archive.7z")
-        z7_cmd.append(quote_path_for_7z(temp_archive_path))
-
-        # 目录输入参数：绝对路径 + *（保持平台分隔符）
-        input_pattern = folder_abs_path.rstrip('\\/') + (('\\*') if is_windows() else '/*')
-        z7_cmd.append(quote_path_for_7z(input_pattern))
-
+        z7_switches = build_7z_switches(args.profile, args.password, args.delete)
+        temp_archive_path = os.path.join(tmp_dir, 'temp_archive.7z')
+        wildcard_input = os.path.join(folder_path, '*')  # Windows -> '\*' | Linux -> '/*'
+        z7_cmd = ['7z', 'a', *z7_switches, quote_path_for_7z(temp_archive_path), quote_path_for_7z(wildcard_input)]
         cmd_str = ' '.join(z7_cmd)
         if args.debug:
-            stats.log(f"执行命令:\n{cmd_str}")
-
+            print(f"执行命令: {cmd_str}")
         if args.dry_run:
-            stats.log(f"[DRY-RUN] {cmd_str}")
-            return
+            stats.log(f"[DRY-RUN] {cmd_str}"); return
 
         result = execute_7z_command(z7_cmd, args.debug)
         if result.returncode != 0:
-            stats.add_failure('文件夹', folder_path, result.returncode,
-                              result.stderr or "未知错误", cmd_str)
+            stats.add_failure('文件夹', folder_path, result.returncode, result.stderr or '未知错误', cmd_str)
             return
 
         final_name = os.path.basename(rel_path)
-        success, renamed_files = find_and_rename_7z_files("temp_archive",
-                                                          final_name, tmp_dir, args.debug)
-        if not success or not renamed_files:
-            stats.add_failure('文件夹', folder_path, 0, "重命名7z文件失败", cmd_str)
-            return
+        success, renamed_files = find_and_rename_7z_files('temp_archive', final_name, tmp_dir, args.debug)
+        if not (success and renamed_files):
+            stats.add_failure('文件夹', folder_path, 0, '重命名7z文件失败', cmd_str); return
 
         all_files_to_move = renamed_files[:]
         if not args.no_rec:
             embed_par2 = not (is_parted_profile(args.profile) or args.no_emb)
-            par2_ok, extra_par2 = process_par2_for_archives(renamed_files, embed_par2, args.debug)
-            if par2_ok and not embed_par2:
-                all_files_to_move.extend(extra_par2)
-            elif not par2_ok:
+            par2_success, par2_files = process_par2_for_archives(renamed_files, embed_par2, args.debug)
+            if not par2_success:
                 stats.add_par2_failure('文件夹', folder_path, renamed_files)
+            else:
+                all_files_to_move.extend(par2_files)
 
-        move_ok, _ = move_files_to_final_destination(all_files_to_move,
-                                                     final_target_dir, rel_path, args.debug)
-        if move_ok:
-            # 删除空文件夹（若使用 -sdel）
+        moved, _ = move_files_to_final_destination(all_files_to_move, final_target_dir, rel_path, args.debug)
+        if moved:
             if args.delete:
                 safe_delete_folder(folder_path, args.dry_run)
             stats.add_success('文件夹', folder_path)
         else:
-            stats.add_failure('文件夹', folder_path, 0, "移动文件失败", cmd_str)
-
+            stats.add_failure('文件夹', folder_path, 0, '移动文件失败', cmd_str)
     finally:
+        safe_chdir(original_cwd, args.debug)
         cleanup_tmp_dir(tmp_dir, args.debug)
-
 
 def signal_handler(signum, frame):
     """信号处理器，用于在程序被中断时清理锁文件"""

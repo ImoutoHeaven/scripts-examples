@@ -146,6 +146,32 @@ lock_handle = None
 lock_owner = False
 
 
+def build_folder_input_path(folder_path: str, debug: bool = False) -> str:
+    """
+    构造 7-Zip 用的文件夹输入参数：
+        • Windows  : “C:\\Path\\To\\Folder\\*”
+        • 非 Windows: “/path/to/folder/*”
+    - Windows 下先转短路径再追加通配符，最后整体加引号；
+    - *nix 下直接返回绝对路径+通配符，不加引号（subprocess shell=False）。
+    """
+    # 取得绝对路径并保证末尾分隔符
+    abs_path = safe_abspath(folder_path, debug)
+    if not abs_path.endswith(os.sep):
+        abs_path += os.sep
+
+    if is_windows():
+        # 先转短路径（去掉末尾分隔符再转）
+        short_base = get_short_path_name(abs_path.rstrip(os.sep)) or abs_path.rstrip(os.sep)
+        wildcard_path = f'{short_base}{os.sep}*'
+        # Windows 走 shell=True，因此需要整体加引号并转义内部引号
+        if '"' in wildcard_path:
+            wildcard_path = wildcard_path.replace('"', '\\"')
+        return f'"{wildcard_path}"'
+    else:
+        # 非 Windows 直接返回，无需额外引号
+        return f"{abs_path}*"
+
+
 def create_unique_tmp_dir(debug=False):
     """
     在脚本当前工作目录创建唯一的临时目录
@@ -1338,362 +1364,174 @@ def safe_delete_folder(folder_path, dry_run=False):
 
 
 def process_file(file_path, args, base_path):
-    """处理单个文件的压缩操作"""
+    """处理单个文件的压缩操作（完全使用绝对路径，无 cd 操作）"""
     global stats
 
-    # 获取文件名（不含扩展名）
-    file_dir = os.path.dirname(file_path)
-    file_name = os.path.basename(file_path)
+    abs_file_path = safe_abspath(file_path)
+    file_name = os.path.basename(abs_file_path)
     name_without_ext = os.path.splitext(file_name)[0]
 
-    # 计算相对路径，用于确定输出文件名
-    rel_path = get_relative_path(file_path, base_path)
-    rel_name_without_ext = os.path.splitext(rel_path)[0]
+    # 计算相对路径，用于输出结构
+    rel_path = get_relative_path(abs_file_path, base_path)
 
-    # 确定最终输出目录
+    # 生成最终输出目录（保持原有逻辑）
     if args.out:
-        # 确保输出目录存在
         output_dir = safe_abspath(args.out)
         safe_makedirs(output_dir, exist_ok=True, debug=args.debug)
-
-        # 计算相对路径的目录部分
         rel_dir = os.path.dirname(rel_path)
-        if rel_dir and rel_dir != '.':
-            # 如果相对路径有目录部分，在输出目录下创建对应的目录结构
-            final_output_dir = os.path.join(output_dir, rel_dir)
-            safe_makedirs(final_output_dir, exist_ok=True, debug=args.debug)
-        else:
-            final_output_dir = output_dir
+        final_output_dir = os.path.join(output_dir, rel_dir) if rel_dir and rel_dir != '.' else output_dir
+        safe_makedirs(final_output_dir, exist_ok=True, debug=args.debug)
     else:
-        final_output_dir = file_dir
+        final_output_dir = os.path.dirname(abs_file_path)
 
-    # 保存当前工作目录
-    original_cwd = os.getcwd()
     tmp_dir_path = None
-
     try:
-        # 创建唯一的临时目录
         tmp_dir_path = create_unique_tmp_dir(args.debug)
         if not tmp_dir_path:
             raise Exception("无法创建临时目录")
 
-        # 切换到文件所在目录
-        if not safe_chdir(file_dir, args.debug):
-            raise Exception(f"无法切换到目录: {file_dir}")
-
-        # 获取7z命令开关（使用args.delete以便7z自行处理删除）
+        # 组装 7z 命令
         z7_switches = build_7z_switches(args.profile, args.password, args.code_page, args.delete)
-
-        # 构建7z命令
-        z7_cmd = ['7z', 'a']
-        z7_cmd.extend(z7_switches)
-
-        # 压缩到临时目录，使用简化的文件名
         temp_zip_path = os.path.join(tmp_dir_path, "temp_archive.zip")
-        z7_cmd.append(quote_path_for_7z(temp_zip_path))
 
-        # 添加输入文件
-        z7_cmd.append(quote_path_for_7z(file_name))
+        z7_cmd = ['7z', 'a', *z7_switches, quote_path_for_7z(temp_zip_path),
+                  quote_path_for_7z(abs_file_path)]
 
-        # 将命令列表转换为字符串用于打印
         cmd_str = ' '.join(z7_cmd)
-
-        # 调试输出
         if args.debug:
-            print("=" * 50)
-            print("调试信息 (文件):")
-            print(f"- 原始文件路径: {file_path}")
-            print(f"- 基础路径: {base_path}")
-            print(f"- 相对路径: {rel_path}")
-            print(f"- 文件名: {file_name}")
-            print(f"- 临时目录: {tmp_dir_path}")
-            print(f"- 临时ZIP路径: {temp_zip_path}")
-            print(f"- 最终输出目录: {final_output_dir}")
-            print(f"- 当前工作目录: {os.getcwd()}")
-            print(f"- 命令列表: {z7_cmd}")
-            print("=" * 50)
+            print(f"[DEBUG] 7z CMD: {cmd_str}")
 
         if args.dry_run:
             stats.log(f"[DRY-RUN] 将执行: {cmd_str}")
             return
 
         stats.log(f"执行: {cmd_str}")
-
-        # 执行7z命令
         result = execute_7z_command(z7_cmd, args.debug)
 
-        # 输出详细的执行结果（如果开启了调试模式）
-        if args.debug:
-            print("命令执行结果:")
-            print(f"- 返回码: {result.returncode}")
-            print(f"- 标准输出: {result.stdout}")
-            print(f"- 错误输出: {result.stderr}")
+        if result.returncode != 0:
+            stats.add_failure('文件', abs_file_path, result.returncode,
+                              result.stderr or "未知错误", cmd_str)
+            return
 
-        # 切换回原始工作目录
-        safe_chdir(original_cwd, args.debug)
+        # 重命名、生成 PAR2、移动——保持原有逻辑
+        final_name = os.path.splitext(os.path.basename(rel_path))[0]
+        temp_zip_file = temp_zip_path
+        final_zip_file = os.path.join(tmp_dir_path, f"{final_name}.zip")
+        if not safe_move(temp_zip_file, final_zip_file, args.debug):
+            stats.add_failure('文件', abs_file_path, 0, "重命名ZIP失败", cmd_str)
+            return
 
-        # 检查命令执行结果
-        if result.returncode == 0:
-            stats.log(f"成功创建ZIP文件到临时目录")
+        par2_files = []
+        if not args.no_rec:
+            ok, par2_files = process_par2_for_archives([final_zip_file], args.debug)
+            if not ok:
+                stats.add_par2_failure('文件', abs_file_path, [final_zip_file])
 
-            # 在临时目录中重命名文件
-            final_name = os.path.splitext(os.path.basename(rel_path))[0]
-            temp_zip_file = os.path.join(tmp_dir_path, "temp_archive.zip")
-            final_zip_file = os.path.join(tmp_dir_path, f"{final_name}.zip")
+        target_zip = os.path.join(final_output_dir, f"{final_name}.zip")
+        if not safe_move(final_zip_file, target_zip, args.debug):
+            stats.add_failure('文件', abs_file_path, 0, "移动ZIP失败", cmd_str)
+            return
 
-            if safe_exists(temp_zip_file, args.debug):
-                if safe_move(temp_zip_file, final_zip_file, args.debug):
-                    stats.log(f"成功重命名ZIP文件: temp_archive.zip -> {final_name}.zip")
+        for p in par2_files:
+            safe_move(p, os.path.join(final_output_dir, os.path.basename(p)), args.debug)
 
-                    # 生成PAR2恢复记录（如果需要）
-                    par2_files = []
-                    if not args.no_rec:
-                        par2_success, generated_par2_files = process_par2_for_archives([final_zip_file], args.debug)
-                        if par2_success:
-                            par2_files = generated_par2_files
-                            stats.log(f"成功在临时目录生成PAR2恢复记录")
-                        else:
-                            stats.log(f"警告: PAR2恢复记录生成失败")
-                            stats.add_par2_failure('文件', file_path, [final_zip_file])
-
-                    # 移动文件到最终目标位置
-                    target_zip_file = os.path.join(final_output_dir, f"{final_name}.zip")
-
-                    # 移动ZIP文件
-                    if safe_move(final_zip_file, target_zip_file, args.debug):
-                        stats.log(f"成功移动ZIP文件到目标位置: {target_zip_file}")
-                        moved_files = [target_zip_file]
-
-                        # 移动PAR2文件
-                        for par2_file in par2_files:
-                            par2_filename = os.path.basename(par2_file)
-                            target_par2_file = os.path.join(final_output_dir, par2_filename)
-                            if safe_move(par2_file, target_par2_file, args.debug):
-                                stats.log(f"成功移动PAR2文件: {target_par2_file}")
-                            else:
-                                stats.log(f"警告: 移动PAR2文件失败: {par2_file}")
-
-                        # 记录成功
-                        stats.add_success('文件', file_path)
-                    else:
-                        stats.log("移动ZIP文件到目标位置失败")
-                        stats.add_failure('文件', file_path, 0, "移动ZIP文件到目标位置失败", cmd_str)
-                else:
-                    stats.log("重命名ZIP文件失败")
-                    stats.add_failure('文件', file_path, 0, "重命名ZIP文件失败", cmd_str)
-            else:
-                stats.log("临时ZIP文件不存在")
-                stats.add_failure('文件', file_path, 0, "临时ZIP文件不存在", cmd_str)
-
-        else:
-            error_msg = f"创建ZIP文件失败，返回码: {result.returncode}"
-            if result.stderr:
-                error_msg += f"\n错误输出: {result.stderr}"
-            stats.log(error_msg)
-            stats.add_failure('文件', file_path, result.returncode, result.stderr or "未知错误", cmd_str)
+        stats.add_success('文件', abs_file_path)
 
     except Exception as e:
-        error_msg = f"执行7z命令时出错: {e}"
-        stats.log(error_msg)
-        stats.add_failure('文件', file_path, -1, str(e), cmd_str if 'cmd_str' in locals() else "未知命令")
+        stats.add_failure('文件', abs_file_path, -1, str(e),
+                          cmd_str if 'cmd_str' in locals() else "未知命令")
         if args.debug:
             import traceback
             traceback.print_exc()
     finally:
-        # 确保无论如何都会切换回原始工作目录
-        try:
-            safe_chdir(original_cwd, args.debug)
-        except Exception as e:
-            print(f"切换回原始工作目录时出错: {e}")
-
-        # 清理临时目录
         if tmp_dir_path:
-            if not cleanup_tmp_dir(tmp_dir_path, args.debug):
-                stats.log(f"警告: 清理临时目录失败: {tmp_dir_path}")
+            cleanup_tmp_dir(tmp_dir_path, args.debug)
+
 
 
 def process_folder(folder_path, args, base_path):
-    """处理单个文件夹的压缩操作"""
+    """处理单个文件夹的压缩操作（完全使用绝对路径，无 cd 操作）"""
     global stats
 
-    # 获取文件夹名称
-    folder_name = os.path.basename(folder_path)
+    abs_folder_path = safe_abspath(folder_path)
+    folder_name = os.path.basename(abs_folder_path)
+    rel_path = get_relative_path(abs_folder_path, base_path)
 
-    # 计算相对路径
-    rel_path = get_relative_path(folder_path, base_path)
-
-    # 确定最终输出目录
+    # 输出目录同旧逻辑
     if args.out:
-        # 确保输出目录存在
         output_dir = safe_abspath(args.out)
         safe_makedirs(output_dir, exist_ok=True, debug=args.debug)
-
-        # 计算相对路径的目录部分
         rel_dir = os.path.dirname(rel_path)
-        if rel_dir and rel_dir != '.':
-            # 如果相对路径有目录部分，在输出目录下创建对应的目录结构
-            final_output_dir = os.path.join(output_dir, rel_dir)
-            safe_makedirs(final_output_dir, exist_ok=True, debug=args.debug)
-        else:
-            final_output_dir = output_dir
+        final_output_dir = os.path.join(output_dir, rel_dir) if rel_dir and rel_dir != '.' else output_dir
+        safe_makedirs(final_output_dir, exist_ok=True, debug=args.debug)
     else:
-        final_output_dir = os.path.dirname(folder_path)
+        final_output_dir = os.path.dirname(abs_folder_path)
 
-    # 保存当前工作目录
-    original_cwd = os.getcwd()
     tmp_dir_path = None
-
     try:
-        # 创建唯一的临时目录
         tmp_dir_path = create_unique_tmp_dir(args.debug)
         if not tmp_dir_path:
             raise Exception("无法创建临时目录")
 
-        # 切换到目标文件夹
-        if not safe_chdir(folder_path, args.debug):
-            raise Exception(f"无法切换到目录: {folder_path}")
-
-        # 获取7z命令开关（使用args.delete以便7z自行处理删除）
         z7_switches = build_7z_switches(args.profile, args.password, args.code_page, args.delete)
-
-        # 构建7z命令
-        z7_cmd = ['7z', 'a']
-        z7_cmd.extend(z7_switches)
-
-        # 压缩到临时目录，使用简化的文件名
         temp_zip_path = os.path.join(tmp_dir_path, "temp_archive.zip")
-        z7_cmd.append(quote_path_for_7z(temp_zip_path))
+        folder_input = build_folder_input_path(abs_folder_path, args.debug)
 
-        # 添加输入通配符，表示当前目录下的所有文件
-        z7_cmd.append('*')
+        z7_cmd = ['7z', 'a', *z7_switches,
+                  quote_path_for_7z(temp_zip_path), folder_input]
 
-        # 将命令列表转换为字符串用于打印
         cmd_str = ' '.join(z7_cmd)
-
-        # 调试输出
         if args.debug:
-            print("=" * 50)
-            print("调试信息 (文件夹):")
-            print(f"- 原始文件夹路径: {folder_path}")
-            print(f"- 基础路径: {base_path}")
-            print(f"- 相对路径: {rel_path}")
-            print(f"- 文件夹名: {folder_name}")
-            print(f"- 临时目录: {tmp_dir_path}")
-            print(f"- 临时ZIP路径: {temp_zip_path}")
-            print(f"- 最终输出目录: {final_output_dir}")
-            print(f"- 当前工作目录: {os.getcwd()}")
-            print(f"- 命令列表: {z7_cmd}")
-            print("=" * 50)
+            print(f"[DEBUG] 7z CMD: {cmd_str}")
 
         if args.dry_run:
             stats.log(f"[DRY-RUN] 将执行: {cmd_str}")
             return
 
         stats.log(f"执行: {cmd_str}")
-
-        # 执行7z命令
         result = execute_7z_command(z7_cmd, args.debug)
 
-        # 输出详细的执行结果（如果开启了调试模式）
-        if args.debug:
-            print("命令执行结果:")
-            print(f"- 返回码: {result.returncode}")
-            print(f"- 标准输出: {result.stdout}")
-            print(f"- 错误输出: {result.stderr}")
+        if result.returncode != 0:
+            stats.add_failure('文件夹', abs_folder_path, result.returncode,
+                              result.stderr or "未知错误", cmd_str)
+            return
 
-        # 切换回原始工作目录
-        safe_chdir(original_cwd, args.debug)
+        final_name = os.path.basename(rel_path)
+        final_zip_file = os.path.join(tmp_dir_path, f"{final_name}.zip")
+        if not safe_move(temp_zip_path, final_zip_file, args.debug):
+            stats.add_failure('文件夹', abs_folder_path, 0, "重命名ZIP失败", cmd_str)
+            return
 
-        # 检查命令执行结果
-        if result.returncode == 0:
-            stats.log(f"成功创建ZIP文件到临时目录")
+        par2_files = []
+        if not args.no_rec:
+            ok, par2_files = process_par2_for_archives([final_zip_file], args.debug)
+            if not ok:
+                stats.add_par2_failure('文件夹', abs_folder_path, [final_zip_file])
 
-            # 在临时目录中重命名文件
-            final_name = os.path.basename(rel_path)
-            temp_zip_file = os.path.join(tmp_dir_path, "temp_archive.zip")
-            final_zip_file = os.path.join(tmp_dir_path, f"{final_name}.zip")
+        target_zip = os.path.join(final_output_dir, f"{final_name}.zip")
+        if not safe_move(final_zip_file, target_zip, args.debug):
+            stats.add_failure('文件夹', abs_folder_path, 0, "移动ZIP失败", cmd_str)
+            return
 
-            if safe_exists(temp_zip_file, args.debug):
-                if safe_move(temp_zip_file, final_zip_file, args.debug):
-                    stats.log(f"成功重命名ZIP文件: temp_archive.zip -> {final_name}.zip")
+        for p in par2_files:
+            safe_move(p, os.path.join(final_output_dir, os.path.basename(p)), args.debug)
 
-                    # 生成PAR2恢复记录（如果需要）
-                    par2_files = []
-                    if not args.no_rec:
-                        par2_success, generated_par2_files = process_par2_for_archives([final_zip_file], args.debug)
-                        if par2_success:
-                            par2_files = generated_par2_files
-                            stats.log(f"成功在临时目录生成PAR2恢复记录")
-                        else:
-                            stats.log(f"警告: PAR2恢复记录生成失败")
-                            stats.add_par2_failure('文件夹', folder_path, [final_zip_file])
+        # 若 -sdel 删除后目录为空则清理
+        if args.delete and is_folder_empty(abs_folder_path):
+            safe_delete_folder(abs_folder_path, args.dry_run)
 
-                    # 移动文件到最终目标位置
-                    target_zip_file = os.path.join(final_output_dir, f"{final_name}.zip")
-
-                    # 移动ZIP文件
-                    if safe_move(final_zip_file, target_zip_file, args.debug):
-                        stats.log(f"成功移动ZIP文件到目标位置: {target_zip_file}")
-                        moved_files = [target_zip_file]
-
-                        # 移动PAR2文件
-                        for par2_file in par2_files:
-                            par2_filename = os.path.basename(par2_file)
-                            target_par2_file = os.path.join(final_output_dir, par2_filename)
-                            if safe_move(par2_file, target_par2_file, args.debug):
-                                stats.log(f"成功移动PAR2文件: {target_par2_file}")
-                            else:
-                                stats.log(f"警告: 移动PAR2文件失败: {par2_file}")
-
-                        # 如果指定了删除选项且7z成功压缩，检查并清理可能残留的空文件夹
-                        # 7z的-sdel会删除文件，但可能不会删除空文件夹
-                        if args.delete:
-                            if safe_exists(folder_path, args.debug):
-                                if is_folder_empty(folder_path):
-                                    if safe_delete_folder(folder_path, args.dry_run):
-                                        stats.log(f"清理残留空文件夹: {folder_path}")
-                                    else:
-                                        stats.log(f"警告: 清理残留空文件夹失败: {folder_path}")
-                                else:
-                                    stats.log(f"文件夹不为空，7z可能未完全处理所有文件: {folder_path}")
-
-                        # 记录成功
-                        stats.add_success('文件夹', folder_path)
-                    else:
-                        stats.log("移动ZIP文件到目标位置失败")
-                        stats.add_failure('文件夹', folder_path, 0, "移动ZIP文件到目标位置失败", cmd_str)
-                else:
-                    stats.log("重命名ZIP文件失败")
-                    stats.add_failure('文件夹', folder_path, 0, "重命名ZIP文件失败", cmd_str)
-            else:
-                stats.log("临时ZIP文件不存在")
-                stats.add_failure('文件夹', folder_path, 0, "临时ZIP文件不存在", cmd_str)
-
-        else:
-            error_msg = f"创建ZIP文件失败，返回码: {result.returncode}"
-            if result.stderr:
-                error_msg += f"\n错误输出: {result.stderr}"
-            stats.log(error_msg)
-            stats.add_failure('文件夹', folder_path, result.returncode, result.stderr or "未知错误", cmd_str)
+        stats.add_success('文件夹', abs_folder_path)
 
     except Exception as e:
-        error_msg = f"执行7z命令时出错: {e}"
-        stats.log(error_msg)
-        stats.add_failure('文件夹', folder_path, -1, str(e), cmd_str if 'cmd_str' in locals() else "未知命令")
+        stats.add_failure('文件夹', abs_folder_path, -1, str(e),
+                          cmd_str if 'cmd_str' in locals() else "未知命令")
         if args.debug:
             import traceback
             traceback.print_exc()
     finally:
-        # 确保无论如何都会切换回原始工作目录
-        try:
-            safe_chdir(original_cwd, args.debug)
-        except Exception as e:
-            print(f"切换回原始工作目录时出错: {e}")
-
-        # 清理临时目录
         if tmp_dir_path:
-            if not cleanup_tmp_dir(tmp_dir_path, args.debug):
-                stats.log(f"警告: 清理临时目录失败: {tmp_dir_path}")
+            cleanup_tmp_dir(tmp_dir_path, args.debug)
+
 
 def signal_handler(signum, frame):
     """信号处理器，用于在程序被中断时清理锁文件"""

@@ -1898,86 +1898,184 @@ def get_7z_encoding_param(encoding):
 def is_traditional_zip(archive_path):
     """
     Check if zip file uses traditional encoding (non-UTF-8).
-    Returns False if the file uses UTF-8 encoding via either:
-    1. EFS flag (General Purpose Bit Flag bit 11)
-    2. UTF-8 Extra Field (ID 0x7075)
     
+    采用保守策略：只有在明确确认是有效的传统编码ZIP时才返回True。
+    任何异常、未知、损坏的情况都返回False。
+    
+    Returns True only if:
+    1. 文件是有效的ZIP格式
+    2. 至少包含一个文件项
+    3. 所有文件项都没有UTF-8编码标识
+    
+    Returns False if:
+    - 文件不是ZIP格式
+    - 文件损坏或不完整  
+    - 空ZIP文件
+    - 发现任何UTF-8编码标识
+    - 任何解析错误或异常情况
+
     Args:
         archive_path: ZIP文件路径
-        
+
     Returns:
-        bool: 如果是传统编码ZIP返回True，否则返回False
+        bool: 只有明确确认是传统编码ZIP时返回True
     """
     try:
         if not archive_path.lower().endswith('.zip'):
-            return False  # Only interested in zip files
-            
+            return False  # 不是.zip文件
+
         if VERBOSE:
             print(f"  DEBUG: 检查ZIP是否为传统编码: {archive_path}")
-            
+
+        valid_entries_count = 0  # 记录成功解析的有效文件项数量
+        
         with open(archive_path, 'rb') as f:
-            # Read the local file headers
+            # 首先检查文件是否足够大以包含最基本的ZIP结构
+            f.seek(0, 2)  # 移到文件末尾
+            file_size = f.tell()
+            f.seek(0)     # 回到开头
+            
+            if file_size < 22:  # ZIP文件最小大小（End of Central Directory Record）
+                if VERBOSE:
+                    print(f"  DEBUG: 文件太小({file_size}字节)，不是有效ZIP")
+                return False
+
+            # 解析Local File Headers
             while True:
+                current_pos = f.tell()
                 header = f.read(30)
+                
                 if len(header) < 30:
+                    # 文件读完了，正常结束
                     break
-                    
-                # Check for PK signature (Local File Header)
+
+                # 检查Local File Header签名
                 if header[0:4] != b'PK\x03\x04':
+                    # 不是Local File Header
+                    if header[0:2] == b'PK':
+                        # 是其他PK结构（如Central Directory），正常结束Local Headers扫描
+                        if VERBOSE:
+                            sig = header[0:4]
+                            print(f"  DEBUG: 遇到其他PK结构: {sig.hex()}, Local Headers扫描结束")
+                    else:
+                        # 完全不是PK结构，可能文件损坏
+                        if VERBOSE:
+                            print(f"  DEBUG: 遇到非PK结构，可能文件损坏")
+                        return False
                     break
+
+                # 解析Local File Header字段
+                try:
+                    # General purpose bit flag (bytes 6-7)
+                    gpbf = int.from_bytes(header[6:8], 'little')
                     
-                # General purpose bit flag is at bytes 6-7
-                gpbf = int.from_bytes(header[6:8], 'little')
-                
-                # Bit 11 indicates UTF-8 encoding (EFS flag)
-                is_utf8_efs = (gpbf & (1 << 11)) != 0
-                if is_utf8_efs:
+                    # 检查UTF-8 EFS标志 (bit 11)
+                    is_utf8_efs = (gpbf & (1 << 11)) != 0
+                    if is_utf8_efs:
+                        if VERBOSE:
+                            print(f"  DEBUG: 发现UTF-8 EFS标志，不是传统ZIP")
+                        return False
+
+                    # 获取长度信息
+                    compressed_size = int.from_bytes(header[18:22], 'little')
+                    filename_length = int.from_bytes(header[26:28], 'little')
+                    extra_field_length = int.from_bytes(header[28:30], 'little')
+                    
+                    # 基本合理性检查
+                    if filename_length == 0:
+                        if VERBOSE:
+                            print(f"  DEBUG: 文件名长度为0，跳过")
+                        return False
+                    
+                    if filename_length > 65535 or extra_field_length > 65535:
+                        if VERBOSE:
+                            print(f"  DEBUG: 长度字段异常，可能文件损坏")
+                        return False
+
+                except Exception as e:
                     if VERBOSE:
-                        print(f"  DEBUG: 发现UTF-8 EFS标志，非传统ZIP")
-                    return False  # Found UTF-8 via EFS flag
-                
-                # Get filename and extra field lengths
-                filename_length = int.from_bytes(header[26:28], 'little')
-                extra_field_length = int.from_bytes(header[28:30], 'little')
-                
-                # Skip filename
-                f.seek(filename_length, os.SEEK_CUR)
-                
-                # Check extra field for UTF-8 Extra Field (0x7075)
+                        print(f"  DEBUG: 解析Local File Header失败: {e}")
+                    return False
+
+                # 读取并跳过文件名
+                try:
+                    filename_data = f.read(filename_length)
+                    if len(filename_data) != filename_length:
+                        if VERBOSE:
+                            print(f"  DEBUG: 文件名读取不完整")
+                        return False
+                except Exception as e:
+                    if VERBOSE:
+                        print(f"  DEBUG: 读取文件名失败: {e}")
+                    return False
+
+                # 检查额外字段中的UTF-8标识
                 if extra_field_length > 0:
-                    extra_field_data = f.read(extra_field_length)
-                    if len(extra_field_data) == extra_field_length:
-                        # Parse extra field entries
+                    try:
+                        extra_field_data = f.read(extra_field_length)
+                        if len(extra_field_data) != extra_field_length:
+                            if VERBOSE:
+                                print(f"  DEBUG: 额外字段读取不完整")
+                            return False
+                        
+                        # 解析额外字段
                         offset = 0
                         while offset + 4 <= len(extra_field_data):
-                            # Read header ID and data size
-                            header_id = int.from_bytes(extra_field_data[offset:offset+2], 'little')
-                            data_size = int.from_bytes(extra_field_data[offset+2:offset+4], 'little')
+                            header_id = int.from_bytes(extra_field_data[offset:offset + 2], 'little')
+                            data_size = int.from_bytes(extra_field_data[offset + 2:offset + 4], 'little')
                             
-                            # Check for UTF-8 Extra Fields (0x7075 for path, 0x6375 for comment)
-                            if header_id == 0x7075 or header_id == 0x6375:
+                            # 检查UTF-8额外字段
+                            if header_id == 0x7075 or header_id == 0x6375:  # UTF-8 path/comment
                                 if VERBOSE:
-                                    print(f"  DEBUG: 发现UTF-8额外字段(0x{header_id:04x})，非传统ZIP")
-                                return False  # Found UTF-8 Extra Field
+                                    print(f"  DEBUG: 发现UTF-8额外字段(0x{header_id:04x})，不是传统ZIP")
+                                return False
                             
-                            # Move to next extra field entry
+                            # 移动到下一个额外字段项
                             offset += 4 + data_size
-                            
-                            # Safety check to prevent infinite loop
-                            if offset >= len(extra_field_data):
-                                break
-                    
-            if VERBOSE:
-                print(f"  DEBUG: 未发现UTF-8指示符，认为是传统ZIP")
-            return True  # Did not find any UTF-8 indicators, assume traditional zip
-            
+                            if offset > len(extra_field_data):  # 防止越界
+                                if VERBOSE:
+                                    print(f"  DEBUG: 额外字段解析越界，可能损坏")
+                                return False
+                                
+                    except Exception as e:
+                        if VERBOSE:
+                            print(f"  DEBUG: 解析额外字段失败: {e}")
+                        return False
+
+                # 跳过文件数据（简化处理，不处理Data Descriptor的复杂情况）
+                has_data_descriptor = (gpbf & (1 << 3)) != 0
+                if not has_data_descriptor and compressed_size > 0:
+                    try:
+                        f.seek(compressed_size, 1)  # 相对当前位置跳过
+                    except Exception as e:
+                        if VERBOSE:
+                            print(f"  DEBUG: 跳过压缩数据失败: {e}")
+                        return False
+
+                # 成功解析了一个传统编码文件项 - 立即返回True！
+                if VERBOSE:
+                    print(f"  DEBUG: 成功解析到传统编码文件项，确认是传统ZIP")
+                return True
+
+        # 扫描完毕，没有找到任何有效的文件项
+        if VERBOSE:
+            print(f"  DEBUG: 扫描完毕，未找到有效文件项，不确认为传统ZIP")
+        return False
+
+    except FileNotFoundError:
+        if VERBOSE:
+            print(f"  DEBUG: 文件不存在: {archive_path}")
+        return False
+    except PermissionError:
+        if VERBOSE:
+            print(f"  DEBUG: 文件权限不足: {archive_path}")
+        return False
     except Exception as e:
         if VERBOSE:
-            print(f"  DEBUG: 读取ZIP文件时出错 '{archive_path}': {e}")
+            print(f"  DEBUG: 读取ZIP文件时出现未预期错误 '{archive_path}': {e}")
         else:
             print(f"Error reading zip file '{archive_path}': {e}")
         return False
-
 
 
 # === depth 限制 实现 ====

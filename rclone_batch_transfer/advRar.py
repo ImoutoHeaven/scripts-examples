@@ -1018,110 +1018,68 @@ def normalize_volume_size(size_str, unit_str):
         # 默认使用原始输入（不应该到达这里，因为profile_type已经验证过）
         return f"{size_str}{unit}"
 
-
-def normalize_folder_path(folder_path, debug=False):
+def prepare_folder_path_for_rar(folder_path, debug=False):
     """
-    标准化文件夹路径，确保末尾有正确的路径分隔符
-
-    Args:
-        folder_path: 文件夹路径
-        debug: 是否输出调试信息
-
-    Returns:
-        str: 标准化后的文件夹路径
+    返回满足 RAR CLI 要求的 **绝对目录路径**，并确保：
+    • Windows: 以反斜杠 '\\' 结尾，且已转换为 8.3 短路径（若可）。
+    • 其他平台: 以正斜杠 '/' 结尾。
     """
-    try:
-        # 获取绝对路径
-        abs_path = safe_abspath(folder_path, debug)
+    abs_path = safe_abspath(folder_path).rstrip('/\\')  # 先去掉现有结尾
+    safe_path = safe_path_for_operation(abs_path, debug)
 
-        # 根据操作系统添加正确的路径分隔符
-        if is_windows():
-            # Windows: 确保末尾有反斜杠
-            if not abs_path.endswith('\\'):
-                abs_path += '\\'
-        else:
-            # Unix/Linux: 确保末尾有正斜杠
-            if not abs_path.endswith('/'):
-                abs_path += '/'
+    if is_windows():
+        if not safe_path.endswith('\\'):
+            safe_path += '\\'
+    else:  # Linux / macOS 等
+        if not safe_path.endswith('/'):
+            safe_path += '/'
 
-        if debug:
-            print(f"标准化文件夹路径: {folder_path} -> {abs_path}")
-
-        return abs_path
-
-    except Exception as e:
-        if debug:
-            print(f"标准化文件夹路径失败 {folder_path}: {e}")
-        return folder_path
+    if debug:
+        print(f"文件夹输入路径已规范化: {folder_path} -> {safe_path}")
+    return safe_path
 
 
-def build_rar_switches(profile, password, delete_files=False, is_folder=False):
-    """构建RAR命令开关参数"""
+def build_rar_switches(profile, password, delete_files=False):
+    """
+    构建 RAR 命令开关参数。
+    变更点：
+    1. 无论何种 profile，统一追加 -ep1 以去除输入路径中高层目录。
+    2. 其余逻辑保持不变。
+    """
     switches = []
 
-    # 添加-ep1参数，去除路径前缀
-    switches.append('-ep1')
-
-    # 如果是文件夹，添加递归选项
-    if is_folder:
-        switches.append('-r')
-
-    # 如果需要删除源文件，添加-df参数
-    # RAR只有在压缩成功时才会执行删除操作，所以这是安全的
+    # 压缩后删除源文件
     if delete_files:
         switches.append('-df')
 
-    # 处理 'store' 和 'parted-XXunit' 配置
+    # profile 逻辑（与旧实现一致）
     if profile.startswith('parted-') or profile == 'store':
         switches.extend([
-            '-m0',  # 仅存储
-            '-md32m',  # 字典大小：32MB
-            '-s-',  # 不使用固实压缩
-            '-htb',  # 使用blake2s校验和
-            '-qo+',  # 为所有文件添加快速打开记录
-            '-oi:1',  # 相同文件保存为引用
-            '-rr5p',  # 添加5%恢复记录
-            '-ma5'  # RAR5格式
+            '-m0', '-md32m', '-s-', '-htb', '-qo+', '-oi:1', '-rr5p', '-ma5'
         ])
-        # 如果是分卷模式，添加分卷大小参数
         if profile.startswith('parted-'):
-            # 支持多种单位格式：g/gb/m/mb/k/kb
             match = re.match(r'^parted-(\d+)(g|gb|m|mb|k|kb)$', profile, re.IGNORECASE)
             if match:
-                size = match.group(1)
-                unit = match.group(2)
-                volume_size = normalize_volume_size(size, unit)
-                switches.append(f'-v{volume_size}')
-    # 处理 'fastest' 配置
+                size, unit = match.groups()
+                switches.append(f'-v{normalize_volume_size(size, unit)}')
     elif profile == 'fastest':
         switches.extend([
-            '-m1',  # 最快压缩
-            '-md256m',  # 字典大小：256MB
-            '-s-',  # 不固实压缩
-            '-htb',  # 使用blake2s校验和
-            '-qo+',  # 为所有文件添加快速打开记录
-            '-oi:1',  # 相同文件保存为引用
-            '-rr5p',  # 添加5%恢复记录
-            '-ma5'  # RAR5格式
+            '-m1', '-md256m', '-s-', '-htb', '-qo+', '-oi:1', '-rr5p', '-ma5'
         ])
-    # 处理 'best' 配置
     else:  # best
         switches.extend([
-            '-m5',  # 最佳压缩
-            '-md256m',  # 字典大小：256MB
-            '-s',  # 固实压缩
-            '-htb',  # 使用blake2s校验和
-            '-qo+',  # 为所有文件添加快速打开记录
-            '-oi:1',  # 相同文件保存为引用
-            '-rr5p',  # 添加5%恢复记录
-            '-ma5'  # RAR5格式
+            '-m5', '-md256m', '-s', '-htb', '-qo+', '-oi:1', '-rr5p', '-ma5'
         ])
 
-    # 添加密码参数
+    # 统一追加 -ep1
+    switches.append('-ep1')
+
+    # 密码
     if password:
-        switches.extend([f'-p{password}', '-hp'])  # -hp选项加密文件头
+        switches.extend([f'-p{password}', '-hp'])
 
     return switches
+
 
 
 def find_and_rename_rar_files(temp_name_prefix, target_name_prefix, search_dir, debug=False):
@@ -1280,326 +1238,133 @@ def safe_delete_folder(folder_path, dry_run=False):
 
 
 def process_file(file_path, args, base_path):
-    """处理单个文件的压缩操作"""
+    """处理单个文件的压缩操作（已移除 cd 逻辑，全部使用绝对路径）"""
     global stats
 
-    # 获取文件名（不含扩展名）
-    file_name = os.path.basename(file_path)
-    name_without_ext = os.path.splitext(file_name)[0]
+    # 绝对路径 & 相对信息
+    abs_file_path = safe_abspath(file_path)
+    rel_path = get_relative_path(abs_file_path, base_path)
+    file_name_no_ext = os.path.splitext(os.path.basename(abs_file_path))[0]
 
-    # 计算相对路径，用于确定输出文件名
-    rel_path = get_relative_path(file_path, base_path)
-    rel_name_without_ext = os.path.splitext(rel_path)[0]
-
-    # 计算最终输出目录
+    # 计算输出目录
     if args.out:
-        # 确保输出目录存在
         output_dir = safe_abspath(args.out)
         safe_makedirs(output_dir, exist_ok=True, debug=args.debug)
-
-        # 计算相对路径的目录部分
         rel_dir = os.path.dirname(rel_path)
-        if rel_dir and rel_dir != '.':
-            # 如果相对路径有目录部分，在输出目录下创建对应的目录结构
-            final_output_dir = os.path.join(output_dir, rel_dir)
-        else:
-            final_output_dir = output_dir
+        final_output_dir = os.path.join(output_dir, rel_dir) if rel_dir and rel_dir != '.' else output_dir
     else:
-        final_output_dir = os.path.dirname(file_path)
+        final_output_dir = os.path.dirname(abs_file_path)
 
-    # 临时文件名前缀（简化为固定名称，因为每个item都有独立的tmp目录）
-    temp_name_prefix = "temp_archive"
-
-    # 保存当前工作目录（用于恢复）
-    original_cwd = os.getcwd()
-
-    # 创建唯一的临时目录
-    temp_dir = create_unique_temp_dir(original_cwd, args.debug)
+    # 创建唯一临时目录
+    temp_dir = create_unique_temp_dir(os.getcwd(), args.debug)
     if not temp_dir:
-        error_msg = "无法创建临时目录"
-        stats.log(error_msg)
-        stats.add_failure('文件', file_path, -1, error_msg, "")
+        stats.add_failure('文件', abs_file_path, -1, "无法创建临时目录", "")
         return
 
     try:
-        # 获取文件的绝对路径
-        abs_file_path = safe_abspath(file_path, args.debug)
+        # 构建 RAR 命令
+        rar_switches = build_rar_switches(args.profile, args.password, args.delete)
+        rar_cmd = [get_rar_command(), 'a', *rar_switches]
 
-        # 获取RAR命令开关（不添加-r参数，因为是单个文件）
-        rar_switches = build_rar_switches(args.profile, args.password, args.delete, is_folder=False)
+        temp_rar_path = os.path.join(temp_dir, "temp_archive.rar")
+        rar_cmd.append(quote_path_for_rar(temp_rar_path))          # 输出
+        rar_cmd.append(quote_path_for_rar(abs_file_path))          # 输入(绝对)
 
-        # 构建RAR命令
-        rar_cmd = [get_rar_command(), 'a']
-        rar_cmd.extend(rar_switches)
-
-        # 计算输出到临时目录的路径（绝对路径）
-        temp_rar_path = os.path.join(temp_dir, f"{temp_name_prefix}.rar")
-
-        # 添加输出路径（使用改进的引用方式）
-        rar_cmd.append(quote_path_for_rar(temp_rar_path))
-
-        # 添加输入文件（使用绝对路径和改进的引用方式）
-        rar_cmd.append(quote_path_for_rar(abs_file_path))
-
-        # 将命令列表转换为字符串用于打印
         cmd_str = ' '.join(rar_cmd)
-
-        # 调试输出
         if args.debug:
-            print("=" * 50)
-            print("调试信息 (文件):")
-            print(f"- 原始文件路径: {file_path}")
-            print(f"- 绝对文件路径: {abs_file_path}")
-            print(f"- 基础路径: {base_path}")
-            print(f"- 相对路径: {rel_path}")
-            print(f"- 文件名: {file_name}")
-            print(f"- 临时目录: {temp_dir}")
-            print(f"- 临时RAR文件前缀: {temp_name_prefix}")
-            print(f"- 最终输出目录: {final_output_dir}")
-            print(f"- 临时RAR路径: {temp_rar_path}")
-            print(f"- 当前工作目录: {os.getcwd()}")
-            print(f"- 命令列表: {rar_cmd}")
-            print(f"- 输入文件引用后: {quote_path_for_rar(abs_file_path)}")
-            print("=" * 50)
+            print(f"[DEBUG] 文件压缩命令: {cmd_str}")
 
         if args.dry_run:
             stats.log(f"[DRY-RUN] 将执行: {cmd_str}")
             return
 
-        stats.log(f"执行: {cmd_str}")
-
-        # 执行RAR命令
         result = execute_rar_command(rar_cmd, args.debug)
 
-        # 输出详细的执行结果（如果开启了调试模式）
-        if args.debug:
-            print("命令执行结果:")
-            print(f"- 返回码: {result.returncode}")
-            print(f"- 标准输出: {result.stdout}")
-            print(f"- 错误输出: {result.stderr}")
-
-        # 检查命令执行结果
         if result.returncode == 0:
-            stats.log(f"成功创建RAR文件到临时目录")
-
-            # 在临时目录中查找并重命名RAR文件（支持分卷）
-            # 使用相对路径的基础名作为最终文件名
+            # 重命名并移动 RAR
             final_name = os.path.splitext(os.path.basename(rel_path))[0]
-            success, moved_files = find_and_rename_rar_files(
-                temp_name_prefix,
-                final_name,
-                temp_dir,
-                args.debug
-            )
-
-            if success:
-                # 将重命名后的文件移动到最终目的地
-                move_success, final_files = move_files_to_final_destination(
-                    temp_dir, final_output_dir, moved_files, args.debug
-                )
-
-                if move_success:
-                    if len(final_files) == 1:
-                        stats.log(f"成功创建RAR文件: {final_files[0]}")
-                    else:
-                        stats.log(f"成功创建RAR分卷文件: {len(final_files)} 个文件")
-                        if args.debug:
-                            for f in final_files:
-                                stats.log(f"  - {f}")
-
-                    # RAR的-df参数已经处理了文件删除，这里不需要额外操作
-                    # 记录成功
-                    stats.add_success('文件', file_path)
+            ok_rename, moved = find_and_rename_rar_files("temp_archive", final_name, temp_dir, args.debug)
+            if ok_rename:
+                ok_move, finals = move_files_to_final_destination(temp_dir, final_output_dir, moved, args.debug)
+                if ok_move:
+                    stats.add_success('文件', abs_file_path)
                 else:
-                    stats.log("移动RAR文件到最终位置失败")
-                    stats.add_failure('文件', file_path, 0, "移动RAR文件到最终位置失败", cmd_str)
+                    stats.add_failure('文件', abs_file_path, 0, "移动RAR到最终目录失败", cmd_str)
             else:
-                stats.log("重命名RAR文件失败")
-                stats.add_failure('文件', file_path, 0, "重命名RAR文件失败", cmd_str)
-
+                stats.add_failure('文件', abs_file_path, 0, "重命名RAR失败", cmd_str)
         else:
-            error_msg = f"创建RAR文件失败，返回码: {result.returncode}"
-            if result.stderr:
-                error_msg += f"\n错误输出: {result.stderr}"
-            stats.log(error_msg)
-            stats.add_failure('文件', file_path, result.returncode, result.stderr or "未知错误", cmd_str)
-
-    except Exception as e:
-        error_msg = f"执行RAR命令时出错: {e}"
-        stats.log(error_msg)
-        stats.add_failure('文件', file_path, -1, str(e), cmd_str)
-        if args.debug:
-            import traceback
-            traceback.print_exc()
+            stats.add_failure('文件', abs_file_path, result.returncode,
+                              result.stderr or "未知错误", cmd_str)
     finally:
-        # 清理临时目录
         cleanup_temp_dir(temp_dir, args.debug)
 
+
 def process_folder(folder_path, args, base_path):
-    """处理单个文件夹的压缩操作"""
+    """处理文件夹压缩（已移除 cd 逻辑，使用绝对路径 + -r）"""
     global stats
 
-    # 新增：检查 --ext-skip-folder-tree 参数
+    # 跳过规则保持不变
     if args.ext_skip_folder_tree and args.skip_extensions and not args.skip_folders:
         if folder_contains_skip_extensions(folder_path, args.skip_extensions, args.debug):
-            skip_msg = f"跳过包含指定扩展名文件的文件夹: {folder_path}"
-            stats.log(skip_msg)
-            print(skip_msg)
+            stats.log(f"跳过包含指定扩展名文件的文件夹: {folder_path}")
             return
 
-    # 获取文件夹名称
-    folder_name = os.path.basename(folder_path)
-
-    # 计算相对路径
     rel_path = get_relative_path(folder_path, base_path)
 
-    # 计算最终输出目录
+    # 输出目录
     if args.out:
-        # 确保输出目录存在
         output_dir = safe_abspath(args.out)
         safe_makedirs(output_dir, exist_ok=True, debug=args.debug)
-
-        # 计算相对路径的目录部分
         rel_dir = os.path.dirname(rel_path)
-        if rel_dir and rel_dir != '.':
-            # 如果相对路径有目录部分，在输出目录下创建对应的目录结构
-            final_output_dir = os.path.join(output_dir, rel_dir)
-        else:
-            final_output_dir = output_dir
+        final_output_dir = os.path.join(output_dir, rel_dir) if rel_dir and rel_dir != '.' else output_dir
     else:
         final_output_dir = os.path.dirname(folder_path)
 
-    # 临时文件名前缀
-    temp_name_prefix = "temp_archive"
-
-    # 保存当前工作目录（用于恢复）
-    original_cwd = os.getcwd()
-
-    # 创建唯一的临时目录
-    temp_dir = create_unique_temp_dir(original_cwd, args.debug)
+    temp_dir = create_unique_temp_dir(os.getcwd(), args.debug)
     if not temp_dir:
-        error_msg = "无法创建临时目录"
-        stats.log(error_msg)
-        stats.add_failure('文件夹', folder_path, -1, error_msg, "")
+        stats.add_failure('文件夹', folder_path, -1, "无法创建临时目录", "")
         return
 
     try:
-        # 获取文件夹的标准化绝对路径（确保末尾有路径分隔符）
-        abs_folder_path = normalize_folder_path(folder_path, args.debug)
+        rar_switches = build_rar_switches(args.profile, args.password, args.delete)
+        rar_switches.insert(0, '-r')  # 文件夹需递归
 
-        # 获取RAR命令开关，对于文件夹需要添加-r选项
-        rar_switches = build_rar_switches(args.profile, args.password, args.delete, is_folder=True)
+        rar_cmd = [get_rar_command(), 'a', *rar_switches]
 
-        # 构建RAR命令
-        rar_cmd = [get_rar_command(), 'a']
-        rar_cmd.extend(rar_switches)
+        temp_rar_path = os.path.join(temp_dir, "temp_archive.rar")
+        rar_cmd.append(quote_path_for_rar(temp_rar_path))                   # 输出
+        folder_input = prepare_folder_path_for_rar(folder_path, args.debug)
+        rar_cmd.append(quote_path_for_rar(folder_input))                    # 输入(绝对 + 尾部分隔)
 
-        # 计算输出到临时目录的路径（绝对路径）
-        temp_rar_path = os.path.join(temp_dir, f"{temp_name_prefix}.rar")
-
-        # 添加输出路径（使用改进的引用方式）
-        rar_cmd.append(quote_path_for_rar(temp_rar_path))
-
-        # 添加输入文件夹（使用标准化的绝对路径和改进的引用方式）
-        rar_cmd.append(quote_path_for_rar(abs_folder_path))
-
-        # 将命令列表转换为字符串用于打印
         cmd_str = ' '.join(rar_cmd)
-
-        # 调试输出
         if args.debug:
-            print("=" * 50)
-            print("调试信息 (文件夹):")
-            print(f"- 原始文件夹路径: {folder_path}")
-            print(f"- 标准化绝对文件夹路径: {abs_folder_path}")
-            print(f"- 基础路径: {base_path}")
-            print(f"- 相对路径: {rel_path}")
-            print(f"- 文件夹名: {folder_name}")
-            print(f"- 临时目录: {temp_dir}")
-            print(f"- 临时RAR文件前缀: {temp_name_prefix}")
-            print(f"- 最终输出目录: {final_output_dir}")
-            print(f"- 临时RAR路径: {temp_rar_path}")
-            print(f"- 当前工作目录: {os.getcwd()}")
-            print(f"- 命令列表: {rar_cmd}")
-            print(f"- 输入文件夹引用后: {quote_path_for_rar(abs_folder_path)}")
-            print("=" * 50)
+            print(f"[DEBUG] 文件夹压缩命令: {cmd_str}")
 
         if args.dry_run:
             stats.log(f"[DRY-RUN] 将执行: {cmd_str}")
             return
 
-        stats.log(f"执行: {cmd_str}")
-
-        # 执行RAR命令
         result = execute_rar_command(rar_cmd, args.debug)
 
-        # 输出详细的执行结果（如果开启了调试模式）
-        if args.debug:
-            print("命令执行结果:")
-            print(f"- 返回码: {result.returncode}")
-            print(f"- 标准输出: {result.stdout}")
-            print(f"- 错误输出: {result.stderr}")
-
-        # 检查命令执行结果
         if result.returncode == 0:
-            stats.log(f"成功创建RAR文件到临时目录")
-
-            # 在临时目录中查找并重命名RAR文件（支持分卷）
-            # 使用相对路径的基础名作为最终文件名
             final_name = os.path.basename(rel_path)
-            success, moved_files = find_and_rename_rar_files(
-                temp_name_prefix,
-                final_name,
-                temp_dir,
-                args.debug
-            )
-
-            if success:
-                # 将重命名后的文件移动到最终目的地
-                move_success, final_files = move_files_to_final_destination(
-                    temp_dir, final_output_dir, moved_files, args.debug
-                )
-
-                if move_success:
-                    if len(final_files) == 1:
-                        stats.log(f"成功创建RAR文件: {final_files[0]}")
-                    else:
-                        stats.log(f"成功创建RAR分卷文件: {len(final_files)} 个文件")
-                        if args.debug:
-                            for f in final_files:
-                                stats.log(f"  - {f}")
-
-                    # RAR的-df参数已经删除了文件夹内的文件
-                    # 如果指定了删除选项，需要检查并删除可能剩余的空文件夹
+            ok_rename, moved = find_and_rename_rar_files("temp_archive", final_name, temp_dir, args.debug)
+            if ok_rename:
+                ok_move, finals = move_files_to_final_destination(temp_dir, final_output_dir, moved, args.debug)
+                if ok_move:
                     if args.delete:
                         safe_delete_folder(folder_path, args.dry_run)
-
-                    # 记录成功
                     stats.add_success('文件夹', folder_path)
                 else:
-                    stats.log("移动RAR文件到最终位置失败")
-                    stats.add_failure('文件夹', folder_path, 0, "移动RAR文件到最终位置失败", cmd_str)
+                    stats.add_failure('文件夹', folder_path, 0, "移动RAR到最终目录失败", cmd_str)
             else:
-                stats.log("重命名RAR文件失败")
-                stats.add_failure('文件夹', folder_path, 0, "重命名RAR文件失败", cmd_str)
-
+                stats.add_failure('文件夹', folder_path, 0, "重命名RAR失败", cmd_str)
         else:
-            error_msg = f"创建RAR文件失败，返回码: {result.returncode}"
-            if result.stderr:
-                error_msg += f"\n错误输出: {result.stderr}"
-            stats.log(error_msg)
-            stats.add_failure('文件夹', folder_path, result.returncode, result.stderr or "未知错误", cmd_str)
-
-    except Exception as e:
-        error_msg = f"执行RAR命令时出错: {e}"
-        stats.log(error_msg)
-        stats.add_failure('文件夹', folder_path, -1, str(e), cmd_str)
-        if args.debug:
-            import traceback
-            traceback.print_exc()
+            stats.add_failure('文件夹', folder_path, result.returncode,
+                              result.stderr or "未知错误", cmd_str)
     finally:
-        # 清理临时目录
         cleanup_temp_dir(temp_dir, args.debug)
+
 
 
 def signal_handler(signum, frame):

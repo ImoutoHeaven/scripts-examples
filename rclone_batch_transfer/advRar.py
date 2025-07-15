@@ -1019,9 +1019,52 @@ def normalize_volume_size(size_str, unit_str):
         return f"{size_str}{unit}"
 
 
-def build_rar_switches(profile, password, delete_files=False):
+def normalize_folder_path(folder_path, debug=False):
+    """
+    标准化文件夹路径，确保末尾有正确的路径分隔符
+
+    Args:
+        folder_path: 文件夹路径
+        debug: 是否输出调试信息
+
+    Returns:
+        str: 标准化后的文件夹路径
+    """
+    try:
+        # 获取绝对路径
+        abs_path = safe_abspath(folder_path, debug)
+
+        # 根据操作系统添加正确的路径分隔符
+        if is_windows():
+            # Windows: 确保末尾有反斜杠
+            if not abs_path.endswith('\\'):
+                abs_path += '\\'
+        else:
+            # Unix/Linux: 确保末尾有正斜杠
+            if not abs_path.endswith('/'):
+                abs_path += '/'
+
+        if debug:
+            print(f"标准化文件夹路径: {folder_path} -> {abs_path}")
+
+        return abs_path
+
+    except Exception as e:
+        if debug:
+            print(f"标准化文件夹路径失败 {folder_path}: {e}")
+        return folder_path
+
+
+def build_rar_switches(profile, password, delete_files=False, is_folder=False):
     """构建RAR命令开关参数"""
     switches = []
+
+    # 添加-ep1参数，去除路径前缀
+    switches.append('-ep1')
+
+    # 如果是文件夹，添加递归选项
+    if is_folder:
+        switches.append('-r')
 
     # 如果需要删除源文件，添加-df参数
     # RAR只有在压缩成功时才会执行删除操作，所以这是安全的
@@ -1241,7 +1284,6 @@ def process_file(file_path, args, base_path):
     global stats
 
     # 获取文件名（不含扩展名）
-    file_dir = os.path.dirname(file_path)
     file_name = os.path.basename(file_path)
     name_without_ext = os.path.splitext(file_name)[0]
 
@@ -1263,12 +1305,12 @@ def process_file(file_path, args, base_path):
         else:
             final_output_dir = output_dir
     else:
-        final_output_dir = file_dir
+        final_output_dir = os.path.dirname(file_path)
 
     # 临时文件名前缀（简化为固定名称，因为每个item都有独立的tmp目录）
     temp_name_prefix = "temp_archive"
 
-    # 保存当前工作目录
+    # 保存当前工作目录（用于恢复）
     original_cwd = os.getcwd()
 
     # 创建唯一的临时目录
@@ -1280,12 +1322,11 @@ def process_file(file_path, args, base_path):
         return
 
     try:
-        # 切换到文件所在目录
-        if not safe_chdir(file_dir, args.debug):
-            raise Exception(f"无法切换到目录: {file_dir}")
+        # 获取文件的绝对路径
+        abs_file_path = safe_abspath(file_path, args.debug)
 
-        # 获取RAR命令开关（恢复使用-df参数）
-        rar_switches = build_rar_switches(args.profile, args.password, args.delete)
+        # 获取RAR命令开关（不添加-r参数，因为是单个文件）
+        rar_switches = build_rar_switches(args.profile, args.password, args.delete, is_folder=False)
 
         # 构建RAR命令
         rar_cmd = [get_rar_command(), 'a']
@@ -1297,8 +1338,8 @@ def process_file(file_path, args, base_path):
         # 添加输出路径（使用改进的引用方式）
         rar_cmd.append(quote_path_for_rar(temp_rar_path))
 
-        # 添加输入文件（使用改进的引用方式）
-        rar_cmd.append(quote_path_for_rar(file_name))
+        # 添加输入文件（使用绝对路径和改进的引用方式）
+        rar_cmd.append(quote_path_for_rar(abs_file_path))
 
         # 将命令列表转换为字符串用于打印
         cmd_str = ' '.join(rar_cmd)
@@ -1308,6 +1349,7 @@ def process_file(file_path, args, base_path):
             print("=" * 50)
             print("调试信息 (文件):")
             print(f"- 原始文件路径: {file_path}")
+            print(f"- 绝对文件路径: {abs_file_path}")
             print(f"- 基础路径: {base_path}")
             print(f"- 相对路径: {rel_path}")
             print(f"- 文件名: {file_name}")
@@ -1317,7 +1359,7 @@ def process_file(file_path, args, base_path):
             print(f"- 临时RAR路径: {temp_rar_path}")
             print(f"- 当前工作目录: {os.getcwd()}")
             print(f"- 命令列表: {rar_cmd}")
-            print(f"- 输入文件引用后: {quote_path_for_rar(file_name)}")
+            print(f"- 输入文件引用后: {quote_path_for_rar(abs_file_path)}")
             print("=" * 50)
 
         if args.dry_run:
@@ -1335,9 +1377,6 @@ def process_file(file_path, args, base_path):
             print(f"- 返回码: {result.returncode}")
             print(f"- 标准输出: {result.stdout}")
             print(f"- 错误输出: {result.stderr}")
-
-        # 切换回原始工作目录
-        safe_chdir(original_cwd, args.debug)
 
         # 检查命令执行结果
         if result.returncode == 0:
@@ -1393,12 +1432,6 @@ def process_file(file_path, args, base_path):
             import traceback
             traceback.print_exc()
     finally:
-        # 确保无论如何都会切换回原始工作目录
-        try:
-            safe_chdir(original_cwd, args.debug)
-        except Exception as e:
-            print(f"切换回原始工作目录时出错: {e}")
-
         # 清理临时目录
         cleanup_temp_dir(temp_dir, args.debug)
 
@@ -1439,7 +1472,7 @@ def process_folder(folder_path, args, base_path):
     # 临时文件名前缀
     temp_name_prefix = "temp_archive"
 
-    # 保存当前工作目录
+    # 保存当前工作目录（用于恢复）
     original_cwd = os.getcwd()
 
     # 创建唯一的临时目录
@@ -1451,13 +1484,11 @@ def process_folder(folder_path, args, base_path):
         return
 
     try:
-        # 切换到目标文件夹
-        if not safe_chdir(folder_path, args.debug):
-            raise Exception(f"无法切换到目录: {folder_path}")
+        # 获取文件夹的标准化绝对路径（确保末尾有路径分隔符）
+        abs_folder_path = normalize_folder_path(folder_path, args.debug)
 
-        # 获取RAR命令开关，对于文件夹需要添加-r选项（恢复使用-df参数）
-        rar_switches = build_rar_switches(args.profile, args.password, args.delete)
-        rar_switches.insert(0, '-r')  # 在开头添加递归选项
+        # 获取RAR命令开关，对于文件夹需要添加-r选项
+        rar_switches = build_rar_switches(args.profile, args.password, args.delete, is_folder=True)
 
         # 构建RAR命令
         rar_cmd = [get_rar_command(), 'a']
@@ -1469,8 +1500,8 @@ def process_folder(folder_path, args, base_path):
         # 添加输出路径（使用改进的引用方式）
         rar_cmd.append(quote_path_for_rar(temp_rar_path))
 
-        # 添加输入通配符，表示当前目录下的所有文件
-        rar_cmd.append('*')
+        # 添加输入文件夹（使用标准化的绝对路径和改进的引用方式）
+        rar_cmd.append(quote_path_for_rar(abs_folder_path))
 
         # 将命令列表转换为字符串用于打印
         cmd_str = ' '.join(rar_cmd)
@@ -1480,6 +1511,7 @@ def process_folder(folder_path, args, base_path):
             print("=" * 50)
             print("调试信息 (文件夹):")
             print(f"- 原始文件夹路径: {folder_path}")
+            print(f"- 标准化绝对文件夹路径: {abs_folder_path}")
             print(f"- 基础路径: {base_path}")
             print(f"- 相对路径: {rel_path}")
             print(f"- 文件夹名: {folder_name}")
@@ -1489,6 +1521,7 @@ def process_folder(folder_path, args, base_path):
             print(f"- 临时RAR路径: {temp_rar_path}")
             print(f"- 当前工作目录: {os.getcwd()}")
             print(f"- 命令列表: {rar_cmd}")
+            print(f"- 输入文件夹引用后: {quote_path_for_rar(abs_folder_path)}")
             print("=" * 50)
 
         if args.dry_run:
@@ -1506,9 +1539,6 @@ def process_folder(folder_path, args, base_path):
             print(f"- 返回码: {result.returncode}")
             print(f"- 标准输出: {result.stdout}")
             print(f"- 错误输出: {result.stderr}")
-
-        # 切换回原始工作目录
-        safe_chdir(original_cwd, args.debug)
 
         # 检查命令执行结果
         if result.returncode == 0:
@@ -1568,12 +1598,6 @@ def process_folder(folder_path, args, base_path):
             import traceback
             traceback.print_exc()
     finally:
-        # 确保无论如何都会切换回原始工作目录
-        try:
-            safe_chdir(original_cwd, args.debug)
-        except Exception as e:
-            print(f"切换回原始工作目录时出错: {e}")
-
         # 清理临时目录
         cleanup_temp_dir(temp_dir, args.debug)
 

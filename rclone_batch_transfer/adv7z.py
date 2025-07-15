@@ -146,6 +146,41 @@ lock_handle = None
 lock_owner = False
 
 
+def run_tasks_concurrently(items, args, base_path):
+    """
+    使用 ThreadPoolExecutor 并发执行文件/文件夹压缩任务。
+    捕获 Ctrl+C / SIGTERM 等中断，确保线程池被正确关闭。
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _dispatch(path, item_type):
+        if item_type == 'file':
+            process_file(path, args, base_path)
+        else:
+            process_folder(path, args, base_path)
+
+    futures = []
+    total = len(items['files']) + len(items['folders'])
+    print(f"并发模式: 启动 {args.threads} 个工作线程，任务总数 {total}")
+
+    with ThreadPoolExecutor(max_workers=args.threads) as executor:
+        # 提交任务
+        for p in items['files']:
+            futures.append(executor.submit(_dispatch, p, 'file'))
+        for p in items['folders']:
+            futures.append(executor.submit(_dispatch, p, 'folder'))
+
+        try:
+            for fut in as_completed(futures):
+                # 触发异常重抛，便于主线程感知
+                fut.result()
+        except KeyboardInterrupt:
+            print("\n检测到用户中断，正在取消剩余任务 ...")
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+
+
+
 def create_unique_tmp_dir(base_dir, debug=False):
     """
     在指定基础目录中创建唯一的临时目录
@@ -1066,18 +1101,27 @@ def is_parted_profile(profile):
 
 
 def parse_arguments():
-    """解析命令行参数"""
-    parser = argparse.ArgumentParser(description='7z压缩工具（含PAR2恢复记录）')
+    """解析命令行参数（新增 --threads 选项）"""
+    parser = argparse.ArgumentParser(description='7z压缩工具（含PAR2恢复记录，多线程支持）')
     parser.add_argument('folder_path', help='要处理的文件夹路径')
+
+    # 并发线程数（新增）
+    parser.add_argument(
+        '-t', '--threads',
+        type=int,
+        default=1,
+        help='同时进行压缩的任务数 (默认: 1)'
+    )
+
     parser.add_argument('--dry-run', action='store_true', help='仅预览操作，不执行实际命令')
     parser.add_argument('--depth', type=int, default=0, help='压缩处理的深度级别 (0, 1, 2, ...)')
     parser.add_argument('-p', '--password', help='设置压缩包密码')
     parser.add_argument('-d', '--delete', action='store_true', help='压缩成功后删除原文件/文件夹')
     parser.add_argument(
         '--profile',
-        type=profile_type,  # 使用自定义验证函数
+        type=profile_type,
         default='best',
-        help="压缩配置文件: 'store', 'best', 'fastest', 或 'parted-XXunit' (例如: 'parted-10g', 'parted-100mb', 'parted-500k')"
+        help="压缩配置文件: 'store', 'best', 'fastest', 或 'parted-XXunit' (例如: 'parted-10g')"
     )
     parser.add_argument('--debug', action='store_true', help='显示调试信息')
     parser.add_argument('--no-lock', action='store_true', help='不使用全局锁（谨慎使用）')
@@ -1086,33 +1130,30 @@ def parse_arguments():
     parser.add_argument('--no-emb', action='store_true', help='生成独立的PAR2文件，不嵌入到7z文件中')
     parser.add_argument('--no-rec', action='store_true', help='不生成PAR2恢复记录（跳过parpar工具检查）')
 
-    # 新增的过滤参数
+    # 过滤相关
     parser.add_argument('--skip-files', action='store_true', help='跳过文件，仅处理文件夹')
     parser.add_argument('--skip-folders', action='store_true', help='跳过文件夹，仅处理文件')
-
-    # 新增：文件夹树过滤参数
     parser.add_argument('--ext-skip-folder-tree', action='store_true',
                         help='当指定--skip-${ext}参数时，跳过包含对应扩展名文件的整个文件夹')
 
     args, unknown = parser.parse_known_args()
 
-    # 处理 --skip-ext 类型的参数
+    # 处理 --skip-<ext>
     skip_extensions = []
     for arg in unknown:
         if arg.startswith('--skip-'):
-            ext = arg[7:]  # 移除 '--skip-' 前缀
-            if ext:  # 确保扩展名不为空
-                skip_extensions.append(ext.lower())  # 转为小写以便不区分大小写比较
+            ext = arg[7:]
+            if ext:
+                skip_extensions.append(ext.lower())
             else:
                 print(f"警告: 忽略无效的跳过参数: {arg}")
         else:
             print(f"错误: 未知参数: {arg}")
             sys.exit(1)
 
-    # 将跳过的扩展名添加到args对象中
     args.skip_extensions = skip_extensions
-
     return args
+
 
 
 def is_windows():
@@ -1491,12 +1532,10 @@ def process_file(file_path, args, base_path):
     file_name = os.path.basename(file_path)
     rel_path = get_relative_path(file_path, base_path)
 
-    # 目标输出目录
     final_target_dir = safe_abspath(args.out) if args.out else file_dir
     safe_makedirs(final_target_dir, exist_ok=True, debug=args.debug)
 
-    original_cwd = os.getcwd()  # 记录但不修改
-    tmp_dir = create_unique_tmp_dir(original_cwd, args.debug)
+    tmp_dir = create_unique_tmp_dir(os.getcwd(), args.debug)
     if not tmp_dir:
         stats.add_failure('文件', file_path, -1, '创建临时目录失败', '')
         return
@@ -1505,41 +1544,48 @@ def process_file(file_path, args, base_path):
         z7_switches = build_7z_switches(args.profile, args.password, args.delete)
         temp_archive_path = os.path.join(tmp_dir, 'temp_archive.7z')
 
-        z7_cmd = ['7z', 'a', *z7_switches, quote_path_for_7z(temp_archive_path), quote_path_for_7z(file_path)]
+        z7_cmd = ['7z', 'a', *z7_switches,
+                  quote_path_for_7z(temp_archive_path),
+                  quote_path_for_7z(file_path)]
         cmd_str = ' '.join(z7_cmd)
         if args.debug:
             print(f"执行命令: {cmd_str}")
         if args.dry_run:
-            stats.log(f"[DRY-RUN] {cmd_str}"); return
+            stats.log(f"[DRY-RUN] {cmd_str}")
+            return
 
         result = execute_7z_command(z7_cmd, args.debug)
         if result.returncode != 0:
-            stats.add_failure('文件', file_path, result.returncode, result.stderr or '未知错误', cmd_str)
+            stats.add_failure('文件', file_path, result.returncode,
+                              result.stderr or '未知错误', cmd_str)
             return
 
-        # 后续逻辑（重命名/生成 PAR2/移动）保持不变
         final_name = os.path.splitext(os.path.basename(rel_path))[0]
-        success, renamed_files = find_and_rename_7z_files('temp_archive', final_name, tmp_dir, args.debug)
+        success, renamed_files = find_and_rename_7z_files(
+            'temp_archive', final_name, tmp_dir, args.debug)
         if not (success and renamed_files):
-            stats.add_failure('文件', file_path, 0, '重命名7z文件失败', cmd_str); return
+            stats.add_failure('文件', file_path, 0, '重命名7z文件失败', cmd_str)
+            return
 
         all_files_to_move = renamed_files[:]
         if not args.no_rec:
             embed_par2 = not (is_parted_profile(args.profile) or args.no_emb)
-            par2_success, par2_files = process_par2_for_archives(renamed_files, embed_par2, args.debug)
+            par2_success, par2_files = process_par2_for_archives(
+                renamed_files, embed_par2, args.debug)
             if not par2_success:
                 stats.add_par2_failure('文件', file_path, renamed_files)
             else:
                 all_files_to_move.extend(par2_files)
 
-        moved, _ = move_files_to_final_destination(all_files_to_move, final_target_dir, rel_path, args.debug)
+        moved, _ = move_files_to_final_destination(
+            all_files_to_move, final_target_dir, rel_path, args.debug)
         if moved:
             stats.add_success('文件', file_path)
         else:
             stats.add_failure('文件', file_path, 0, '移动文件失败', cmd_str)
     finally:
-        safe_chdir(original_cwd, args.debug)
         cleanup_tmp_dir(tmp_dir, args.debug)
+
 
 
 def process_folder(folder_path, args, base_path):
@@ -1549,8 +1595,7 @@ def process_folder(folder_path, args, base_path):
     final_target_dir = safe_abspath(args.out) if args.out else os.path.dirname(folder_path)
     safe_makedirs(final_target_dir, exist_ok=True, debug=args.debug)
 
-    original_cwd = os.getcwd()
-    tmp_dir = create_unique_tmp_dir(original_cwd, args.debug)
+    tmp_dir = create_unique_tmp_dir(os.getcwd(), args.debug)
     if not tmp_dir:
         stats.add_failure('文件夹', folder_path, -1, '创建临时目录失败', '')
         return
@@ -1558,34 +1603,42 @@ def process_folder(folder_path, args, base_path):
     try:
         z7_switches = build_7z_switches(args.profile, args.password, args.delete)
         temp_archive_path = os.path.join(tmp_dir, 'temp_archive.7z')
-        wildcard_input = os.path.join(folder_path, '*')  # Windows -> '\*' | Linux -> '/*'
-        z7_cmd = ['7z', 'a', *z7_switches, quote_path_for_7z(temp_archive_path), quote_path_for_7z(wildcard_input)]
+        wildcard_input = os.path.join(folder_path, '*')
+        z7_cmd = ['7z', 'a', *z7_switches,
+                  quote_path_for_7z(temp_archive_path),
+                  quote_path_for_7z(wildcard_input)]
         cmd_str = ' '.join(z7_cmd)
         if args.debug:
             print(f"执行命令: {cmd_str}")
         if args.dry_run:
-            stats.log(f"[DRY-RUN] {cmd_str}"); return
+            stats.log(f"[DRY-RUN] {cmd_str}")
+            return
 
         result = execute_7z_command(z7_cmd, args.debug)
         if result.returncode != 0:
-            stats.add_failure('文件夹', folder_path, result.returncode, result.stderr or '未知错误', cmd_str)
+            stats.add_failure('文件夹', folder_path, result.returncode,
+                              result.stderr or '未知错误', cmd_str)
             return
 
         final_name = os.path.basename(rel_path)
-        success, renamed_files = find_and_rename_7z_files('temp_archive', final_name, tmp_dir, args.debug)
+        success, renamed_files = find_and_rename_7z_files(
+            'temp_archive', final_name, tmp_dir, args.debug)
         if not (success and renamed_files):
-            stats.add_failure('文件夹', folder_path, 0, '重命名7z文件失败', cmd_str); return
+            stats.add_failure('文件夹', folder_path, 0, '重命名7z文件失败', cmd_str)
+            return
 
         all_files_to_move = renamed_files[:]
         if not args.no_rec:
             embed_par2 = not (is_parted_profile(args.profile) or args.no_emb)
-            par2_success, par2_files = process_par2_for_archives(renamed_files, embed_par2, args.debug)
+            par2_success, par2_files = process_par2_for_archives(
+                renamed_files, embed_par2, args.debug)
             if not par2_success:
                 stats.add_par2_failure('文件夹', folder_path, renamed_files)
             else:
                 all_files_to_move.extend(par2_files)
 
-        moved, _ = move_files_to_final_destination(all_files_to_move, final_target_dir, rel_path, args.debug)
+        moved, _ = move_files_to_final_destination(
+            all_files_to_move, final_target_dir, rel_path, args.debug)
         if moved:
             if args.delete:
                 safe_delete_folder(folder_path, args.dry_run)
@@ -1593,8 +1646,8 @@ def process_folder(folder_path, args, base_path):
         else:
             stats.add_failure('文件夹', folder_path, 0, '移动文件失败', cmd_str)
     finally:
-        safe_chdir(original_cwd, args.debug)
         cleanup_tmp_dir(tmp_dir, args.debug)
+
 
 def signal_handler(signum, frame):
     """信号处理器，用于在程序被中断时清理锁文件"""
@@ -1781,25 +1834,21 @@ def main():
         # 获取基础路径（用于计算相对路径）
         base_path = safe_abspath(args.folder_path)
 
-        # 处理每个找到的文件
-        for i, file_path in enumerate(items['files'], 1):
-            progress_msg = f"\n[{i}/{len(items['files'])}] 处理文件: {file_path}"
-            stats.log(progress_msg)
-            print(progress_msg)
-            process_file(file_path, args, base_path)
+        # 根据线程数选择执行模式
+        if args.threads > 1:
+            run_tasks_concurrently(items, args, base_path)
+        else:
+            # 顺序执行（与旧版保持一致）
+            for i, file_path in enumerate(items['files'], 1):
+                print(f"\n[{i}/{len(items['files'])}] 处理文件: {file_path}")
+                process_file(file_path, args, base_path)
 
-        # 处理每个找到的文件夹
-        for i, folder_path in enumerate(items['folders'], 1):
-            progress_msg = f"\n[{i}/{len(items['folders'])}] 处理文件夹: {folder_path}"
-            stats.log(progress_msg)
-            print(progress_msg)
-            process_folder(folder_path, args, base_path)
+            for i, folder_path in enumerate(items['folders'], 1):
+                print(f"\n[{i}/{len(items['folders'])}] 处理文件夹: {folder_path}")
+                process_folder(folder_path, args, base_path)
 
     finally:
-        # 打印最终统计信息
         stats.print_final_stats()
-
-        # 确保释放锁（如果已获取）
         if lock_acquired:
             release_lock()
             stats.log("已释放全局锁")

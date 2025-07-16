@@ -858,6 +858,9 @@ class ArchiveProcessor:
         elif self.args.decompress_policy == 'only-file-content':
             apply_only_file_content_policy(tmp_dir, final_output_dir, archive_base_name, unique_suffix)
 
+        elif self.args.decompress_policy == 'only-file-content-direct':
+            apply_only_file_content_direct_policy(tmp_dir, final_output_dir, archive_base_name, unique_suffix)
+
         elif self.args.decompress_policy == 'file-content-with-folder':
             apply_file_content_with_folder_policy(tmp_dir, final_output_dir, archive_base_name, unique_suffix)
 
@@ -868,6 +871,8 @@ class ArchiveProcessor:
             # N-collect policy
             threshold = int(self.args.decompress_policy.split('-')[0])
             self.apply_collect_policy(tmp_dir, final_output_dir, archive_base_name, threshold, unique_suffix)
+
+
 
     def apply_separate_policy(self, tmp_dir, output_dir, archive_name, unique_suffix):
         """Apply separate decompress policy following exact specification."""
@@ -3406,6 +3411,9 @@ def find_file_content(tmp_dir, debug=False):
     return result
 
 
+
+
+
 def apply_only_file_content_policy(tmp_dir, output_dir, archive_name, unique_suffix):
     """
     应用only-file-content策略
@@ -3679,6 +3687,85 @@ def apply_file_content_with_folder_separate_policy(tmp_dir, output_dir, archive_
             safe_rmtree(content_dir, VERBOSE)
             
 
+def apply_only_file_content_direct_policy(tmp_dir, output_dir, archive_name, unique_suffix):
+    """
+    “only-file-content-direct” 策略：
+    1. 抽取 file_content（与 only-file-content 相同逻辑）
+    2. 若将 file_content 直接合并进 output_dir 时 **任意文件** 会冲突，则回退到 only-file-content 策略
+       （文件冲突判定：content_dir 中的文件与 output_dir 中同相对路径已有文件重名）
+       目录同名但内部文件不冲突视为可合并
+    3. 无冲突时，递归移动/合并所有内容到 output_dir
+    """
+    if VERBOSE:
+        print(f"  DEBUG: 应用only-file-content-direct策略")
+
+    # 1. 识别 file_content
+    file_content = find_file_content(tmp_dir, VERBOSE)
+    if not file_content['found']:
+        if VERBOSE:
+            print(f"  DEBUG: 未找到file_content，回退only-file-content策略")
+        apply_only_file_content_policy(tmp_dir, output_dir, archive_name, unique_suffix)
+        return
+
+    # 2. 临时 content 目录
+    content_dir = f"content_{unique_suffix}"
+    safe_makedirs(content_dir, debug=VERBOSE)
+
+    try:
+        # 移动 file_content 项目到 content_dir
+        for item in file_content['items']:
+            src = item['path']
+            dst = os.path.join(content_dir, item['name'])
+            if VERBOSE:
+                print(f"  DEBUG: 移动file_content项目: {src} -> {dst}")
+            safe_move(src, dst, VERBOSE)
+
+        # 3. 冲突检测（仅文件）
+        conflict_found = False
+        for root, dirs, files in safe_walk(content_dir, VERBOSE):
+            rel_root = os.path.relpath(root, content_dir)
+            rel_root = '' if rel_root == '.' else rel_root
+            # 只检查文件
+            for f in files:
+                rel_path = os.path.join(rel_root, f) if rel_root else f
+                dest_path = os.path.join(output_dir, rel_path)
+                if safe_isfile(dest_path, VERBOSE):
+                    if VERBOSE:
+                        print(f"  DEBUG: 冲突文件检测到: {dest_path}")
+                    conflict_found = True
+                    break
+            if conflict_found:
+                break
+
+        if conflict_found:
+            if VERBOSE:
+                print(f"  DEBUG: 检测到文件冲突，回退only-file-content策略")
+            apply_only_file_content_policy(tmp_dir, output_dir, archive_name, unique_suffix)
+            return
+
+        # 4. 无冲突 -> 合并/移动到 output_dir
+        for root, dirs, files in safe_walk(content_dir, VERBOSE):
+            rel_root = os.path.relpath(root, content_dir)
+            target_root = output_dir if rel_root == '.' else os.path.join(output_dir, rel_root)
+            safe_makedirs(target_root, debug=VERBOSE)
+
+            for d in dirs:
+                dest_dir = os.path.join(target_root, d)
+                safe_makedirs(dest_dir, debug=VERBOSE)
+
+            for f in files:
+                src_f = os.path.join(root, f)
+                dest_f = os.path.join(target_root, f)
+                safe_move(src_f, dest_f, VERBOSE)
+
+        print(f"  Extracted using only-file-content-direct policy to: {output_dir}")
+
+    finally:
+        # 清理临时 content_dir
+        if safe_exists(content_dir, VERBOSE):
+            safe_rmtree(content_dir, VERBOSE)
+
+
 # ==================== 结束新增解压策略 ====================
 
 # ==================== 新增RAR策略 ====================
@@ -3908,7 +3995,7 @@ def main():
     parser.add_argument(
         '-dp', '--decompress-policy',
         default='2-collect',
-        help='Decompress policy: separate/direct/only-file-content/file-content-with-folder/file-content-with-folder-separate/N-collect (default: 2-collect)'
+        help='Decompress policy: separate/direct/only-file-content/file-content-with-folder/file-content-with-folder-separate/only-file-content-direct/N-collect (default: 2-collect)'
     )
 
     parser.add_argument(
@@ -4113,7 +4200,7 @@ def main():
                     return 1
 
         # Validate decompress policy
-        if args.decompress_policy not in ['separate', 'direct', 'only-file-content', 'file-content-with-folder', 'file-content-with-folder-separate']:
+        if args.decompress_policy not in ['separate', 'direct', 'only-file-content', 'file-content-with-folder', 'file-content-with-folder-separate', 'only-file-content-direct']:
             if not re.match(r'^\d+-collect$', args.decompress_policy):
                 print(f"Error: Invalid decompress policy: {args.decompress_policy}")
                 return 1

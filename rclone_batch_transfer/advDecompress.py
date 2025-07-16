@@ -2695,6 +2695,8 @@ def safe_popen_communicate(cmd, **kwargs):
 def check_encryption(filepath):
     """
     Check if an archive is encrypted and determine the encryption type.
+    Uses return codes as primary indicator for more accurate detection.
+    Always provides a password to avoid interactive prompts.
     
     Returns:
         str: One of the following encryption status:
@@ -2707,9 +2709,12 @@ def check_encryption(filepath):
         if VERBOSE:
             print(f"  DEBUG: Testing archive encryption: {filepath}")
 
-        # Step 1: Try with dummy password to test header encryption
+        # Strategy: Always use a dummy password to avoid interactive prompts
+        # This prevents 7z from waiting for user input on header-encrypted archives
+        
+        # Step 1: Test with dummy password
         if VERBOSE:
-            print(f"  DEBUG: Testing header encryption with dummy password")
+            print(f"  DEBUG: Testing with dummy password to avoid interactive prompts")
 
         stdout_output, stderr_output, returncode = safe_popen_communicate(
             ['7z', 'l', '-slt', '-pDUMMYPASSWORD', filepath]
@@ -2721,43 +2726,177 @@ def check_encryption(filepath):
             print(f"  DEBUG: Dummy password test - Return code: {returncode}")
             print(f"  DEBUG: Output excerpt: {output_combined[:200]}")
 
-        # Check for header encryption or corruption (returncode != 0)
-        if returncode != 0:
-            # Check if it's not an archive at all
-            if "Cannot open the file as archive" in output_combined:
+        # Analyze based on return code first
+        if returncode == 0:
+            # Return code 0: Archive opened successfully with dummy password
+            if VERBOSE:
+                print(f"  DEBUG: Archive opened successfully with dummy password (code 0)")
+            
+            # This means either:
+            # 1. Archive is not encrypted (dummy password ignored)
+            # 2. Archive has content encryption only (header readable)
+            # 3. By incredible coincidence, dummy password is correct (extremely unlikely)
+            
+            # Check for content encryption indicators
+            if "Encrypted = +" in output_combined:
                 if VERBOSE:
-                    print(f"  DEBUG: Not an archive detected")
+                    print(f"  DEBUG: Content encryption detected (Encrypted = +)")
+                return 'encrypted_content'
+            else:
+                # Verify it's really not encrypted by testing with different dummy password
+                if VERBOSE:
+                    print(f"  DEBUG: Verifying no encryption by testing with different dummy password")
+                
+                stdout_output2, stderr_output2, returncode2 = safe_popen_communicate(
+                    ['7z', 'l', '-slt', '-pDUMMYPASSWORD2', filepath]  # Different dummy password
+                )
+                
+                if returncode2 == 0:
+                    if VERBOSE:
+                        print(f"  DEBUG: Confirmed - no encryption detected (works with any dummy password)")
+                    return 'plain'
+                else:
+                    # Unexpected: failed with second dummy password but succeeded with first
+                    # This suggests the first dummy password somehow worked (extremely unlikely)
+                    # More likely there's some inconsistency - assume content encryption to be safe
+                    if VERBOSE:
+                        print(f"  DEBUG: Inconsistent results with different dummy passwords - assuming content encryption")
+                    return 'encrypted_content'
+
+        elif returncode == 2:
+            # Return code 2: Fatal error with dummy password
+            if VERBOSE:
+                print(f"  DEBUG: Fatal error with dummy password (code 2)")
+            
+            # Check if it's not an archive at all
+            if any(phrase in output_combined for phrase in [
+                "Cannot open the file as archive",
+                "is not archive", 
+                "Can not open the file as archive",
+                "Unsupported archive type"
+            ]):
+                if VERBOSE:
+                    print(f"  DEBUG: Not an archive (fatal error + not archive message)")
                 return None
             
-            # Assume header encryption or corruption
+            # Check for encryption-related fatal errors
+            if any(phrase in output_combined for phrase in [
+                "Cannot open encrypted archive",
+                "Wrong password",
+                "encrypted archive",
+                "Can not open encrypted archive"
+            ]):
+                if VERBOSE:
+                    print(f"  DEBUG: Header encryption detected (fatal error + encryption message)")
+                return 'encrypted_header'
+            
+            # Check for specific error patterns that indicate encryption
+            if any(phrase in output_combined for phrase in [
+                "password",
+                "Password",
+                "PASSWORD"
+            ]):
+                if VERBOSE:
+                    print(f"  DEBUG: Header encryption detected (password-related error)")
+                return 'encrypted_header'
+            
+            # Other fatal errors - test with different dummy password to differentiate
             if VERBOSE:
-                print(f"  DEBUG: Header encryption/corruption detected (returncode != 0)")
+                print(f"  DEBUG: Testing with different dummy password to differentiate error cause")
+            
+            stdout_output3, stderr_output3, returncode3 = safe_popen_communicate(
+                ['7z', 'l', '-slt', '-pDUMMYPASSWORD2', filepath]  # Different dummy password
+            )
+            
+            if returncode3 == 2:
+                # Same error with different dummy password - likely corruption or not an archive
+                if any(phrase in (stdout_output3 + stderr_output3) for phrase in [
+                    "Cannot open the file as archive",
+                    "is not archive",
+                    "Can not open the file as archive"
+                ]):
+                    if VERBOSE:
+                        print(f"  DEBUG: Confirmed not an archive")
+                    return None
+                else:
+                    if VERBOSE:
+                        print(f"  DEBUG: Assuming header encryption (consistent fatal error with different passwords)")
+                    return 'encrypted_header'
+            else:
+                # Different result with different dummy password - likely header encryption
+                if VERBOSE:
+                    print(f"  DEBUG: Header encryption detected (different results with different dummy passwords)")
+                return 'encrypted_header'
+
+        elif returncode == 1:
+            # Return code 1: Warning with dummy password
+            if VERBOSE:
+                print(f"  DEBUG: Warning with dummy password (code 1)")
+            
+            # Even with warnings, check for encryption indicators
+            if "Encrypted = +" in output_combined:
+                if VERBOSE:
+                    print(f"  DEBUG: Content encryption detected despite warnings")
+                return 'encrypted_content'
+            
+            # Check for encryption-related warnings
+            if any(phrase in output_combined for phrase in [
+                "Cannot open encrypted archive", 
+                "Wrong password",
+                "encrypted archive"
+            ]):
+                if VERBOSE:
+                    print(f"  DEBUG: Header encryption detected (warning + encryption message)")
+                return 'encrypted_header'
+            
+            if VERBOSE:
+                print(f"  DEBUG: No encryption detected (warnings present)")
+            return 'plain'
+
+        elif returncode == 7:
+            # Return code 7: Command line error
+            if VERBOSE:
+                print(f"  DEBUG: Command line error (code 7)")
+            print(f"  Error: Command line error when testing {filepath}")
+            return None
+
+        elif returncode == 8:
+            # Return code 8: Not enough memory
+            if VERBOSE:
+                print(f"  DEBUG: Memory error (code 8)")
+            print(f"  Error: Not enough memory when testing {filepath}")
+            return None
+
+        elif returncode == 255:
+            # Return code 255: User stopped the process
+            if VERBOSE:
+                print(f"  DEBUG: Process stopped by user (code 255)")
+            print(f"  Error: Process stopped when testing {filepath}")
+            return None
+
+        else:
+            # Unknown return code
+            if VERBOSE:
+                print(f"  DEBUG: Unknown return code {returncode}")
+            
+            # Check for obvious not-archive indicators
+            if any(phrase in output_combined for phrase in [
+                "Cannot open the file as archive",
+                "is not archive",
+                "Can not open the file as archive"
+            ]):
+                if VERBOSE:
+                    print(f"  DEBUG: Not an archive (unknown code + not archive message)")
+                return None
+            
+            # Assume header encryption for unknown error codes
+            if VERBOSE:
+                print(f"  DEBUG: Assuming header encryption due to unknown error code")
             return 'encrypted_header'
-
-        # Additional check for "Cannot open encrypted archive" message even with returncode 0
-        if "Cannot open encrypted archive. Wrong password?" in output_combined:
-            if VERBOSE:
-                print(f"  DEBUG: Header encryption detected (wrong password message)")
-            return 'encrypted_header'
-
-        # Step 2: Header is readable, check for content encryption
-        if VERBOSE:
-            print(f"  DEBUG: Header readable, checking content encryption")
-
-        # Check if content is encrypted by looking for "Encrypted = +" in the output
-        if "Encrypted = +" in output_combined:
-            if VERBOSE:
-                print(f"  DEBUG: Content encryption detected")
-            return 'encrypted_content'
-
-        # Step 3: No encryption detected
-        if VERBOSE:
-            print(f"  DEBUG: No encryption detected")
-        return 'plain'
 
     except Exception as e:
         if VERBOSE:
-            print(f"  DEBUG: Error checking encryption: {str(e)}")
+            print(f"  DEBUG: Exception occurred: {str(e)}")
         print(f"  Error checking encryption: {str(e)}")
         return None
 

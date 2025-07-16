@@ -1709,46 +1709,62 @@ class ArchiveProcessor:
 
 def guess_zip_encoding(zip_path):
     """
-    Detect the legacy codepage used by non‑UTF‑8 ZIP files.
-    Returns {...'success': bool}.
+    Detect the legacy code‑page used by a *non‑UTF‑8* ZIP file.
+
+    改进要点
+    --------
+    1. 统一通过 `safe_path_for_operation()` 处理超长 / Unicode 路径。  
+    2. **保证** 参与 `b'\\n'.join()` 的全部元素都是 `bytes`，  
+       - `ZipInfo.orig_filename` 可能是 *str*，需转 CP437。  
+       - 若属性不存在则退回 `info.filename`（同样转 bytes）。  
+    3. 当所有条目均已设置 UTF‑8 标志时直接返回 `success=False`，避免误报。  
     """
     import zipfile, chardet
 
-    result = {'encoding': None, 'language': None, 'confidence': 0.0, 'success': False}
+    result = {'encoding': None,
+              'language': None,
+              'confidence': 0.0,
+              'success':   False}
+
     if VERBOSE:
         print(f"  DEBUG: 开始检测ZIP编码: {zip_path}")
 
-    filename_bytes = []
+    safe_zip_path   = safe_path_for_operation(zip_path, VERBOSE)
+    filename_bytes  = []
+
     try:
-        with zipfile.ZipFile(safe_path_for_operation(zip_path), 'r') as zf:
+        with zipfile.ZipFile(safe_zip_path, 'r') as zf:
             for info in zf.infolist():
-                if info.flag_bits & 0x800:         # 已经是 UTF‑8
+                if info.flag_bits & 0x800:          # 已是 UTF‑8 条目
                     continue
-                try:
-                    # ➊ 高版本 Python 无 orig_filename；➋ fallback 到 filename
-                    raw_name = (info.orig_filename
-                                if hasattr(info, 'orig_filename') and info.orig_filename
-                                else info.filename.encode('cp437', 'surrogateescape'))
-                    filename_bytes.append(raw_name)
-                except Exception as exc:
-                    if VERBOSE:
-                        print(f"  DEBUG: 读取文件名字节失败: {exc}")
-        if not filename_bytes:
-            return result                     # 没有传统编码条目
+
+                raw_name = getattr(info, 'orig_filename', None) or info.filename
+
+                # 统一转 bytes（若本身已是 bytes 则按原值）
+                if isinstance(raw_name, str):
+                    raw_name = raw_name.encode('cp437', 'surrogateescape')
+
+                filename_bytes.append(raw_name)
+
+        if not filename_bytes:                      # 无传统编码条目
+            if VERBOSE:
+                print("  DEBUG: 全部条目已采用 UTF‑8 – 非传统ZIP")
+            return result
 
         sample = b'\n'.join(filename_bytes)
-        det = chardet.detect(sample)
+        det    = chardet.detect(sample)
+
         if det.get('encoding'):
-            result.update({
-                'encoding': det['encoding'],
-                'language': det.get('language'),
-                'confidence': det.get('confidence', 0.0),
-                'success': True
-            })
+            result.update({'encoding':  det['encoding'],
+                           'language':  det.get('language'),
+                           'confidence':det.get('confidence', 0.0),
+                           'success':   True})
     except Exception as exc:
         if VERBOSE:
             print(f"  DEBUG: ZIP编码检测异常: {exc}")
+
     return result
+
 
 
 
@@ -2637,55 +2653,42 @@ def safe_subprocess_run(cmd, **kwargs):
 
 def safe_popen_communicate(cmd, **kwargs):
     """
-    Safely use Popen and communicate with proper encoding handling
-
-    Args:
-        cmd: Command to run
-        **kwargs: Additional arguments for Popen
-
-    Returns:
-        tuple: (stdout_str, stderr_str, returncode)
+    Wrapper around subprocess.Popen + communicate
+    ‑‑ 增强日志打印，避免因 command 元素非 str 而触发 TypeError。
     """
-    # Force binary mode
     kwargs_copy = kwargs.copy()
-    kwargs_copy.pop('text', None)
-    kwargs_copy.pop('encoding', None)
-    kwargs_copy.pop('universal_newlines', None)
+    for flag in ('text', 'encoding', 'universal_newlines'):
+        kwargs_copy.pop(flag, None)
+
+    def _cmd_to_str(c):
+        return ' '.join(map(str, c)) if isinstance(c, (list, tuple)) else str(c)
 
     try:
         if VERBOSE:
-            print(f"  DEBUG: 执行Popen命令: {' '.join(cmd) if isinstance(cmd, list) else cmd}")
+            print(f"  DEBUG: 执行Popen命令: {_cmd_to_str(cmd)}")
 
         proc = subprocess.Popen(cmd,
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE,
                                 **kwargs_copy)
 
-        stdout_bytes, stderr_bytes = proc.communicate()
-
-        # Safely decode output
-        stdout_str = safe_decode(stdout_bytes) if stdout_bytes else ""
-        stderr_str = safe_decode(stderr_bytes) if stderr_bytes else ""
+        stdout_b, stderr_b = proc.communicate()
+        stdout_s = safe_decode(stdout_b) if stdout_b else ""
+        stderr_s = safe_decode(stderr_b) if stderr_b else ""
 
         if VERBOSE:
             print(f"  DEBUG: Popen返回码: {proc.returncode}")
-            if stdout_str:
-                print(f"  DEBUG: stdout摘要: {stdout_str[:200]}")
-            if stderr_str:
-                print(f"  DEBUG: stderr摘要: {stderr_str[:200]}")
+            if stdout_s:
+                print(f"  DEBUG: stdout摘要: {stdout_s[:200]}")
+            if stderr_s:
+                print(f"  DEBUG: stderr摘要: {stderr_s[:200]}")
 
-        return stdout_str, stderr_str, proc.returncode
+        return stdout_s, stderr_s, proc.returncode
 
-    except Exception as e:
+    except Exception as exc:
         if VERBOSE:
-            print(f"  DEBUG: Popen error: {e}")
-        return "", str(e), 1
-
-
-
-
-
-
+            print(f"  DEBUG: Popen error: {exc}")
+        return "", str(exc), 1
 
 
 

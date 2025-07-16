@@ -59,7 +59,7 @@ class SFXDetector:
             bool: True if it's a valid EXE file, False otherwise
         """
         try:
-            with open(file_path, 'rb') as f:
+            with safe_open(file_path, 'rb') as f:
                 result = f.read(2) == b'MZ'
                 if self.verbose:
                     print(f"  DEBUG: EXE检查 {file_path}: {result}")
@@ -92,7 +92,7 @@ class SFXDetector:
             if self.verbose:
                 print(f"  DEBUG: 分析PE结构: {file_path}")
 
-            with open(file_path, 'rb') as f:
+            with safe_open(file_path, 'rb') as f:
                 # Get total file size
                 f.seek(0, 2)
                 result['file_size'] = f.tell()
@@ -215,7 +215,7 @@ class SFXDetector:
         aligned_offsets = sorted(set(aligned_offsets))
 
         try:
-            with open(file_path, 'rb') as f:
+            with safe_open(file_path, 'rb') as f:
                 # Check file size to ensure offset is valid
                 f.seek(0, 2)
                 file_size = f.tell()
@@ -303,7 +303,7 @@ class SFXDetector:
         known_offsets = [0x80000, 0x88000, 0x8A000, 0x8C000, 0x90000]
 
         try:
-            with open(file_path, 'rb') as f:
+            with safe_open(file_path, 'rb') as f:
                 f.seek(0, 2)
                 file_size = f.tell()
 
@@ -344,7 +344,7 @@ class SFXDetector:
             print(f"  DEBUG: 检查RAR SFX特殊标记")
 
         try:
-            with open(file_path, 'rb') as f:
+            with safe_open(file_path, 'rb') as f:
                 # Check file size
                 f.seek(0, 2)
                 file_size = f.tell()
@@ -736,7 +736,7 @@ class ArchiveProcessor:
 
             if self.args.password_file:
                 try:
-                    with open(self.args.password_file, 'r', encoding='utf-8') as f:
+                    with safe_open(self.args.password_file, 'r', encoding='utf-8') as f:
                         for line in f:
                             password = line.strip()
                             if password and password not in password_candidates:
@@ -1190,14 +1190,14 @@ class ArchiveProcessor:
                 
                 # 检查是否存在对应的.exe文件
                 potential_exe_pattern = base_without_part + '.part*.exe'
-                exe_files = glob.glob(os.path.join(dir_path, potential_exe_pattern))
+                exe_files = safe_glob(os.path.join(dir_path, potential_exe_pattern))
                 if exe_files:
                     return 'notarchive'  # 这是exe SFX-RAR分卷的.rar文件
                 else:
                     return 'volume'
             else:
                 # 检查是否为RAR4分卷（存在.r*文件）
-                rar4_volumes = glob.glob(os.path.join(dir_path, base_filename + '.r*'))
+                rar4_volumes = safe_glob(os.path.join(dir_path, base_filename + '.r*'))
                 if rar4_volumes:
                     return 'volume'
                 else:
@@ -1213,7 +1213,7 @@ class ArchiveProcessor:
         # === ZIP 文件处理 ===
         if file_ext == 'zip':
             # 检查是否存在.z*分卷文件
-            zip_volumes = glob.glob(os.path.join(dir_path, base_filename + '.z*'))
+            zip_volumes = safe_glob(os.path.join(dir_path, base_filename + '.z*'))
             if zip_volumes:
                 return 'volume'
             else:
@@ -1250,7 +1250,7 @@ class ArchiveProcessor:
                 if part_match:
                     # 检查是否存在对应的.rar分卷文件
                     base_without_part = base_filename[:part_match.start()]
-                    rar_volumes = glob.glob(os.path.join(dir_path, base_without_part + '.part*.rar'))
+                    rar_volumes = safe_glob(os.path.join(dir_path, base_without_part + '.part*.rar'))
                     if rar_volumes:
                         return 'volume'
                     else:
@@ -1260,7 +1260,7 @@ class ArchiveProcessor:
             else:
                 # SFX-7z文件
                 # 检查是否存在对应的.7z.*分卷文件
-                seven_volumes = glob.glob(os.path.join(dir_path, base_filename + '.7z.*'))
+                seven_volumes = safe_glob(os.path.join(dir_path, base_filename + '.7z.*'))
                 if seven_volumes:
                     return 'volume'
                 else:
@@ -1316,21 +1316,21 @@ class ArchiveProcessor:
                     # 确保不存在对应的.exe文件
                     base_without_part = base_filename[:part_match.start()]
                     potential_exe_pattern = base_without_part + '.part*.exe'
-                    exe_files = glob.glob(os.path.join(dir_path, potential_exe_pattern))
+                    exe_files = safe_glob(os.path.join(dir_path, potential_exe_pattern))
                     if not exe_files:
                         return True
         
         # === RAR4 分卷主卷 ===
         if file_ext == 'rar':
             # RAR4分卷的主卷就是.rar文件（当存在.r*文件时）
-            rar4_volumes = glob.glob(os.path.join(dir_path, base_filename + '.r*'))
+            rar4_volumes = safe_glob(os.path.join(dir_path, base_filename + '.r*'))
             if rar4_volumes:
                 return True
         
         # === ZIP 分卷主卷 ===
         if file_ext == 'zip':
             # ZIP分卷的主卷就是.zip文件（当存在.z*文件时）
-            zip_volumes = glob.glob(os.path.join(dir_path, base_filename + '.z*'))
+            zip_volumes = safe_glob(os.path.join(dir_path, base_filename + '.z*'))
             if zip_volumes:
                 return True
         
@@ -1360,13 +1360,13 @@ class ArchiveProcessor:
                     if part_num in ['1', '01', '001', '0001', '00001']:
                         # 检查是否存在对应的.rar分卷文件
                         base_without_part = base_filename[:part_match.start()]
-                        rar_volumes = glob.glob(os.path.join(dir_path, base_without_part + '.part*.rar'))
+                        rar_volumes = safe_glob(os.path.join(dir_path, base_without_part + '.part*.rar'))
                         if rar_volumes:
                             return True
             else:
                 # SFX-7z分卷主卷
                 # 检查是否存在对应的.7z.*分卷文件
-                seven_volumes = glob.glob(os.path.join(dir_path, base_filename + '.7z.*'))
+                seven_volumes = safe_glob(os.path.join(dir_path, base_filename + '.7z.*'))
                 if seven_volumes:
                     return True
         
@@ -1436,7 +1436,7 @@ class ArchiveProcessor:
                     # 确保不存在对应的.exe文件或者存在但不是SFX-RAR分卷
                     base_without_part = base_filename[:part_match.start()]
                     potential_exe_pattern = base_without_part + '.part*.exe'
-                    exe_files = glob.glob(os.path.join(dir_path, potential_exe_pattern))
+                    exe_files = safe_glob(os.path.join(dir_path, potential_exe_pattern))
                     if not exe_files:
                         return True
                     else:
@@ -1498,14 +1498,14 @@ class ArchiveProcessor:
             if not safe_exists(potential_exe, VERBOSE):
                 # 纯7z分卷
                 pattern = base_without_7z + '.7z.*'
-                volume_files = glob.glob(os.path.join(dir_path, pattern))
+                volume_files = safe_glob(os.path.join(dir_path, pattern))
                 volumes.extend([f for f in volume_files if re.match(r'.*\.7z\.\d+$', f.lower())])
             else:
                 # SFX-7z分卷（情况2：从.7z.*文件开始查找）
                 if safe_isfile(potential_exe, VERBOSE) and self.sfx_detector.is_sfx(potential_exe):
                     volumes.append(potential_exe)  # 添加.exe主文件
                     pattern = base_without_7z + '.7z.*'
-                    volume_files = glob.glob(os.path.join(dir_path, pattern))
+                    volume_files = safe_glob(os.path.join(dir_path, pattern))
                     volumes.extend([f for f in volume_files if re.match(r'.*\.7z\.\d+$', f.lower())])
         
         # === RAR5 分卷 ===
@@ -1514,27 +1514,27 @@ class ArchiveProcessor:
             if part_match:
                 base_without_part = base_filename[:part_match.start()]
                 potential_exe_pattern = base_without_part + '.part*.exe'
-                exe_files = glob.glob(os.path.join(dir_path, potential_exe_pattern))
+                exe_files = safe_glob(os.path.join(dir_path, potential_exe_pattern))
                 
                 if not exe_files:
                     # 纯RAR5分卷
                     pattern = base_without_part + '.part*.rar'
-                    volumes.extend(glob.glob(os.path.join(dir_path, pattern)))
+                    volumes.extend(safe_glob(os.path.join(dir_path, pattern)))
                 else:
                     # SFX-RAR分卷（情况2：从.rar文件开始查找）
                     volumes.extend(exe_files)  # 添加所有.exe文件
                     pattern = base_without_part + '.part*.rar'
-                    volumes.extend(glob.glob(os.path.join(dir_path, pattern)))
+                    volumes.extend(safe_glob(os.path.join(dir_path, pattern)))
             else:
                 # RAR4分卷
-                rar4_volumes = glob.glob(os.path.join(dir_path, base_filename + '.r*'))
+                rar4_volumes = safe_glob(os.path.join(dir_path, base_filename + '.r*'))
                 if rar4_volumes:
                     volumes.append(file_path)  # 主.rar文件
                     volumes.extend(rar4_volumes)
         
         # === ZIP 分卷 ===
         elif file_ext == 'zip':
-            zip_volumes = glob.glob(os.path.join(dir_path, base_filename + '.z*'))
+            zip_volumes = safe_glob(os.path.join(dir_path, base_filename + '.z*'))
             if zip_volumes:
                 volumes.append(file_path)  # 主.zip文件
                 volumes.extend(zip_volumes)
@@ -1561,11 +1561,11 @@ class ArchiveProcessor:
                         # 查找所有相关的.exe和.rar文件
                         exe_pattern = base_without_part + '.part*.exe'
                         rar_pattern = base_without_part + '.part*.rar'
-                        volumes.extend(glob.glob(os.path.join(dir_path, exe_pattern)))
-                        volumes.extend(glob.glob(os.path.join(dir_path, rar_pattern)))
+                        volumes.extend(safe_glob(os.path.join(dir_path, exe_pattern)))
+                        volumes.extend(safe_glob(os.path.join(dir_path, rar_pattern)))
                 else:
                     # SFX-7z分卷（情况1：从.exe文件开始查找）
-                    seven_volumes = glob.glob(os.path.join(dir_path, base_filename + '.7z.*'))
+                    seven_volumes = safe_glob(os.path.join(dir_path, base_filename + '.7z.*'))
                     if seven_volumes:
                         volumes.append(file_path)  # 主.exe文件
                         volumes.extend([f for f in seven_volumes if re.match(r'.*\.7z\.\d+$', f.lower())])
@@ -1709,87 +1709,47 @@ class ArchiveProcessor:
 
 def guess_zip_encoding(zip_path):
     """
-    使用chardet检测ZIP文件中非UTF-8文件名的编码
-    
-    Args:
-        zip_path: ZIP文件路径
-        
-    Returns:
-        dict: {
-            'encoding': str,      # 检测到的编码
-            'language': str,      # 检测到的语言
-            'confidence': float,  # 置信度 (0.0-1.0)
-            'success': bool       # 是否成功检测
-        }
+    Detect the legacy codepage used by non‑UTF‑8 ZIP files.
+    Returns {...'success': bool}.
     """
-    import zipfile
-    import chardet
-    
-    result = {
-        'encoding': None,
-        'language': None, 
-        'confidence': 0.0,
-        'success': False
-    }
-    
+    import zipfile, chardet
+
+    result = {'encoding': None, 'language': None, 'confidence': 0.0, 'success': False}
     if VERBOSE:
         print(f"  DEBUG: 开始检测ZIP编码: {zip_path}")
-    
+
+    filename_bytes = []
     try:
-        # 收集所有可能的非UTF-8文件名字节
-        filename_bytes_list = []
-        
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            for file_info in zip_ref.infolist():
-                # 检查是否有UTF-8标志
-                is_utf8 = bool(file_info.flag_bits & 0x800)
-                
-                if not is_utf8:
-                    # 获取原始文件名字节（假设是CP437编码）
-                    try:
-                        # 尝试从显示的文件名重新编码为字节
-                        filename_bytes = file_info.orig_filename.encode('cp437')
-                        filename_bytes_list.append(filename_bytes)
-                        
-                        if VERBOSE:
-                            print(f"  DEBUG: 收集非UTF-8文件名: {file_info.filename}")
-                    except Exception as e:
-                        if VERBOSE:
-                            print(f"  DEBUG: 无法获取文件名字节: {e}")
-                        continue
-        
-        if not filename_bytes_list:
-            if VERBOSE:
-                print(f"  DEBUG: 未找到非UTF-8文件名，无需检测编码")
-            return result
-        
-        # 合并所有文件名字节进行检测
-        combined_bytes = b'\n'.join(filename_bytes_list)
-        
+        with zipfile.ZipFile(safe_path_for_operation(zip_path), 'r') as zf:
+            for info in zf.infolist():
+                if info.flag_bits & 0x800:         # 已经是 UTF‑8
+                    continue
+                try:
+                    # ➊ 高版本 Python 无 orig_filename；➋ fallback 到 filename
+                    raw_name = (info.orig_filename
+                                if hasattr(info, 'orig_filename') and info.orig_filename
+                                else info.filename.encode('cp437', 'surrogateescape'))
+                    filename_bytes.append(raw_name)
+                except Exception as exc:
+                    if VERBOSE:
+                        print(f"  DEBUG: 读取文件名字节失败: {exc}")
+        if not filename_bytes:
+            return result                     # 没有传统编码条目
+
+        sample = b'\n'.join(filename_bytes)
+        det = chardet.detect(sample)
+        if det.get('encoding'):
+            result.update({
+                'encoding': det['encoding'],
+                'language': det.get('language'),
+                'confidence': det.get('confidence', 0.0),
+                'success': True
+            })
+    except Exception as exc:
         if VERBOSE:
-            print(f"  DEBUG: 合并字节长度: {len(combined_bytes)}")
-        
-        # 使用chardet检测编码
-        detection = chardet.detect(combined_bytes)
-        
-        if detection and detection.get('encoding'):
-            result['encoding'] = detection['encoding']
-            result['language'] = detection.get('language')
-            result['confidence'] = detection.get('confidence', 0.0)
-            result['success'] = True
-            
-            if VERBOSE:
-                print(f"  DEBUG: 检测结果 - 编码: {result['encoding']}, "
-                      f"语言: {result['language']}, 置信度: {result['confidence']:.2%}")
-        else:
-            if VERBOSE:
-                print(f"  DEBUG: chardet检测失败")
-    
-    except Exception as e:
-        if VERBOSE:
-            print(f"  DEBUG: ZIP编码检测异常: {e}")
-    
+            print(f"  DEBUG: ZIP编码检测异常: {exc}")
     return result
+
 
 
 def get_7z_encoding_param(encoding):
@@ -1902,185 +1862,47 @@ def get_7z_encoding_param(encoding):
 # === 传统zip编码检测实现 ===
 def is_traditional_zip(archive_path):
     """
-    Check if zip file uses traditional encoding (non-UTF-8).
-    
-    采用保守策略：只有在明确确认是有效的传统编码ZIP时才返回True。
-    任何异常、未知、损坏的情况都返回False。
-    
-    Returns True only if:
-    1. 文件是有效的ZIP格式
-    2. 至少包含一个文件项
-    3. 所有文件项都没有UTF-8编码标识
-    
-    Returns False if:
-    - 文件不是ZIP格式
-    - 文件损坏或不完整  
-    - 空ZIP文件
-    - 发现任何UTF-8编码标识
-    - 任何解析错误或异常情况
-
-    Args:
-        archive_path: ZIP文件路径
-
-    Returns:
-        bool: 只有明确确认是传统编码ZIP时返回True
+    Return True **iff** at least one entry uses legacy CP437‑encoded name
+    and **no** UTF‑8 flag/extra fields are present.
     """
     try:
         if not archive_path.lower().endswith('.zip'):
-            return False  # 不是.zip文件
-
-        if VERBOSE:
-            print(f"  DEBUG: 检查ZIP是否为传统编码: {archive_path}")
-
-        valid_entries_count = 0  # 记录成功解析的有效文件项数量
-        
-        with open(archive_path, 'rb') as f:
-            # 首先检查文件是否足够大以包含最基本的ZIP结构
-            f.seek(0, 2)  # 移到文件末尾
-            file_size = f.tell()
-            f.seek(0)     # 回到开头
-            
-            if file_size < 22:  # ZIP文件最小大小（End of Central Directory Record）
-                if VERBOSE:
-                    print(f"  DEBUG: 文件太小({file_size}字节)，不是有效ZIP")
-                return False
-
-            # 解析Local File Headers
+            return False
+        with safe_open(archive_path, 'rb') as f:
             while True:
-                current_pos = f.tell()
-                header = f.read(30)
-                
-                if len(header) < 30:
-                    # 文件读完了，正常结束
+                sig = f.read(4)
+                if sig != b'PK\x03\x04':          # Local‑file‑header 结束
                     break
-
-                # 检查Local File Header签名
-                if header[0:4] != b'PK\x03\x04':
-                    # 不是Local File Header
-                    if header[0:2] == b'PK':
-                        # 是其他PK结构（如Central Directory），正常结束Local Headers扫描
-                        if VERBOSE:
-                            sig = header[0:4]
-                            print(f"  DEBUG: 遇到其他PK结构: {sig.hex()}, Local Headers扫描结束")
-                    else:
-                        # 完全不是PK结构，可能文件损坏
-                        if VERBOSE:
-                            print(f"  DEBUG: 遇到非PK结构，可能文件损坏")
-                        return False
-                    break
-
-                # 解析Local File Header字段
-                try:
-                    # General purpose bit flag (bytes 6-7)
-                    gpbf = int.from_bytes(header[6:8], 'little')
-                    
-                    # 检查UTF-8 EFS标志 (bit 11)
-                    is_utf8_efs = (gpbf & (1 << 11)) != 0
-                    if is_utf8_efs:
-                        if VERBOSE:
-                            print(f"  DEBUG: 发现UTF-8 EFS标志，不是传统ZIP")
-                        return False
-
-                    # 获取长度信息
-                    compressed_size = int.from_bytes(header[18:22], 'little')
-                    filename_length = int.from_bytes(header[26:28], 'little')
-                    extra_field_length = int.from_bytes(header[28:30], 'little')
-                    
-                    # 基本合理性检查
-                    if filename_length == 0:
-                        if VERBOSE:
-                            print(f"  DEBUG: 文件名长度为0，跳过")
-                        return False
-                    
-                    if filename_length > 65535 or extra_field_length > 65535:
-                        if VERBOSE:
-                            print(f"  DEBUG: 长度字段异常，可能文件损坏")
-                        return False
-
-                except Exception as e:
-                    if VERBOSE:
-                        print(f"  DEBUG: 解析Local File Header失败: {e}")
+                hdr = f.read(26)                  # 剩余固定区
+                if len(hdr) < 26:
                     return False
+                gpbf           = int.from_bytes(hdr[2:4], 'little')
+                name_len       = int.from_bytes(hdr[22:24], 'little')
+                extra_len      = int.from_bytes(hdr[24:26], 'little')
+                is_utf8        = gpbf & (1 << 11)
 
-                # 读取并跳过文件名
-                try:
-                    filename_data = f.read(filename_length)
-                    if len(filename_data) != filename_length:
-                        if VERBOSE:
-                            print(f"  DEBUG: 文件名读取不完整")
-                        return False
-                except Exception as e:
-                    if VERBOSE:
-                        print(f"  DEBUG: 读取文件名失败: {e}")
+                if is_utf8:                       # 出现 UTF‑8 标志 ➜ 不是传统 ZIP
                     return False
+                if name_len == 0:
+                    return False                  # 不合理
 
-                # 检查额外字段中的UTF-8标识
-                if extra_field_length > 0:
-                    try:
-                        extra_field_data = f.read(extra_field_length)
-                        if len(extra_field_data) != extra_field_length:
-                            if VERBOSE:
-                                print(f"  DEBUG: 额外字段读取不完整")
-                            return False
-                        
-                        # 解析额外字段
-                        offset = 0
-                        while offset + 4 <= len(extra_field_data):
-                            header_id = int.from_bytes(extra_field_data[offset:offset + 2], 'little')
-                            data_size = int.from_bytes(extra_field_data[offset + 2:offset + 4], 'little')
-                            
-                            # 检查UTF-8额外字段
-                            if header_id == 0x7075 or header_id == 0x6375:  # UTF-8 path/comment
-                                if VERBOSE:
-                                    print(f"  DEBUG: 发现UTF-8额外字段(0x{header_id:04x})，不是传统ZIP")
-                                return False
-                            
-                            # 移动到下一个额外字段项
-                            offset += 4 + data_size
-                            if offset > len(extra_field_data):  # 防止越界
-                                if VERBOSE:
-                                    print(f"  DEBUG: 额外字段解析越界，可能损坏")
-                                return False
-                                
-                    except Exception as e:
-                        if VERBOSE:
-                            print(f"  DEBUG: 解析额外字段失败: {e}")
-                        return False
+                f.seek(name_len, 1)               # skip name
+                f.seek(extra_len, 1)              # skip extra
 
-                # 跳过文件数据（简化处理，不处理Data Descriptor的复杂情况）
-                has_data_descriptor = (gpbf & (1 << 3)) != 0
-                if not has_data_descriptor and compressed_size > 0:
-                    try:
-                        f.seek(compressed_size, 1)  # 相对当前位置跳过
-                    except Exception as e:
-                        if VERBOSE:
-                            print(f"  DEBUG: 跳过压缩数据失败: {e}")
-                        return False
-
-                # 成功解析了一个传统编码文件项 - 立即返回True！
-                if VERBOSE:
-                    print(f"  DEBUG: 成功解析到传统编码文件项，确认是传统ZIP")
-                return True
-
-        # 扫描完毕，没有找到任何有效的文件项
+                has_dd = gpbf & (1 << 3)
+                if not has_dd:
+                    comp_size = int.from_bytes(hdr[10:14], 'little')
+                    f.seek(comp_size, 1)
+                else:
+                    # 遇到 Data‑Descriptor 直接判定：已确认存在非 UTF‑8 条目
+                    return True
+            # 如果能循环到这里，说明出现过 ≥1 项非 UTF‑8
+            return True
+    except Exception as exc:
         if VERBOSE:
-            print(f"  DEBUG: 扫描完毕，未找到有效文件项，不确认为传统ZIP")
+            print(f"  DEBUG: 传统ZIP检测异常: {exc}")
         return False
 
-    except FileNotFoundError:
-        if VERBOSE:
-            print(f"  DEBUG: 文件不存在: {archive_path}")
-        return False
-    except PermissionError:
-        if VERBOSE:
-            print(f"  DEBUG: 文件权限不足: {archive_path}")
-        return False
-    except Exception as e:
-        if VERBOSE:
-            print(f"  DEBUG: 读取ZIP文件时出现未预期错误 '{archive_path}': {e}")
-        else:
-            print(f"Error reading zip file '{archive_path}': {e}")
-        return False
 
 
 # === depth 限制 实现 ====
@@ -2343,31 +2165,81 @@ def get_short_path_name(long_path):
     except Exception:
         return long_path
 
-
-def safe_path_for_operation(path, debug=False):
+# === 修复windows长路径 ===
+def _normalize_windows_long_path(path: str) -> str:
     """
-    为文件系统操作获取安全的路径（优先使用短路径）
-
-    Args:
-        path: 原始路径
-        debug: 是否输出调试信息
-
-    Returns:
-        str: 安全的路径（短路径或原路径）
+    Convert to Win32 long‑path form (\\?\\ or \\?\\UNC\\).
+    Handles existing long paths and avoids duplicate back‑slashes.
     """
-    if not path:
+    if not is_windows():
+        return path
+    abs_path = os.path.abspath(os.path.expandvars(path))
+    if abs_path.startswith(('\\\\?\\', '\\\\.\\')):
+        return abs_path                       # 已是长路径
+    if abs_path.startswith('\\\\'):           # UNC
+        # 注意：lstrip 只能去掉 *一个* 前导反斜杠
+        return '\\\\?\\UNC\\' + abs_path[2:]  # 去掉最前面的两个 '\'
+    return '\\\\?\\' + abs_path
+
+
+
+def safe_path_for_operation(path: str, debug: bool = False) -> str:
+    """
+    统一的“可安全参与文件系统/子进程操作”的路径转换：
+    1. 若非 Windows：直接返回原始路径
+    2. Windows：
+       2.1 优先尝试扩展长度路径 `_normalize_windows_long_path`
+       2.2 若生成路径仍超长或出现异常，再回退到 8.3 短路径 `get_short_path_name`
+    """
+    if not is_windows() or not path:
         return path
 
-    if is_windows():
-        short_path = get_short_path_name(path)
-        if short_path != path and short_path:
-            if debug:
-                print(f"  DEBUG: 使用短路径: {path} -> {short_path}")
-            return short_path
-        elif debug:
-            print(f"  DEBUG: 使用原路径: {path}")
+    try:
+        long_path = _normalize_windows_long_path(path)
+        # Win32 API 对扩展长度路径的上限是 32 k，足够使用
+        return long_path
+    except Exception as e:
+        # 极端情况（如路径含保留字符）再尝试短路径
+        if debug:
+            print(f"  DEBUG: long‑path normalize failed for {path}: {e}; fallback to short path")
+        return get_short_path_name(path) or path
 
-    return path
+def safe_open(file_path, mode='r', *args, **kwargs):
+    """
+    替代内建 open，自动处理 Windows 超长/Unicode 路径。
+    额外接受 keyword 参数 debug=True 开启调试输出。
+    """
+    debug = kwargs.pop('debug', False)
+    safe_path = safe_path_for_operation(file_path, debug)
+    if debug:
+        print(f"  DEBUG: safe_open -> {safe_path}")
+    return open(safe_path, mode, *args, **kwargs)
+
+def safe_glob(pattern: str, debug: bool = False):
+    """
+    glob.glob 的安全包装，使模式可以含有超长路径前缀。
+    注意：glob / fnmatch 自身在 \\?\\ 前缀下仍工作良好。
+    """
+    safe_pattern = safe_path_for_operation(pattern, debug)
+    return glob.glob(safe_pattern)
+
+def _patch_cmd_paths(cmd):
+    """
+    接受 list / tuple / str，返回替换了路径元素后的同类型对象。
+    规则：凡是现存的文件或目录，都调用 safe_path_for_operation 处理。
+    """
+    if isinstance(cmd, (list, tuple)):
+        patched = []
+        for token in cmd:
+            try:
+                if os.path.isabs(token) and safe_exists(token):
+                    patched.append(safe_path_for_operation(token))
+                else:
+                    patched.append(token)
+            except Exception:
+                patched.append(token)
+        return type(cmd)(patched)
+    return cmd  # 字符串情况交由 shell 处理
 
 
 def safe_exists(path, debug=False):
@@ -2563,7 +2435,7 @@ def acquire_lock(max_attempts=30, min_wait=2, max_wait=10):
                     safe_lock_file = safe_path_for_operation(LOCK_FILE)
 
                     # 使用 'x' 模式：只有当文件不存在时才创建，如果文件已存在会抛出异常
-                    lock_handle = open(safe_lock_file, 'x')
+                    lock_handle = safe_open(safe_lock_file, 'x')
 
                     # 成功创建锁文件，写入进程信息
                     hostname = socket.gethostname()
@@ -2732,57 +2604,35 @@ def safe_decode(byte_data, encoding='utf-8', fallback_encodings=None):
 
 def safe_subprocess_run(cmd, **kwargs):
     """
-    Safely run subprocess with proper encoding handling
-
-    Args:
-        cmd: Command to run
-        **kwargs: Additional arguments for subprocess.run
-
-    Returns:
-        subprocess.CompletedProcess with safely decoded output
+    Wrapper around subprocess.run with encoding‑safe decoding.
     """
-    # Force binary mode and handle encoding manually
-    kwargs_copy = kwargs.copy()
-    kwargs_copy.pop('text', None)  # Remove text=True if present
-    kwargs_copy.pop('encoding', None)  # Remove encoding if present
-    kwargs_copy.pop('universal_newlines', None)  # Remove universal_newlines if present
+    kwargs = kwargs.copy()
+    for flag in ('text', 'encoding', 'universal_newlines'):
+        kwargs.pop(flag, None)
+
+    # 调用方如果没有要求捕获输出，则不做解码工作
+    capture_out = ('stdout' in kwargs and kwargs['stdout'] == subprocess.PIPE) \
+                  or ('capture_output' in kwargs and kwargs['capture_output'])
+    capture_err = ('stderr' in kwargs and kwargs['stderr'] == subprocess.PIPE) \
+                  or ('capture_output' in kwargs and kwargs['capture_output'])
 
     try:
+        patched_cmd = _patch_cmd_paths(cmd)
+        res = subprocess.run(patched_cmd, **kwargs)
+        if capture_out and isinstance(res.stdout, bytes):
+            res.stdout = safe_decode(res.stdout)
+        if capture_err and isinstance(res.stderr, bytes):
+            res.stderr = safe_decode(res.stderr)
+        return res
+    except Exception as exc:
         if VERBOSE:
-            print(f"  DEBUG: 执行命令: {' '.join(cmd) if isinstance(cmd, list) else cmd}")
+            print(f"  DEBUG: subprocess error: {exc}")
+        # 构造兼容对象
+        class Dummy:
+            def __init__(self, err):
+                self.returncode, self.stdout, self.stderr = 1, '', str(err)
+        return Dummy(exc)
 
-        result = subprocess.run(cmd, **kwargs_copy)
-
-        # Safely decode stdout and stderr
-        if hasattr(result, 'stdout') and result.stdout is not None:
-            if isinstance(result.stdout, bytes):
-                result.stdout = safe_decode(result.stdout)
-
-        if hasattr(result, 'stderr') and result.stderr is not None:
-            if isinstance(result.stderr, bytes):
-                result.stderr = safe_decode(result.stderr)
-
-        if VERBOSE:
-            print(f"  DEBUG: 命令返回码: {result.returncode}")
-            if result.stdout:
-                print(f"  DEBUG: stdout摘要: {result.stdout[:200]}")
-            if result.stderr:
-                print(f"  DEBUG: stderr摘要: {result.stderr[:200]}")
-
-        return result
-
-    except Exception as e:
-        if VERBOSE:
-            print(f"  DEBUG: subprocess error: {e}")
-
-        # Return a mock result object for error cases
-        class MockResult:
-            def __init__(self):
-                self.returncode = 1
-                self.stdout = ""
-                self.stderr = str(e)
-
-        return MockResult()
 
 
 def safe_popen_communicate(cmd, **kwargs):
@@ -2935,7 +2785,7 @@ def is_password_correct(archive_path, password, encryption_status='encrypted_con
             cmd = ['7z', 't', str(archive_path), f'-p{password}', '-y']
             if VERBOSE:
                 print(f"  DEBUG: Using test command for content encryption test")
-
+        cmd = _patch_cmd_paths(cmd)
         result = safe_subprocess_run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         success = result.returncode == 0
@@ -2999,7 +2849,7 @@ def try_extract(archive_path, password, tmp_dir, zip_decode=None, enable_rar=Fal
                 print(f"  DEBUG: RAR命令: {' '.join(cmd)}")
                 print(f"  DEBUG: 原始路径: {archive_path}")
                 print(f"  DEBUG: 安全路径: {safe_archive_path}")
-
+            cmd = _patch_cmd_paths(cmd)
             result = safe_subprocess_run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         else:
@@ -3049,7 +2899,7 @@ def try_extract(archive_path, password, tmp_dir, zip_decode=None, enable_rar=Fal
                 print(f"  DEBUG: 7z命令: {' '.join(cmd)}")
                 print(f"  DEBUG: 原始路径: {archive_path}")
                 print(f"  DEBUG: 安全路径: {safe_archive_path}")
-
+            cmd = _patch_cmd_paths(cmd)
             result = safe_subprocess_run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         success = result.returncode == 0
@@ -3199,7 +3049,7 @@ def is_zip_format(archive_path):
 
     # 检查文件魔术字节 (PK header)
     try:
-        with open(archive_path, 'rb') as f:
+        with safe_open(archive_path, 'rb') as f:
             header = f.read(4)
             if header.startswith(b'PK'):
                 if VERBOSE:
@@ -3780,7 +3630,7 @@ def check_rar_available():
     try:
         if VERBOSE:
             print(f"  DEBUG: 检查rar命令可用性")
-
+        
         # Try to run rar command to check if it's available
         result = safe_subprocess_run(['rar'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
@@ -3838,7 +3688,7 @@ def is_rar_format(archive_path):
 
     # 检查文件魔术字节 (Rar! header)
     try:
-        with open(archive_path, 'rb') as f:
+        with safe_open(archive_path, 'rb') as f:
             header = f.read(4)
             if header == b'Rar!':
                 if VERBOSE:
